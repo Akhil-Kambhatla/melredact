@@ -9,6 +9,30 @@ sees the packets. Real inputs are scanned PDFs pulled from Box and roster
 CSVs exported from a Google Sheet — both contain real student PII and are
 gitignored (see `data/README.md`); never commit or sync them anywhere.
 
+## Status (handoff)
+
+Working end to end on the real 44-page file: review-first workflow,
+SID-named output in `out/<teacher>/<period>/<SID>.pdf`, `verify` passes
+unscoped.
+
+**Speed finding:** full-page OCR at 300 DPI costs 10-25 min/page cold —
+~13h projected on a 50-page file. The disk cache (file-hash+page+dpi+bbox)
+makes a warm re-run of the *same* file 7.5s, but does nothing for a new,
+never-seen file. Full-page OCR only exists to preserve the kept text
+layer for John's later data extraction — de-identification itself only
+needs the header strip.
+
+**Next task:** build a header-only OCR path as an alternative to
+full-page, and compare cold-cache runtime on unseen files. Both paths
+must pass verify. Open question: does header-only give the matcher
+enough to work with, while still catching group-row overflow the way
+full-page OCR's word list currently does (see `find_uncovered_group_words`
+in "Two rectangles are redacted per header page" below)?
+
+**Deferred:** a hosted web app (upload/review/download) instead of the
+local Streamlit tool. Needs John/Doug sign-off first — moves identifiable
+minor data off-device, a different IRB posture than the local tool.
+
 ## Consent rule
 
 The roster **is** the consent list. A student not on the roster is not
