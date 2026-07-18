@@ -1,0 +1,21 @@
+# Identifiable data - never commit
+*.pdf
+*.csv
+data/*
+!data/README.md
+
+# Generated output
+out/
+decisions/
+.cache/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# OS
+.DS_Store
