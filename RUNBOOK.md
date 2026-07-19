@@ -64,14 +64,14 @@ stages reads from disk instead of re-running OCR.
 
 1. **"Segmenting PDF into packets..."** (spinner) — OCRs a small header-region crop and a
    small footer-region crop on *every* page (44 pages × 2 crops = 88 small OCR calls) to find
-   packet boundaries from the footer's "Page X of Y". Rough budget: a couple of minutes, cold
-   cache; near-instant once cached.
+   packet boundaries from the footer's "Page X of Y". Measured cold on the real file: 7.01 min
+   (420.6s across all 88 calls, ~4.8s/call); near-instant once cached.
 2. **"Scoring name candidates against the roster..."** (spinner) — OCRs the header band on each
    of the ~22 header pages to pull out Name/Teacher/Group/Date/Period, then fuzzy-scores Name
    against the roster. This is the *same* header-crop OCR call segmentation's own header check
    already made (identical bbox, identical dpi) — with the cache in place this stage is a cache
-   hit, not a second OCR pass. Rough budget: under a couple of minutes, cold cache; near-instant
-   once cached.
+   hit, not a second OCR pass. Measured on the real file: 0s — confirms this is a genuine cache
+   hit off step 1, not a second OCR pass.
 3. Opening each packet in the UI renders and disk-caches its header-page preview image
    (`.cache/melredact/...`) the first time you view it, and now also reuses the same OCR cache
    for the field table (`extract_header_fields`, itself wrapped in `st.cache_data`) — both a
@@ -80,15 +80,16 @@ stages reads from disk instead of re-running OCR.
    slowdown); it doesn't anymore.
 4. **"Run redaction pipeline"** (sidebar button, see below) — for every packet with a decision
    recorded, this OCRs *every page in that packet* at full 300 DPI (vs. 150 DPI for the
-   on-screen preview) to rebuild the invisible text layer, then redacts and verifies. This is
-   the expensive one even with caching: full-page OCR at 300 DPI on a content-dense worksheet
-   page measured at 10-25+ minutes *per page* on this machine (CPU, no GPU) the first time a
-   given page is ever OCR'd this way — segmentation's header/footer crops are small and cheap by
-   comparison, this genuinely isn't. Approving and running the whole 44-page file in one sitting,
-   cold cache, took ~1h30m end to end; a second run against the same file (decisions unchanged,
-   cache warm) took ~7.5s. In practice this cost is paid once, incrementally, as you approve
-   packets across a review session, not all at once at the end — but budget for it seriously the
-   first time you touch a fresh scan.
+   on-screen preview) to rebuild the invisible text layer, then redacts and verifies. Measured
+   cold on the real file: ~29s/page (635.2s across the 22 pages in 11 approved packets) — more
+   than a header/footer crop's ~4.8s/call, but nowhere near the 10-25 min/page this section
+   previously (incorrectly) cited. A full cold run of all three stages above end to end
+   (segmenting all 44 pages, scoring, then redacting 11 approved packets/22 pages) took 17.6 min
+   total, not the ~1h30m previously logged here — that older figure was inflated by the same
+   miscalculation. A second run against the same file (decisions unchanged, cache warm) is
+   expected to be near-instant, since every OCR call becomes a disk-cache hit. In practice this
+   cost is paid once, incrementally, as you approve packets across a review session, not all at
+   once at the end — but the real per-file cold budget is minutes, not hours.
 
 **Hung vs. slow:** there's no per-page progress bar during OCR, just the spinner text above (or,
 for step 4, no progress indicator at all — it's a plain function call, not a spinner-wrapped

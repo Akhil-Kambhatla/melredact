@@ -15,19 +15,26 @@ Working end to end on the real 44-page file: review-first workflow,
 SID-named output in `out/<teacher>/<period>/<SID>.pdf`, `verify` passes
 unscoped.
 
-**Speed finding:** full-page OCR at 300 DPI costs 10-25 min/page cold —
-~13h projected on a 50-page file. The disk cache (file-hash+page+dpi+bbox)
-makes a warm re-run of the *same* file 7.5s, but does nothing for a new,
-never-seen file. Full-page OCR only exists to preserve the kept text
-layer for John's later data extraction — de-identification itself only
-needs the header strip.
+**Speed finding:** measured cold (cache fully cleared, `data/Hannel MPR
+PD2.pdf`, 44 pages, 22 packets, 11 approved): **17.6 min machine time
+end to end**, not the 10-25 min/page (~13h/50-page-file) figure this
+section previously cited — that estimate was miscalculated. Real
+breakdown: 7.01 min segmentation (88 small header/footer-band OCR calls
+@300dpi across all 44 pages, ~4.8s/call), 0s matching (exact cache hit
+off segmentation's own header-band call), 10.6 min redaction (22
+full-page OCR calls @300dpi, one per page in an approved packet, ~29s/
+page). The disk cache (file-hash+page+dpi+bbox) makes a warm re-run of
+the *same* file even faster, but does nothing for a new, never-seen
+file — 17.6 min is the real cold-file cost. Full-page OCR only exists to
+preserve the kept text layer for John's later data extraction — de-
+identification itself only needs the header strip.
 
-**Next task:** build a header-only OCR path as an alternative to
-full-page, and compare cold-cache runtime on unseen files. Both paths
-must pass verify. Open question: does header-only give the matcher
-enough to work with, while still catching group-row overflow the way
-full-page OCR's word list currently does (see `find_uncovered_group_words`
-in "Two rectangles are redacted per header page" below)?
+**Low priority:** a header-only OCR path (as an alternative to
+full-page) was previously flagged as the next task, motivated by the
+since-corrected 10-25 min/page estimate implying a ~13h cost on a
+50-page file. At the real ~29s/page, that problem doesn't exist —
+not worth building unless a much larger real file's own measured cold
+cost says otherwise.
 
 **Deferred:** a hosted web app (upload/review/download) instead of the
 local Streamlit tool. Needs John/Doug sign-off first — moves identifiable
@@ -201,6 +208,20 @@ worth surfacing, neither worth silently picking a winner between.
   the pre-reversal all-image, zero-text-layer behavior available behind a
   flag (John is re-checking the decision with Doug; it may reverse again).
   (Reversed by John, 2026-07-17 — original design flattened to images.)
+  **`flatten=True` only gets half of `run_dispositions`'s leak protection.**
+  `find_uncovered_group_words` (the geometric, pixel-based check — see "Two
+  rectangles are redacted per header page" below) runs unconditionally,
+  flatten or not, since it only needs the raster image and the located
+  anchors, never the text layer. `verify_no_leaked_names` needs a text
+  layer to search, though — a flattened, zero-text-layer page has nothing
+  for it to find, so it passes *vacuously*, not because nothing leaked. A
+  flattened verify pass and a non-flattened one are not equivalent; don't
+  treat a clean flattened result as the same guarantee as a normal one. If
+  `flatten=True` ever becomes a real production path rather than a
+  fallback flag, `verify`/`run_dispositions` need to assert the pixel
+  check specifically ran and passed for that file, not just that
+  `verify_no_leaked_names` found no text — right now a vacuous pass and a
+  real one look identical from the caller's side.
   One coordinate subtlety worth knowing before touching this: page-point
   space (pdfplumber `top`/`bottom`) and rasterized image-pixel space are
   both top-down, related by a plain `dpi/72` scale — no axis flip. The
@@ -230,12 +251,13 @@ worth surfacing, neither worth silently picking a winner between.
   packet re-ran the exact same OCR every time. Keyed on bbox, not just
   file+page+dpi, deliberately: collapsing header/footer crops and
   redact_packet's full-page request into one cache entry sounds simpler,
-  but measured on the real 44-page file a full-page OCR call took
-  10-25+ minutes on content-dense worksheet pages vs. a couple of
-  seconds for a small header/footer crop — forcing every page through a
+  but measured cold on the real 44-page file a full-page OCR call costs
+  ~29s/page (635.2s across the 22 pages in 11 approved packets) vs.
+  ~4.8s for a small header/footer crop (420.6s across 88 narrow-band
+  calls, header+footer × all 44 pages) — forcing every page through a
   full-page OCR up front (during segmentation, for all 44 pages, most of
-  which never get redacted) would turn a ~2-minute segmentation step into
-  20+ minutes for no benefit. Keying on the exact bbox keeps each call's
+  which never get redacted) would turn a ~7-minute segmentation step into
+  ~21 minutes for no benefit. Keying on the exact bbox keeps each call's
   cost where it already was while still collapsing every *repeat* of the
   same call to one, disk-persisted so it survives a Streamlit restart or
   a second `cli.py run` (confirmed: a warm-cache re-run of the real file
