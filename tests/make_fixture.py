@@ -108,36 +108,51 @@ def render_header_image(
     worksheet_type: str,
     page_marker: str,
     shade_blank_rows: bool,
+    block_offset_pt: float = 0.0,
 ) -> Image.Image:
+    """`block_offset_pt` shifts the whole bordered block (border + Name/
+    Teacher/Group/Date/Period rows) down the page, independent of the fixed
+    title-text position above it -- simulating a worksheet type whose own
+    title/instructions block is taller than MPR's own (confirmed on a real
+    second worksheet type, PRT: its two-line title pushes the header block
+    ~37-44pt further down the page than MPR's). Zero (the default)
+    reproduces the exact original MPR-shaped layout."""
     w, h = int(_px(PAGE_WIDTH_PT)), int(_px(PAGE_HEIGHT_PT))
     img = Image.new("RGB", (w, h), "white")
     draw = ImageDraw.Draw(img)
 
     draw.text((_px(45), _px(20)), "B. Model Plausibility Ratings", fill=BORDER_COLOR, font=_font(11))
 
-    band = HEADER_BAND_FALLBACK
+    def _shift(anchor: dict) -> dict:
+        return {**anchor, "top": anchor["top"] + block_offset_pt}
+
+    band = {**HEADER_BAND_FALLBACK, "top": HEADER_BAND_FALLBACK["top"] + block_offset_pt, "bottom": HEADER_BAND_FALLBACK["bottom"] + block_offset_pt}
+    name_anchor = _shift(NAME_ANCHOR)
+    teacher_anchor = _shift(TEACHER_ANCHOR)
+    group_anchor = _shift(GROUP_ANCHOR)
+
     if shade_blank_rows:
-        shade_top = TEACHER_ANCHOR["top"] - 2
+        shade_top = teacher_anchor["top"] - 2
         draw.rectangle([_px(band["left"] + 1), _px(shade_top), _px(band["right"] - 1), _px(band["bottom"] - 1)], fill=SHADE_COLOR)
     _draw_border(draw, band)
 
-    _draw_label_row(draw, NAME_ANCHOR, "Name:")
-    _draw_label_row(draw, TEACHER_ANCHOR, "Teacher:")
-    _draw_label_row(draw, GROUP_ANCHOR, "Group members, if any:")
-    draw.text((_px(DATE_ANCHOR["x0"]), _px(NAME_ANCHOR["top"])), "Date:", fill=BORDER_COLOR, font=_font(9))
-    draw.text((_px(PERIOD_ANCHOR["x0"]), _px(TEACHER_ANCHOR["top"])), "Period:", fill=BORDER_COLOR, font=_font(9))
+    _draw_label_row(draw, name_anchor, "Name:")
+    _draw_label_row(draw, teacher_anchor, "Teacher:")
+    _draw_label_row(draw, group_anchor, "Group members, if any:")
+    draw.text((_px(DATE_ANCHOR["x0"]), _px(name_anchor["top"])), "Date:", fill=BORDER_COLOR, font=_font(9))
+    draw.text((_px(PERIOD_ANCHOR["x0"]), _px(teacher_anchor["top"])), "Period:", fill=BORDER_COLOR, font=_font(9))
 
     value_x = 150.0
     if name_text:
-        draw.text((_px(value_x), _px(NAME_ANCHOR["top"])), name_text, fill=INK_COLOR, font=_font(10))
+        draw.text((_px(value_x), _px(name_anchor["top"])), name_text, fill=INK_COLOR, font=_font(10))
     if teacher_text:
-        draw.text((_px(value_x), _px(TEACHER_ANCHOR["top"])), teacher_text, fill=INK_COLOR, font=_font(10))
+        draw.text((_px(value_x), _px(teacher_anchor["top"])), teacher_text, fill=INK_COLOR, font=_font(10))
     if group_text:
-        draw.text((_px(value_x), _px(GROUP_ANCHOR["top"])), group_text, fill=INK_COLOR, font=_font(10))
-    draw.text((_px(450), _px(NAME_ANCHOR["top"])), date_text, fill=INK_COLOR, font=_font(10))
-    draw.text((_px(450), _px(TEACHER_ANCHOR["top"])), period_text, fill=INK_COLOR, font=_font(10))
+        draw.text((_px(value_x), _px(group_anchor["top"])), group_text, fill=INK_COLOR, font=_font(10))
+    draw.text((_px(450), _px(name_anchor["top"])), date_text, fill=INK_COLOR, font=_font(10))
+    draw.text((_px(450), _px(teacher_anchor["top"])), period_text, fill=INK_COLOR, font=_font(10))
 
-    draw.text((_px(45), _px(170)), "1. Please work on this individually:", fill=BORDER_COLOR, font=_font(10))
+    draw.text((_px(45), _px(170 + block_offset_pt)), "1. Please work on this individually:", fill=BORDER_COLOR, font=_font(10))
     _draw_footer(draw, worksheet_type, page_marker)
     return img
 

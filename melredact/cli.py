@@ -17,10 +17,11 @@ for why a scan is only ever matched against one period's roster block.
 `verify` intentionally does *not* take `--period` and always checks
 against the whole roster, every period included -- it's a safety net, and
 narrowing its search space would only make it worse at its one job. It
-also does not take `--pdf`: output is named out/<teacher>/<period>/<SID>.pdf
-(see pipeline.py), which carries no trace of which scan produced it, so
-there is nothing scan-specific left for verify to filter by -- it walks
-every file under `--out` and checks it against the whole roster.
+also does not take `--pdf`: output is named
+out/<teacher>/<period>/<worksheet_type>/<SID>.pdf (see pipeline.py), which
+carries no trace of which scan produced it, so there is nothing
+scan-specific left for verify to filter by -- it walks every file under
+`--out` and checks it against the whole roster.
 
 `verify` independently re-checks whatever is already sitting in `out/`
 against the roster -- the same check `run_dispositions` already runs
@@ -37,7 +38,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from melredact.pipeline import decisions_path, load_decisions, packet_tag, run_dispositions
+from melredact.pipeline import decisions_path, load_decisions, load_detection_overrides, packet_tag, run_dispositions
 from melredact.redact import verify_no_leaked_names
 from melredact.roster import RosterError, load_full_roster, load_roster
 from melredact.segment import segment_pdf
@@ -55,9 +56,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if out_dir.suffix.lower() == ".pdf":
         print(
             f"error: --out {out_dir} looks like a single file, but output is one redacted PDF per "
-            f"approved packet, named by SID under a <teacher>/<period> subdirectory (e.g. "
-            f"{out_dir.stem}/020415/02/0204150204.pdf), written into --out as a directory -- pass "
-            f"a directory name instead (e.g. --out {out_dir.stem})",
+            f"approved packet, named by SID under a <teacher>/<period>/<worksheet_type> subdirectory "
+            f"(e.g. {out_dir.stem}/020415/02/PRT/0204150204.pdf), written into --out as a directory -- "
+            f"pass a directory name instead (e.g. --out {out_dir.stem})",
             file=sys.stderr,
         )
         return 1
@@ -75,6 +76,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return 1
     segmented = segment_pdf(pdf_path)
     decisions = load_decisions(pdf_path, decisions_dir=Path(args.decisions))
+    detection_overrides = load_detection_overrides(pdf_path, decisions_dir=Path(args.decisions))
 
     if not decisions:
         print(
@@ -83,25 +85,36 @@ def _cmd_run(args: argparse.Namespace) -> int:
             f'  streamlit run review_app.py -- "{pdf_path}" "{roster_path}"'
         )
 
-    try:
-        results = run_dispositions(pdf_path, segmented, decisions, roster, out_dir=out_dir, flatten=args.flatten)
-    except (RuntimeError, ValueError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+    results = run_dispositions(
+        pdf_path,
+        segmented,
+        decisions,
+        roster,
+        out_dir=out_dir,
+        flatten=args.flatten,
+        detection_overrides=detection_overrides,
+    )
 
     written = [r for r in results if r.out_path is not None]
     deleted = [r for r in results if r.deleted_path is not None]
     pending = [r for r in results if r.pending]
+    held_back = [r for r in results if r.held_back]
 
     for r in written:
-        print(f"wrote   {r.out_path}")
+        note = f"  ({r.reason})" if r.reason else ""
+        print(f"wrote   {r.out_path}{note}")
     for r in deleted:
         print(f"deleted {r.deleted_path}")
     for r in pending:
         print(f"pending {r.packet_tag} (not yet reviewed)")
+    for r in held_back:
+        print(f"held back {r.packet_tag} (sid {r.sid}): {r.reason}")
 
-    print(f"\n{len(written)} written, {len(deleted)} deleted, {len(pending)} still pending review")
-    return 0
+    print(
+        f"\n{len(written)} written, {len(deleted)} deleted, "
+        f"{len(held_back)} held back for review, {len(pending)} still pending review"
+    )
+    return 1 if held_back else 0
 
 
 def _cmd_verify(args: argparse.Namespace) -> int:
@@ -117,30 +130,35 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         return 1
 
     out_dir = Path(args.out)
-    # New layout: out/<teacher_code>/<period>/<SID>.pdf -- exactly two
-    # directory levels under --out, no scan-name prefix to filter by (see
-    # module docstring for why this dropped --pdf).
-    pdfs = sorted(out_dir.glob("*/*/*.pdf"))
+    # Layout: out/<teacher_code>/<period>/<worksheet_type>/<SID>.pdf --
+    # exactly three directory levels under --out, no scan-name prefix to
+    # filter by (see module docstring for why this dropped --pdf).
+    pdfs = sorted(out_dir.glob("*/*/*/*.pdf"))
     if not pdfs:
         print(
             f"error: no output files found under {out_dir} (expected "
-            f"{out_dir}/<teacher>/<period>/<SID>.pdf) -- nothing to verify. "
+            f"{out_dir}/<teacher>/<period>/<worksheet_type>/<SID>.pdf) -- nothing to verify. "
             "If this is unexpected, check --out points at the right directory "
             "rather than trusting a vacuous pass.",
             file=sys.stderr,
         )
         return 1
 
-    failed = False
+    n_failed = 0
     for pdf in pdfs:
         findings = verify_no_leaked_names(pdf, roster)
         if findings:
-            failed = True
+            n_failed += 1
             print(f"FAIL {pdf.relative_to(out_dir)}: {findings}")
         else:
             print(f"ok   {pdf.relative_to(out_dir)}")
 
-    return 1 if failed else 0
+    # Explicit checked-count on every path, pass or fail -- so "0 files
+    # checked" is never confusable with "N files checked, all clean"; the
+    # hard failure above already refuses to run at all when pdfs is empty,
+    # this is the count for whenever it did run.
+    print(f"\n{len(pdfs)} file(s) checked, {n_failed} failed")
+    return 1 if n_failed else 0
 
 
 def main(argv: list[str] | None = None) -> int:

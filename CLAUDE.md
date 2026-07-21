@@ -11,11 +11,119 @@ gitignored (see `data/README.md`); never commit or sync them anywhere.
 
 ## Status (handoff)
 
-Working end to end on the real 44-page file: review-first workflow,
-SID-named output in `out/<teacher>/<period>/<SID>.pdf`, `verify` passes
-unscoped.
+Working end to end on the real files: review-first workflow, SID-named
+output in `out/<teacher>/<period>/<worksheet_type>/<SID>.pdf`, `verify`
+passes unscoped and reports an explicit checked-file count (currently 11:
+10 MPR + 1 PRT, never 0).
 
-**Speed finding:** measured cold (cache fully cleared, `data/Hannel MPR
+**`data/` reorganized 2026-07-20** into `MPR/`, `PRT/`, `teacher_codes/`,
+`samples/` subfolders (was a flat directory). All code that takes a path
+(`cli.py`, `review_app.py`) already took `--pdf`/`--roster` as explicit
+arguments with no hardcoded default, so nothing in `melredact/` needed to
+change — only RUNBOOK.md's example commands and `data/README.md` did. The
+OCR disk cache is keyed on file content hash (`ocr.py`), not path, so the
+move didn't invalidate it.
+
+**Text layer scramble, found and fixed 2026-07-20:** the kept OCR text
+layer was silently corrupted on real scans — see "Each word's text-matrix
+horizontal component has to be scaled..." above for the full mechanics and
+fix (`melredact.redact._horizontal_scale_for_word`). Regenerating the real
+PRT and MPR files with the fix surfaced two further, unrelated bugs, both
+now resolved:
+
+- SID 0204150202 (`Hannel MPR PD2_p006`, the original "Ganik" incident
+  packet) and SID 0204150203 (`Hannel MPR PD2_p016`): `find_uncovered_
+  group_words` flagged the printed "1. Please work on this individually:"
+  instruction as unredacted group-row ink — confirmed a false positive by
+  rendering the actual pages (real, printed body text, clearly separated
+  from the header box; the real redaction box, independently driven by
+  `detect_header_band`, already covered every real word of handwritten ink
+  in both cases). **Fixed:** the row-assignment window's documented "room
+  to spare" margin never held across the real dataset (measured: -10pt to
+  +38pt across 42 real pages, 3 negative). Now anchored to the real
+  detected header border (`band_bottom`) instead of the indirect
+  row_height proxy that produced that swing — see "Correction, 2026-07-20"
+  under "Only the Name row may reach the matcher" above and bug #6 under
+  "Six regression-tested bugs" for the full before/after. Re-measured: 0 of
+  42 pages negative, min +0.42pt. **Regenerated and shipped**:
+  `out/020415/02/PCMEL_MPR_ADR/0204150202.pdf` now exists and passes
+  `verify`. (0204150203 was already shipped pre-fix and re-verified clean
+  after regeneration.)
+- SID 0204150204 (`Hannel MPR PD2_p002`): `detect_header_band` can't
+  confidently locate the header border — OCR didn't find the printed
+  "Group" label on this page. Unrelated to the fix above, genuinely needs
+  a human review pass, not more code — **still held back**, no output.
+  This is no longer a reason the *other* MPR packets fail to ship, though
+  (see the next paragraph): it holds back only its own packet.
+  **Update, 2026-07-21:** a real reviewer confirming this packet's decision
+  in `review_app.py` and clicking "Run redaction pipeline" found it *still*
+  held back — approval couldn't release a detection-confidence hold at
+  all, code fixed the same day (see "One of those five holds is
+  human-overridable" below). 0204150204 itself is still not shipped: the
+  code now supports a human explicitly checking the new "release this
+  packet" override after looking at the preview box, but nobody has
+  actually done that for this real packet yet, and doing so is a review
+  decision, not something this fix does automatically.
+
+**Fail-fast bug found and fixed 2026-07-20, in the same session that
+surfaced the two bugs above.** `run_dispositions` used to raise and abort
+the *entire* run on the first packet failure — which meant, concretely,
+that SID 0204150204's held-back page (first in this file's page order)
+blocked every other already-approved MPR packet, including 0204150202,
+from ever being attempted at all. Fixed: a per-packet failure (SID not on
+roster, unresolved segmentation issues, undetected header border,
+uncovered group-row ink, or a leak finding) now produces a `held_back`
+result with a `reason` and the run continues to the next packet — see "A
+per-packet failure holds back only that packet" below for the full
+mechanics. `cli.py run`'s summary line and `review_app.py`'s sidebar both
+report held-back packets explicitly now, separate from written/deleted/
+pending.
+
+**Current real result, both files, this fix in place:** MPR run — 10
+written (9 previously-approved + newly-unblocked 0204150202), 0 deleted, 1
+held back (0204150204, `detect_header_band` — a genuine human-review item,
+not a bug), 0 pending. PRT run — 1 written (0204150201, re-verified clean
+under both fixes), 0 held back, 19 pending (no human has reviewed those
+packets yet — correct, not a gap; nothing auto-approves consent). `verify`
+run unscoped against the whole out tree: `11 file(s) checked, 0 failed`,
+covering both `PCMEL_MPR_ADR/` and `PRT/` subtrees side by side under the
+same `<teacher>/<period>/`.
+
+**What's actually still open:** SID 0204150204 needs a human to actually
+open `review_app.py`, look at the preview box on that page, and — if it
+genuinely covers the name, the same visual check already done informally
+earlier — check the new detection-hold override checkbox before
+re-running the pipeline; the code path exists now, but nobody has done
+that for this real packet yet, and it's a review decision no code should
+make on its own. The 19 unreviewed PRT packets need a human review pass
+through `review_app.py` before they can produce any output — also not a
+code task; nothing should auto-decide consent for real students.
+
+**Incident, 2026-07-20:** running dispositions for a PRT scan deleted all
+11 already-approved MPR outputs for the same class. Two compounding bugs,
+both fixed same-day (see "Output is deliberately one redacted PDF..." and
+"Packet identity and the decisions store" below for the full mechanics):
+output was named `out/<teacher>/<period>/<SID>.pdf` with no worksheet-type
+segment, so an MPR and a PRT packet for the same student collided on the
+identical path; and `run_dispositions` reconciled deletions by sweeping the
+whole shared `<teacher>/<period>/` directory against only the *current*
+pdf's own `decisions.values()`, so a PRT run with every packet still
+pending (empty decisions) deleted every file a *different* pdf's decisions
+store had approved, since the sweep had no notion of which pdf actually
+wrote which file. Fixed by adding a `worksheet_type` path segment (read off
+each packet's own footer, never guessed) and replacing the sweep with a
+precise, per-tag ledger (`out/.ledger/<pdf-stem>.json`) that only ever
+deletes a file the *same* packet_tag's own prior decision wrote, driven by
+an explicit rejection or correction of *that* tag — never by another pdf's
+run, and never by a pending packet. The 11 deleted MPR files were fully
+recoverable, not lost: `decisions/Hannel MPR PD2.json` (the human-approved
+match for each packet) was never touched by the bug — only files already
+sitting in `out/` were — so re-running the pipeline against the existing
+decisions regenerates byte-equivalent output. The OCR disk cache was also
+untouched, so the regenerating run costs seconds, not the original 17.6 min
+cold-cache run (see "Speed finding" below).
+
+**Speed finding:** measured cold (cache fully cleared, `data/MPR/Hannel MPR
 PD2.pdf`, 44 pages, 22 packets, 11 approved): **17.6 min machine time
 end to end**, not the 10-25 min/page (~13h/50-page-file) figure this
 section previously cited — that estimate was miscalculated. Real
@@ -39,6 +147,35 @@ cost says otherwise.
 **Deferred:** a hosted web app (upload/review/download) instead of the
 local Streamlit tool. Needs John/Doug sign-off first — moves identifiable
 minor data off-device, a different IRB posture than the local tool.
+
+**Real leak found in review, 2026-07-21: PRT packet 14, still in review
+(not approved, not shipped) at the time it was caught.** A reviewer
+spotted a Group-row list ("Jyoshika, Mohammed, Divya" in the real packet)
+sitting fully visible below a redaction box that was correctly positioned
+per the printed border but too short for what the student actually wrote
+— genuinely new failure shape (vertical overflow past the header's own
+detected bottom border), not the sideways-past-`COLUMN_SPLIT_X` overflow
+the "Ganik" incident already fixed. Root-caused to `find_uncovered_
+group_words`'s own bug #6 fix (anchoring its word-collection window to
+`band.bottom`) creating exactly the blind spot bug #6 was trying to avoid
+elsewhere: ink genuinely below the border was excluded from consideration
+before the coverage check ever ran, so the pipeline would have shipped
+this as clean had it been approved and run. Fixed same day — see "Seven
+regression-tested bugs" #7 and the "Correction, 2026-07-21" note under
+"Two rectangles are redacted per header page" above for the full
+mechanics and the fixed check's accepted trade-off (0204150202/
+0204150203 will flag again as a known false positive on regeneration).
+Regression fixture built fictional ("Priya Xavier Noor"), not the real
+names, per the no-real-PII-in-code rule below. **Not regenerated or
+shipped as part of this fix** — same "verified, not automatically
+re-shipped" posture as the 2026-07-20 fixes below.
+
+Also added this session, as the intended remedy for the accepted
+false-positive trade-off above (and as a general backstop for a genuine
+detection/coverage miss): the manual-redaction queue (see its own section
+below) and a "Confirm & Next" button in `review_app.py` next to "Confirm
+decision", so confirming a packet and advancing to the next one is one
+click instead of two.
 
 ## Consent rule
 
@@ -125,6 +262,131 @@ worth surfacing, neither worth silently picking a winner between.
   anything below the header, so nearest-anchor assignment can't route
   there), but the group field a reviewer sees should reflect the group row
   and nothing else.
+
+  **Correction, 2026-07-20: "room to spare" does not hold across the real
+  dataset, and this is the reason `find_uncovered_group_words` (which
+  reuses this same window — see "Two rectangles are redacted per header
+  page" below) flagged SID 0204150202 — the original Ganik incident packet
+  — as having uncovered group-row ink when regenerating it with this
+  session's text-layer fix.** That flag was independently confirmed a
+  false positive by rendering the actual page (the flagged words are
+  genuinely printed body text, clearly separated from the header box by
+  eye), but the *margin* — not this one instance — is the actual finding.
+
+  First, what this session's two other changes are **not** responsible
+  for: `_assign_words_to_rows`'s window formula and `ROW_ASSIGNMENT_
+  BOTTOM_SLACK_PT` (10pt) are byte-identical between `git show HEAD:
+  melredact/config.py` and the current working tree — neither the
+  Widths/horizontal-scale text-layer fix (a different module entirely,
+  only touches how words are *written* to output, never how they're read
+  or assigned to rows) nor the anchor-relative header/border-detection
+  change (which *reuses* `header_row_height`'s existing formula for a new
+  purpose, border search, but doesn't alter what that formula computes)
+  touched this code path. Whatever this margin actually is, this session
+  didn't shrink it.
+
+  What it actually is: measured directly (`check_margin` = first real
+  body-text word's `top`, from a fresh OCR pass, minus this window's own
+  `group_top + row_height + ROW_ASSIGNMENT_BOTTOM_SLACK_PT` cutoff) across
+  all 42 real header pages we have — every packet in both `Hannel MPR
+  PD2.pdf` (22) and `Hannel PRT PD2.pdf` (20), not just approved ones, so
+  this isn't cherry-picked around 0204150202:
+
+  | | min | median | max | mean |
+  |---|---|---|---|---|
+  | MPR (n=22) | -10.0pt | 5.48pt | 15.92pt | — |
+  | PRT (n=20) | -0.16pt | 3.8pt | 38.36pt | — |
+  | combined (n=42) | -10.0pt | 5.0pt | 38.36pt | 5.67pt |
+
+  21 of 42 real pages (half) have less than 5pt of margin. **Three already
+  have a *negative* margin — the window already overlaps real body
+  text — with no involvement from 0204150202 at all:** `Hannel MPR
+  PD2_p016` (-10.0pt, SID 0204150203 — the other packet this session's
+  regeneration also hit this exact flag on), `Hannel MPR PD2_p036`
+  (-4.48pt, decided non-consent, never shipped, so latent rather than
+  live), and `Hannel PRT PD2_p020` (-0.16pt, not yet reviewed, also
+  latent). 0204150202 itself measured at −0.4pt in the initial
+  investigation and +0.32pt in this fuller pass — the sign flip between
+  two independent OCR reads of the same word is itself the finding: the
+  margin on this page is smaller than OCR's own re-measurement noise
+  (~0.7pt between two crops of the same page), so whether this specific
+  check fires is closer to a coin flip than a reliable pass.
+
+  Conclusion: the ~24pt "room to spare" figure documented above was real
+  for whichever single page it was measured against, but was never
+  checked against the rest of the real dataset, and doesn't generalize —
+  real per-page variance in the whitespace between the header box and the
+  first line of body text (title length, scan skew, how tall PaddleOCR's
+  merged bounding box for a line of handwriting comes out) routinely eats
+  most or all of the assumed margin. 0204150202's thin margin is not an
+  outlier this session introduced; it's confirmation the calibration never
+  covered the cases that needed it.
+
+  **Were the already-shipped files actually leaking, or just diagnosed by
+  an unreliable check?** Checked directly, not inferred: the three
+  negative-margin pages (`Hannel MPR PD2_p016` / SID 0204150203, `_p036`,
+  `Hannel PRT PD2_p020`) were rendered — both the real ink underneath and,
+  for 0204150203 (the only one of the three actually shipped; `_p036` is
+  confirmed non-consent and was never output, PRT `_p020` is still
+  pending review), the already-redacted file sitting in `out/`. In all
+  three, the real header border (`detect_header_band`'s `band.bottom`) was
+  correctly detected and the drawn redaction box fully covers every word
+  of real handwritten ink — `Carter, Kingston, Brayden` on 0204150203,
+  `Sydney, Grace, Priscilla` on PRT `_p020`, nothing at all on `_p036`
+  (empty group row). The negative margin was *only* in the diagnostic
+  window that decides which OCR words to check for coverage — the
+  redaction rectangles themselves come from `detect_header_band` directly
+  and never depended on this window at all. Confirmed: `physical_gap`
+  (first real body-text word's `top` minus the *actual detected*
+  `band.bottom`, i.e. the real page geometry the redaction box itself
+  uses) was positive on **all 42** real pages — min +1.92pt, median
+  +5.28pt, never negative — while `check_margin` (the self-relative
+  window's own, indirect estimate) swung from -10pt to +38pt. The
+  self-relative window was the wrong number in both directions: too wide
+  on these three pages, too narrow relative to the box's own real extent
+  on others (e.g. PRT `_p014`, where `band.bottom` sits *below*
+  `window_max` — that page's window could in principle have clipped real
+  overflow ink before this fix, a mirror-image risk this same finding also
+  closes off). **Conclusion: "verified clean" was real, not lucky, for
+  every already-shipped file — the two systems (border detection, which
+  drives the actual pixel redaction, and the row-assignment window, which
+  only drove this one diagnostic) are independent, and only the diagnostic
+  was ever wrong.**
+
+  **Fixed, not padded: the window is now anchor-relative, the same fix
+  applied to the header border itself.** `_assign_words_to_rows`
+  (`segment.py`) takes an optional `band_bottom` parameter; when given (the
+  real, rasterized header border's own bottom edge, always available at
+  `find_uncovered_group_words`'s call site since a band is already
+  computed there), the window's bottom bound becomes `band_bottom +
+  GROUP_ROW_BAND_SLACK_PT` — a direct measurement, not the `group_top +
+  row_height + ROW_ASSIGNMENT_BOTTOM_SLACK_PT` proxy that produced the -10
+  to +38pt swing. `GROUP_ROW_BAND_SLACK_PT = 1.5` (config.py) is
+  deliberately small, not a bigger version of the same guess: `band_bottom`
+  is already close to the truth, so its slack only has to absorb OCR's own
+  re-measurement noise at a boundary (~0.7-1pt observed between two
+  independent OCR passes over the same word) and a little real overflow
+  tolerance, not an assumption about where body text starts. `_assign_
+  words_to_rows`'s old self-relative formula is kept, unchanged, as the
+  fallback for callers with no rasterized band to anchor to — segment.py's
+  own matching/field-extraction path never renders the page, so it has
+  nothing else to anchor to, and the cost of that path getting the group
+  row wrong is a messier display field, not a leak. Re-measured across the
+  same 42 real pages with the new anchor: **zero negative margins** (was
+  3), min +0.42pt (PRT `_p020` again — its real `physical_gap` is only
+  +1.92pt, so no bottom-window design gets much more headroom than this on
+  that specific page), median +3.8pt, max +32.34pt. Regression test:
+  `test_band_bottom_anchor_excludes_body_text_the_self_relative_window_
+  missed` (`tests/test_segment.py`), built from SID 0204150202's own real
+  measured numbers.
+
+  **`0204150202.pdf` and `0204150203.pdf` were not regenerated as part of
+  this fix** — the fix is verified (128 tests passing, re-measured margins
+  above), but shipping them is a separate, deliberate step pending explicit
+  go-ahead, not an automatic consequence of the check passing now. SID
+  0204150204 is unrelated to this fix (a different check — `detect_header_
+  band` itself failing to locate the "Group" label — see the correction
+  above) and stays held back regardless.
 - **Redaction floor is the drawn border, not fixed coordinates.** The
   bordered header band detected in the raster (`melredact.redact.
   detect_header_band`) is the primary source of truth. `HEADER_BAND_
@@ -174,7 +436,54 @@ worth surfacing, neither worth silently picking a winner between.
   thinks that ink says, which matters because the leak that motivated
   this was never about text matching being wrong (see the next bullet).
   `run_dispositions` treats a non-empty result the same as a
-  `verify_no_leaked_names` finding: delete the output, raise loudly.
+  `verify_no_leaked_names` finding: move the draft into the manual-
+  redaction queue instead of shipping it, hold the packet back with a
+  reason (see "A per-packet failure holds back only that packet" below —
+  this used to raise and abort the whole run instead — and "The manual-
+  redaction queue is a backstop" below for where the drafted file actually
+  goes now instead of being deleted outright).
+
+  **Correction, 2026-07-21 (real leak, PRT packet 14): this same check
+  missed Group-row ink that overflowed *downward*, past the header's own
+  detected bottom border, not sideways past `COLUMN_SPLIT_X`.** A
+  student's group-member list ("Jyoshika, Mohammed, Divya" in the real
+  packet; fictional names stand in everywhere in code/tests, never the
+  real ones) didn't fit the printed row's height and was handwritten
+  below the box entirely — the drawn box itself was correctly positioned
+  per the printed border, it was simply too short for what the student
+  actually wrote. `find_uncovered_group_words` used to bound its own
+  word-collection window at `band.bottom + GROUP_ROW_BAND_SLACK_PT`
+  (1.5pt, via `_assign_words_to_rows(..., band_bottom=band.bottom)`) — the
+  anchor-relative fix from bug #6 below. That fix was real (it closed a
+  real false positive, SID 0204150202/0204150203's printed instruction
+  text), but it created a worse blind spot: ink genuinely below
+  `band.bottom` was excluded from `rows["group"]` *before* the coverage
+  check ever ran, since the box and the check shared the same (in this
+  case too-short) idea of where the header ends. A check that can never
+  disagree with the geometry it exists to verify isn't independent of
+  it — this packet was reviewed and would have shipped as clean.
+
+  There is also no fixed slack past `band.bottom` that could have caught
+  this without reintroducing the bug #6 false positive: measured on the
+  real file, printed body text can start as little as +1.92pt below
+  `band.bottom` on some pages — closer than most plausible handwriting-
+  overflow allowances, so no single number reliably separates "real
+  overflow ink" from "safe printed text" below the border. Given that,
+  `find_uncovered_group_words` now uses the full `HEADER_SEARCH_MAX_TOP`
+  bound instead (the same generous limit already used for *finding*
+  labels, and the outer bound `header_words` was already fetched under —
+  this widens what counts as a *candidate* group word, not what gets read
+  off the page at all). This is a deliberate trade: SID 0204150202 and
+  0204150203 will flag as held-back again if regenerated (a known,
+  accepted false positive — their printed instruction text sits only
+  ~4.8pt below `band.bottom`), and that cost is intentional — see "The
+  manual-redaction queue is a backstop" below for why a held-back false
+  positive is now cheap to clear, versus a silently shipped leak, which is
+  not. Regression fixture: `test_group_row_vertical_overflow_below_the_
+  header_border_is_not_silently_missed` (`tests/test_redact.py`, unit
+  level) and `test_vertical_group_row_overflow_is_auto_held_not_shipped_
+  as_clean` (`tests/test_pipeline.py`, end-to-end through the real
+  `segment_pdf` → `run_dispositions` path, no monkeypatching).
 - **`verify_no_leaked_names` has a fuzzy pass, not just exact-token
   matching.** The reason Cmd+F and the original set-intersection missed
   "Ganik" in the first place: OCR read the handwritten surname "Gonik" as
@@ -232,6 +541,75 @@ worth surfacing, neither worth silently picking a winner between.
   the real writer and pdfplumber's real reader
   (`test_coordinate_flip_round_trips_through_real_writer_and_reader`), not
   just re-derived and trusted.
+- **Each word's text-matrix horizontal component has to be scaled to its
+  own OCR-measured box width, not left at 1** (`melredact.redact.
+  _horizontal_scale_for_word`, wired into `_invisible_text_op`). Found on
+  the real PRT file, and this is a correctness bug, not a cosmetic one: the
+  font dict `_PdfWriter._font` declares has no `Widths` array, so any PDF
+  reader — including pdfplumber, which is what `verify_no_leaked_names`
+  reads with — falls back to Helvetica's own built-in metrics to compute
+  where each character actually sits. Those metrics don't agree with a
+  real OCR word box (real scans measure to the ink, which is frequently
+  *narrower* than Helvetica's advance width for the same text at the
+  font-size `_font_size_for_word` derives from box height — e.g. the real
+  file: "A" boxed at 2.16pt wide, Helvetica renders it ~10pt at that
+  height). Left unscaled, each word's Tj run advances past the *next*
+  word's independently-set x0, so adjacent words overlap in text-space;
+  pdfplumber's word-clustering (which groups characters by x-proximity,
+  not by which Tj call produced them) then interleaves the overlapping
+  runs into a single garbled token on read-back. This turned the real
+  file's clean "A Plausibility Ranking Task" into "A PlausibilRitya
+  nkinTga sk" — the words themselves were always correct and in order,
+  the corruption is entirely positional, introduced by the writer, not by
+  OCR. This matters beyond cosmetics for two reasons: `verify_no_leaked_
+  names` reads the same corrupted layer it's supposed to be the safety net
+  for (a scrambled name could in principle land on a false-positive
+  fuzzy-match *or* fail to land on a true one — the check was never wrong
+  on its own terms, its input was), and the text layer only exists in the
+  first place to survive for John's later data extraction (see "Keep the
+  OCR text layer" above), which a scrambled layer can't serve either. Fix:
+  scale the text matrix's horizontal component (`sx 0 0 1 x y Tm`, not `1
+  0 0 1 x y Tm`) so each word's rendered advance equals its own measured
+  `x1 - x0`, using a hardcoded standard-Helvetica AFM width table (no
+  reader/writer dependency in this repo ships real font metrics) —
+  every word then ends exactly where the next one's own x0 begins,
+  regardless of how tight or wide its OCR box was. Regression test:
+  `test_adjacent_words_with_tight_ocr_boxes_do_not_overlap_and_read_back_
+  in_order`, built from the real file's own measured word boxes for this
+  exact line.
+  **Re-running the real files after this fix surfaced two more, unrelated,
+  pre-existing bugs** (not fixed as of this writing — see "Status
+  (handoff)"): regenerating `Hannel MPR PD2.pdf`'s already-approved output
+  hit `header border not confidently detected` for SID 0204150204 (OCR
+  didn't locate the printed "Group" label on that page, so the anchor-
+  relative bottom-border search fell back to a generic constant instead of
+  this page's own position — the abstain fired correctly, but why OCR
+  missed a printed label there is unexplained) and `uncovered group-row
+  ink` for SID 0204150202 (the file at the center of the original "Ganik"
+  incident) and SID 0204150203, both flagging the printed "1. Please work
+  on this individually:" instruction as unredacted group-row ink. A
+  rendered crop of the 0204150202 page confirms that text is genuinely
+  printed body copy with a clear visual gap below the header box, not
+  missed handwriting — `_assign_words_to_rows`'s self-relative bottom
+  window (`group_top + row_height + ROW_ASSIGNMENT_BOTTOM_SLACK_PT`) has
+  only ~0.4pt of margin over that instruction's own top on these two real
+  pages, not the "room to spare" this window was documented against
+  elsewhere in this file. Both failures are the pipeline's own safety
+  design working as intended — refuse and delete rather than ship a
+  guess — but the *net effect* of running that intended behavior against
+  real data was `run_dispositions` deleting two already-approved,
+  previously-shipped output files (0204150202.pdf, 0204150204.pdf) as a
+  side effect of this session's regeneration. Both are fully recoverable,
+  not lost, the same way the 2026-07-20 incident's 11 files were:
+  `decisions/Hannel MPR PD2.json` still names their SIDs, the roster and
+  source scan are untouched, and the OCR disk cache is still warm — but
+  they are *not currently present* in `out/` and won't be until whichever
+  of these two bugs blocks each one is actually fixed. Deliberately left
+  unfixed this session (out of scope for the text-layer bug this was
+  chasing, and 0204150202/0204150203's `ROW_ASSIGNMENT_BOTTOM_SLACK_PT`
+  margin needs checking against more real pages before being changed, per
+  "calibrate against real measured data" under Working preferences — not a
+  one-line guess from a single crop).
 - **Real scans have no text layer at all** (confirmed against actual
   files — zero chars, one image per page). `melredact/ocr.py` reproduces
   pdfplumber's `extract_words()` shape from PaddleOCR output so
@@ -266,7 +644,7 @@ worth surfacing, neither worth silently picking a winner between.
   Streamlit rerun (a button click, Prev/Next) doesn't even repeat the
   in-memory anchor-location work on top of a cache hit.
 
-## Four regression-tested bugs
+## Seven regression-tested bugs
 
 1. **Illegible scrawl matched confidently.** Short ink like `"S 8"` could
    score ~100 against an unrelated roster entry via `partial_ratio`-style
@@ -303,6 +681,61 @@ worth surfacing, neither worth silently picking a winner between.
    split_is_fully_redacted`, `test_find_uncovered_group_words_actually_
    catches_a_miss`, `test_verify_no_leaked_names_catches_ocr_garbled_
    near_miss`.
+5. **Kept text layer scrambled on read-back, corrupting the leak check's
+   own input.** No `Widths` array on the declared font meant any reader —
+   including pdfplumber, which `verify_no_leaked_names` reads with —
+   fell back to Helvetica's own metrics to place each character, which
+   don't match a real OCR word box (see "Each word's text-matrix
+   horizontal component..." above). Adjacent words overlapped in
+   text-space and read back interleaved: "A Plausibility Ranking Task"
+   extracted as "A PlausibilRitya nkinTga sk" on the real PRT file. Fix:
+   scale each word's text-matrix horizontal component to its own measured
+   box width (`redact._horizontal_scale_for_word`). Test:
+   `test_adjacent_words_with_tight_ocr_boxes_do_not_overlap_and_read_
+   back_in_order`.
+6. **Group-row leak backstop calibrated against one page, wrong on plenty
+   of others.** `find_uncovered_group_words`'s window for "which OCR words
+   count as group-row ink" used a self-relative estimate (`group_top +
+   row_height + ROW_ASSIGNMENT_BOTTOM_SLACK_PT`) documented as having
+   "room to spare" over real body text. Measured across all 42 real header
+   pages we have: that margin actually ranged from -10pt to +38pt, 3 pages
+   already negative — on two of them (SID 0204150202, the original Ganik
+   incident packet, and SID 0204150203) the window swept the printed "1.
+   Please work on this individually:" instruction into the group bucket
+   and `find_uncovered_group_words` flagged it as unredacted ink, a false
+   positive (confirmed by rendering the actual pages: the real redaction
+   box, driven independently by `detect_header_band`, already fully
+   covered the real handwritten ink in every case checked). Fix: anchor
+   the window to the real, rasterized header border (`band.bottom`, from
+   `detect_header_band`) instead of the indirect row_height proxy, the
+   same anchor-relative approach already applied to the border itself —
+   `_assign_words_to_rows(..., band_bottom=...)`. Re-measured: 0 of 42
+   pages negative, min +0.42pt. See the "Correction, 2026-07-20" note
+   under "Only the Name row may reach the matcher" above for the full
+   before/after tables. Test: `test_band_bottom_anchor_excludes_body_
+   text_the_self_relative_window_missed`.
+7. **Group-row leak backstop's own fix for bug #6 created a new blind spot:
+   vertical overflow past the border (real leak, PRT packet 14, 2026-07-
+   21).** Anchoring `find_uncovered_group_words`'s window to `band.bottom`
+   (bug #6's fix) closed the false-positive risk from body text just below
+   the header, but meant real Group-row ink handwritten *below* the
+   header's own detected border — not caught by the two-rectangle fix
+   above, which only ever addressed sideways overflow past
+   `COLUMN_SPLIT_X` — was excluded from the word-collection window before
+   the coverage check ever ran, and shipped as a silent miss: a fully
+   legible group-member list below a correctly-positioned-but-too-short
+   box, reviewed and about to ship as clean. Fix: the window now uses the
+   full `HEADER_SEARCH_MAX_TOP` bound (the same one already used to *find*
+   labels) instead of `band.bottom + GROUP_ROW_BAND_SLACK_PT` — see the
+   "Correction, 2026-07-21" note under "Two rectangles are redacted per
+   header page" above for why no fixed slack threads this needle safely,
+   and for the accepted trade-off (0204150202/0204150203 will flag again
+   as a known false positive, cleared via the manual-redaction queue
+   rather than silently passed). Tests: `test_group_row_vertical_
+   overflow_below_the_header_border_is_not_silently_missed`
+   (`tests/test_redact.py`), `test_vertical_group_row_overflow_is_auto_
+   held_not_shipped_as_clean` (`tests/test_pipeline.py`, end-to-end, no
+   monkeypatching).
 
 ## Packet identity and the decisions store
 
@@ -336,9 +769,10 @@ Two things here are load-bearing for the delete rule and easy to get wrong:
   human declining to treat it as a valid packet at all, not approving it.
 
 **Output is deliberately one redacted PDF per approved packet, not one
-combined PDF per class** — `out/<teacher_code>/<period>/<SID>.pdf` (e.g.
-`out/020415/02/0204150204.pdf`), where `teacher_code` and `period` are the
-SID's own digits (`RosterEntry.teacher_code`, `.period_display`), not
+combined PDF per class** —
+`out/<teacher_code>/<period>/<worksheet_type>/<SID>.pdf` (e.g.
+`out/020415/02/PRT/0204150204.pdf`), where `teacher_code` and `period` are
+the SID's own digits (`RosterEntry.teacher_code`, `.period_display`), not
 anything read off the packet. (Reworked by John, 2026-07-18 from an
 earlier `out/<pdf-stem>_p<page>.pdf` naming keyed off `packet_tag` — de-
 identified output is now named and organized entirely by the identity a
@@ -348,35 +782,85 @@ path; it errors out early (before touching the filesystem) if given one,
 rather than silently creating a directory with a misleading `.pdf`-looking
 name.
 
+**`worksheet_type` is its own path segment, not folded into the SID.** A
+student has one SID but multiple worksheet types (MPR, PRT, ...), and
+`teacher_code`/`period` are both read off the SID alone — so without a
+worksheet_type segment, an MPR packet and a PRT packet for the same student
+land on the *identical* path and the second one written silently clobbers
+the first (a real incident, 2026-07-20: a PRT run overwrote/deleted 11
+already-approved MPR outputs — see "Status (handoff)"). `worksheet_type` is
+read off each packet's own header-page footer
+(`segment.read_footer`/`_parse_worksheet_type`, e.g. "PRT (01/2024)" or
+"pcMEL MPR+ADR (06/2025)" — both real, distinct forms; the trailing
+"(mm/yyyy)" revision date is stripped, and what's left is slugified into a
+directory-safe segment) from the *same* already-read footer-band text
+`PAGE_MARKER_PATTERN` searches, not a second OCR call — see "OCR is
+disk-cached..." above for why that distinction matters (a second bbox
+would mean a second, uncached OCR call across every page of segmentation).
+A header page whose
+worksheet-type label can't be parsed gets `worksheet_type=None` and an
+`issues` entry, the same treatment as an unreadable page marker — never
+guessed, never defaulted, since guessing here is exactly what would put a
+packet back at risk of the collision above.
+
 **The load-bearing invariant is "present in the output tree" iff "has a
 confirmed, approved SID."** Non-consented and pending packets are never in
 the tree under any name, including a placeholder — only a packet with a
-decision naming a SID ever produces a file. Because the file name is now
-the SID rather than the `packet_tag` that produced it, a single tag-keyed
-delete is no longer enough to enforce this on its own: a *corrected*
-decision (a human overriding an earlier match to a different SID) orphans
-its old SID's file exactly the same way a rejection does, just without an
-explicit "delete this" step naming that old file. `run_dispositions`
-therefore closes the loop with a reconciliation pass at the end of every
-run — since `roster` is always already narrowed to one teacher+period
-block (see roster.py), every SID any decision for this pdf can legally
-name lands in exactly one `out/<teacher>/<period>/` directory, so sweeping
-that one directory against the current `decisions.json` values (deleting
-any `<SID>.pdf` whose SID is no longer an approved value) catches both a
-straight rejection and a correction with the same code path, with no
-separate history of "what used to be written" to keep in sync. This holds
-for all four packet states: approved-with-SID (written), non-consented
-(deleted, absent), pending (absent, never written in the first place), and
-corrected (old SID's file swept, new SID's file written).
+decision naming a SID ever produces a file. Because the file name is the
+SID rather than the `packet_tag` that produced it, a single tag-keyed
+delete is not enough to enforce this on its own: a *corrected* decision (a
+human overriding an earlier match to a different SID) orphans its old
+SID's file exactly the same way a rejection does, just without an explicit
+"delete this" step naming that old file.
+
+An earlier design closed this gap with a reconciliation pass that swept
+the whole `out/<teacher>/<period>/` directory at the end of every run,
+deleting any `<SID>.pdf` whose SID wasn't in the *current* pdf's
+`decisions.values()`. This was safe only under the unstated assumption
+that exactly one pdf/decisions-store ever writes into that directory — an
+assumption the worksheet_type collision above already breaks (two scans,
+one directory), and which the 2026-07-20 incident exposed directly: a PRT
+run with every packet still *pending* (empty `decisions`) swept the shared
+directory against its own near-empty approved-set and deleted every file a
+*different* pdf's decisions store had approved, since the sweep had no
+notion of which pdf actually wrote which file. A pending packet producing
+no output of its own is not the same as a pending-only run being safe to
+execute at all, if the run's side effect is a sweep of state it doesn't
+own.
+
+**Fix: deletion is now ledger-based and per-tag, never a directory sweep.**
+`run_dispositions` persists a small per-`(out_dir, pdf)` ledger
+(`ledger_path`/`_load_ledger`/`_save_ledger`, at
+`out/.ledger/<pdf-stem>.json` — colocated under `out_dir`, not
+`decisions_dir`, since it's derived bookkeeping about what this output tree
+contains, not a human-editable decision) of `packet_tag -> last SID
+successfully written for it`. A deletion now only ever happens for a
+`packet_tag` this same pdf's own ledger says it previously wrote a file
+for, when *this run's own* decision for that exact tag says the old SID is
+no longer correct: an explicit `None` (confirmed non-consent — the
+ledger's old SID's file is removed) or a different SID (a correction — the
+ledger's old SID's file is removed once the new SID's file is confirmed
+written and clean). A tag absent from `decisions` (pending) is never
+consulted against the ledger at all, so it can never trigger a delete of
+its own output or anyone else's — nothing about processing a pending
+packet touches any path but its own. This holds for all four packet
+states: approved-with-SID (written, ledger updated), non-consented
+(ledger's prior file deleted if one existed, absent), pending (untouched,
+ledger untouched), and corrected (ledger's old SID's file deleted, new
+SID's file written, ledger updated to the new SID).
 
 **`verify` walks that same tree, not a flat `<pdf-stem>_p*.pdf` glob.**
 Since output file names no longer trace back to a source scan, `verify`
-takes no `--pdf` — it globs `<out>/*/*/*.pdf` and checks every file it
-finds against the full (unscoped) roster. Finding *no* files under `--out`
-is treated as a hard failure, not a vacuous pass: silently checking
-nothing because `--out` pointed at the wrong place is more dangerous than
-erroring loudly, since a clean silent run looks identical to a genuinely
-clean one.
+takes no `--pdf` — it globs `<out>/*/*/*/*.pdf` (teacher/period/
+worksheet_type/SID) and checks every file it finds against the full
+(unscoped) roster. Finding *no* files under `--out` is treated as a hard
+failure, not a vacuous pass: silently checking nothing because `--out`
+pointed at the wrong place is more dangerous than erroring loudly, since a
+clean silent run looks identical to a genuinely clean one. Beyond that
+all-or-nothing guard, `_cmd_verify` also prints an explicit `N file(s)
+checked, M failed` summary on every run, pass or fail — the per-file `ok`/
+`FAIL` lines alone don't make "checked 11 files, all clean" visually
+distinct from some subset silently never having been globbed at all.
 
 **The review UI's preview and the real output share one drawing path.**
 `review_app.py` calls the exact same `render_redaction_preview` (which
@@ -387,6 +871,172 @@ Streamlit's own session state ahead of the radio being instantiated, so
 the preview reflects a live "if you confirm this, this is what you get"
 rather than a fixed placeholder that could read differently from what
 Confirm actually produces.
+
+**A per-packet failure holds back only that packet, never the whole run
+(fixed 2026-07-20).** All five reasons a packet with an approved SID can
+still fail to redact safely — the SID isn't on the roster, the packet
+still has unresolved segmentation `issues`, `detect_header_band` couldn't
+confidently locate this page's own border, `find_uncovered_group_words`
+found Group-row ink the redaction boxes missed, or `verify_no_leaked_
+names` found a leak in the written file — used to be a raised exception
+that aborted `run_dispositions` for the *entire* pdf, mid-loop, before
+every packet after the failing one was even attempted. This was fail-fast
+in the wrong place: a data or geometry problem specific to one packet
+(this session's real trigger — SID 0204150204's page, where OCR simply
+never found the printed "Group" label) blocked every *other*
+already-reviewed, already-approved packet in the same file from being
+written, even though nothing about their own redaction was affected.
+Blocking N-1 good packets because packet N has a bad header defeats the
+review-first design the same way the 2026-07-20 ledger-sweep incident did,
+just via a different mechanism (a raised exception instead of an
+over-broad directory sweep). Fixed: each of these five conditions now
+appends a `DispositionResult` with `held_back=True` and a human-readable
+`reason` and `continue`s to the next packet, instead of raising. A
+held-back packet produces no output (any partially-written file for it is
+still deleted, same as before) and leaves any *prior* output for that tag
+completely untouched — a human hasn't confirmed a replacement is safe, so
+nothing about an old file changes. `cli.py run`'s summary line grew a
+third count for it (`N written, M deleted, K held back for review, J
+still pending review`; the CLI now exits 1 if `K > 0`) and `review_app.py`
+surfaces one `st.sidebar.warning` per held-back packet_tag/sid/reason so a
+reviewer knows exactly which packet to look at and why. This is still
+abstain-and-flag, never silently guess — see "Working preferences" below —
+just scoped to the one packet that actually has the problem instead of
+treating one packet's problem as a reason to distrust every other
+packet's already-confirmed decision. Tests: `test_undetected_header_
+border_holds_back_only_that_packet_not_the_whole_run`, `test_unknown_sid_
+in_decisions_is_held_back_not_raised`, `test_packet_with_unresolved_
+issues_is_held_back_even_with_a_decision`, `test_leak_finding_deletes_
+output_and_holds_back_not_raises` (all in `tests/test_pipeline.py`).
+
+**One of those five holds is human-overridable; the other four are not
+(fixed 2026-07-21).** The fix above stopped one packet's failure from
+blocking every other packet, but it left the detection-confidence hold
+permanently unreleasable — a reviewer who approved SID 0204150204's
+decision and clicked "Run redaction pipeline" in `review_app.py` found the
+packet still held back, with no action left that could ever change that.
+That's backwards: the entire reason a low-confidence packet routes to a
+human is so a person can make the call the geometry alone couldn't, and a
+hold nothing can clear makes review decorative for exactly the packets
+that need it. But only the detection-confidence hold is actually a
+*confidence* question — "header border not confidently detected" still
+draws a real box (the anchor- or fallback-derived geometry
+`detect_header_band` falls back to even when `detected=False`, not a null
+one), and a human looking at `review_app.py`'s own preview of that exact
+box can judge whether it covers the name. The other four (unknown SID,
+unresolved segmentation issues, `find_uncovered_group_words` finding real
+uncovered ink in the pixels, `verify_no_leaked_names` finding a real leak
+in the written text layer) are findings of an actual problem, not a
+confidence gap — staying non-overridable is the entire point of them
+existing, and letting a human wave one of those through would silently
+reopen the exact leak (SID 0204150202/"Ganik") this file's other fixes
+exist to close.
+
+Fixed: `run_dispositions` takes `detection_overrides: set[str]`, a set of
+packet_tags a human has explicitly approved for release from *only* the
+detection-confidence hold (`melredact/pipeline.py`). When a tag is in
+`detection_overrides`, an undetected-border result no longer deletes
+`out_path` and holds back — it falls through instead, but *into* the
+uncovered-group-words and `verify_no_leaked_names` checks, which still run
+unconditionally on every packet regardless of the override and still hold
+back (un-overridably) if either finds a real problem. A written packet
+that used the override still carries a `reason` noting it, so it's visibly
+distinct from a clean, confidently-detected write, not silently
+indistinguishable from one.
+
+`detection_overrides` is persisted separately from `decisions`
+(`overrides_path`/`load_detection_overrides`/`save_detection_overrides`,
+`decisions/<pdf-stem>.overrides.json`), not folded into a richer
+`decisions` value: `decisions`' `sid | None | absent` three-state contract
+is depended on by every existing `decisions/*.json` file on disk and every
+test that reads one (see "Packet identity and the decisions store" above),
+and overloading its value shape to also carry an unrelated override is a
+needless way to put that at risk.
+
+`review_app.py` exposes this as its own explicit checkbox next to the
+"header border not confidently detected" warning — a separate control from
+the Decision radio and Confirm button, deliberately: confirming a SID
+match answers "who is this", not "I've looked at the fallback box and it
+covers the name", and conflating the two would mean every ordinary
+approval silently carried this override too, even for packets where a
+human never actually looked at the geometry. Checking it calls
+`save_detection_overrides` immediately (same pattern as `_confirm` for
+decisions); the sidebar's "Run redaction pipeline" button reloads overrides
+fresh from disk the same way it already reloads decisions fresh, and
+reports an overridden write with `st.sidebar.info`, separately from a
+plain "written" count. `cli.py run` reads the same overrides file and
+prints the same per-file `reason` note next to `wrote`. Tests:
+`test_detection_override_releases_the_hold_and_writes_the_packet`,
+`test_detection_override_does_not_release_an_uncovered_ink_hold`,
+`test_detection_override_does_not_release_a_verify_leak_hold` (all in
+`tests/test_pipeline.py`).
+
+## The manual-redaction queue is a backstop, not a substitute
+
+**Added 2026-07-21, alongside the PRT packet 14 fix above.** A held-back
+packet used to just have its drafted attempt deleted — safe, but a dead
+end: a human who wants to actually *fix* a genuine geometry miss (as
+opposed to a data problem like an unknown SID) had nothing to work from
+and no way to ship a corrected version without re-running the whole
+pipeline by hand. The manual-redaction queue
+(`pipeline.manual_queue_dir`/`_queue_for_manual_redaction`/
+`list_manual_queue`/`release_from_manual_queue`) is the fix, scoped to
+exactly the two hold reasons that are actually a *geometry* problem a
+human can look at and correct — a detection-confidence hold (`detect_
+header_band` couldn't confidently locate the border) and a coverage-check
+hold (`find_uncovered_group_words` found real uncovered ink). The other
+three hold reasons (unknown SID, unresolved segmentation `issues`, a
+`verify_no_leaked_names` text-layer finding) are data or already-final-text
+problems, not something a corrected redaction band fixes, and are never
+queued — they're still just deleted, held back with a reason, same as
+before.
+
+**Queued, never just deleted: the drafted (not-safe-to-ship) attempt is
+moved, not copied, into `out_dir/.manual_queue/<pdf-stem>/<packet_tag>.pdf`
+plus a `<packet_tag>.json` sidecar (sid, worksheet_type, reason,
+pdf_path).** Moved rather than copied because the draft can be exactly as
+unsafe as the reason it was held back for — it must exist in at most one
+place on disk, never both the queue and (however briefly) anywhere else.
+Colocated under `out_dir` (the same gitignored, never-synced tree `out/`
+itself already lives in — see `.gitignore`'s existing `out/` entry, which
+already covers this), not `decisions_dir`: this is derived bookkeeping
+about what this output tree currently can't safely produce, not a
+human-editable decision.
+
+**Release re-runs the real redaction with a human-supplied corrected
+band, then re-runs the exact same two unconditional checks before writing
+anything — the checks are never bypassed, only re-parameterized.**
+`redact_packet` (and `render_redaction_preview`, for the UI's live
+preview) both grew a `band_override` parameter: when given, it's used in
+place of `detect_header_band`'s own automatic detection, but every
+downstream step — the two redaction rectangles, `find_uncovered_group_
+words` against the *actual* header words — runs exactly the same way
+against an override band as an auto-detected one. `pipeline.
+release_from_manual_queue` calls `redact_packet` with the human's
+proposed band, then checks `uncovered_group_words` and
+`verify_no_leaked_names` again; only if *both* still pass does it write to
+the real `output_path` and clear the queue entry (`_clear_manual_queue_
+entry`) and update the ledger. A wrong correction (still doesn't cover the
+ink) writes nothing and leaves the packet queued — the automated checks
+always have the final say, regardless of who supplied the geometry. This
+is the literal meaning of "backstop, not substitute": a human can release
+a packet the automated pipeline couldn't confidently redact on its own,
+but cannot release one that's still actually leaking, no matter what band
+they supply.
+
+**`review_app.py`'s "Manual redaction queue" panel** (a sidebar checkbox
+toggles it in place of the normal per-packet view) lists every queued
+entry for the currently-open pdf, shows the drafted attempt that was held
+back, and gives four number inputs (left/top/right/bottom) for a
+corrected band — previewed live through the same `render_redaction_
+preview` mechanism the ordinary decision preview uses, before a "Release
+to out/" button actually calls `release_from_manual_queue`. A release that
+still doesn't pass surfaces the checks' own reason via `st.error` rather
+than silently doing nothing. Tests: `test_manual_queue_release_with_a_
+corrected_band_writes_and_clears_the_queue`, `test_manual_queue_release_
+with_a_still_insufficient_band_stays_queued` (`tests/test_pipeline.py`),
+`test_manual_queue_panel_lists_a_queued_packet_and_can_release_it`
+(`tests/test_review_app.py`, full Streamlit AppTest round trip).
 
 ## Measured geometry
 

@@ -38,6 +38,7 @@ from melredact.config import (
     GROUP_ANCHOR,
     GROUP_ANCHOR_WORDS,
     GROUP_LABEL_WORDS,
+    GROUP_ROW_BAND_SLACK_PT,
     HEADER_SEARCH_MAX_TOP,
     NAME_ANCHOR,
     NAME_ANCHOR_WORDS,
@@ -48,6 +49,7 @@ from melredact.config import (
     TEACHER_ANCHOR,
     TEACHER_ANCHOR_WORDS,
     TEACHER_LABEL_WORDS,
+    WORKSHEET_TYPE_PATTERN,
 )
 
 Word = dict
@@ -59,6 +61,12 @@ class FooterInfo:
     page_total: int | None
     raw_text: str
     readable: bool
+    # Which worksheet this packet is (e.g. "PRT" vs "PCMEL_MPR_ADR"), read
+    # from the same footer band as page_num/page_total, independently of
+    # `readable` -- a page marker being unreadable and a worksheet-type
+    # label being unreadable are separate failure modes, not one signal.
+    # None means the label couldn't be parsed at all.
+    worksheet_type: str | None = None
 
 
 @dataclass
@@ -88,6 +96,11 @@ class Packet:
     header_page_index: int | None
     declared_total: int | None
     is_orphan: bool  # missing its first (header) page
+    # Read from the header page's own footer (see FooterInfo.worksheet_type)
+    # -- None for an orphan (no header page to read it from) or a header
+    # page whose worksheet-type label couldn't be parsed, either of which
+    # already lands this packet in `issues` below.
+    worksheet_type: str | None = None
     issues: list[str] = field(default_factory=list)
 
     @property
@@ -135,26 +148,44 @@ def _words_to_text(words: list[Word]) -> str:
     return " ".join(w["text"] for w in sorted(words, key=lambda w: (w["top"], w["x0"])))
 
 
+def _parse_worksheet_type(text: str) -> str | None:
+    """Extract and normalize the printed worksheet-type label (e.g. "PRT
+    (01/2024)", "pcMEL MPR+ADR (06/2025)") from the footer band's own text
+    -- the same blob PAGE_MARKER_PATTERN searches, not a separate OCR call
+    (see WORKSHEET_TYPE_PATTERN in config.py). The trailing "(mm/yyyy)"
+    revision date is dropped; what's left is slugified into a directory-safe
+    segment so distinct worksheet types (which otherwise share the same
+    teacher_code/period, since both come from the SID) land in separate
+    out/ subdirectories instead of colliding on the same <SID>.pdf path."""
+    m = re.search(WORKSHEET_TYPE_PATTERN, text)
+    if not m:
+        return None
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", m.group(1).strip()).strip("_").upper()
+    return slug or None
+
+
 def read_footer(page: pdfplumber.page.Page) -> FooterInfo:
-    """Read the printed 'Page X of Y' from the footer band only (not the
-    whole page), so body text elsewhere can never be mistaken for it."""
+    """Read the printed 'Page X of Y' and worksheet-type label from the
+    footer band only (not the whole page), so body text elsewhere can never
+    be mistaken for either."""
     bbox = (0, FOOTER_BAND_TOP, page.width, page.height)
     if page.chars:
         text = page.crop(bbox).extract_text() or ""
     else:
         text = _words_to_text(page_words(page, bbox))
     matches = list(re.finditer(PAGE_MARKER_PATTERN, text))
+    worksheet_type = _parse_worksheet_type(text)
 
     if len(matches) != 1:
         # Zero matches: unreadable. More than one: ambiguous. Neither is
         # something to guess through -- both mean "don't trust this".
-        return FooterInfo(page_num=None, page_total=None, raw_text=text, readable=False)
+        return FooterInfo(page_num=None, page_total=None, raw_text=text, readable=False, worksheet_type=worksheet_type)
 
     num, total = int(matches[0].group(1)), int(matches[0].group(2))
     readable = 1 <= num <= total
     if not readable:
-        return FooterInfo(page_num=None, page_total=None, raw_text=text, readable=False)
-    return FooterInfo(page_num=num, page_total=total, raw_text=text, readable=True)
+        return FooterInfo(page_num=None, page_total=None, raw_text=text, readable=False, worksheet_type=worksheet_type)
+    return FooterInfo(page_num=num, page_total=total, raw_text=text, readable=True, worksheet_type=worksheet_type)
 
 
 def is_header_page(page: pdfplumber.page.Page) -> bool:
@@ -196,7 +227,25 @@ def locate_header_anchors(words: list[Word]) -> HeaderAnchors:
     )
 
 
-def _assign_words_to_rows(words: list[Word], anchors: HeaderAnchors) -> dict[str, list[Word]]:
+def header_row_height(anchors: HeaderAnchors) -> float:
+    """One row's worth of vertical space on *this* page, from this page's
+    own located anchors -- not a fixed constant, so it survives a worksheet
+    template whose rows are taller/shorter than MPR's. Shared by
+    `_assign_words_to_rows` (bounding the group row's value-collection
+    window) and `redact.detect_header_band` (bounding the anchor-relative
+    border search) -- both need the same "how tall is one row here" measure.
+    """
+    row_height = anchors.group_top - anchors.teacher_top
+    if row_height <= 0:
+        row_height = anchors.teacher_top - anchors.name_top
+    if row_height <= 0:
+        row_height = GROUP_ANCHOR["top"] - TEACHER_ANCHOR["top"]
+    return row_height
+
+
+def _assign_words_to_rows(
+    words: list[Word], anchors: HeaderAnchors, *, band_bottom: float | None = None
+) -> dict[str, list[Word]]:
     """Assign each word within the header band to whichever row anchor it's
     vertically closest to. Not x-aware by design: Date/Period share
     Name/Teacher's row-tops, so this groups both columns of a row together.
@@ -208,30 +257,45 @@ def _assign_words_to_rows(words: list[Word], anchors: HeaderAnchors) -> dict[str
     "nearest" to something far away, and whichever anchor is at the extreme
     (topmost or bottommost) silently absorbs unrelated text.
 
-    The bottom bound is self-relative -- group_top plus one more row's
-    worth of height (this page's own teacher-to-group spacing, not a fixed
-    constant) plus ROW_ASSIGNMENT_BOTTOM_SLACK_PT -- rather than reusing
-    HEADER_SEARCH_MAX_TOP's wide, skew-tolerant slack. HEADER_SEARCH_MAX_TOP
-    is generous on purpose for *finding a label*; reusing that same generous
-    bound for *collecting a row's value words* is what let the printed
-    numbered instruction directly below the header bleed into group_text on
-    a real packet (confirmed against the real file: the header's own
-    content ends by ~135pt but that wider slack reaches to ~188pt, well
-    past where body text starts at ~172pt). This can never reach name_text
-    even when it does trigger, since name_top is always the row anchor
-    farthest from the body text below -- group_top (or teacher_top, absent
-    a located group anchor) is always the nearer anchor -- but tightening
-    the bound is still worth doing so the group field a reviewer sees
-    reflects only the group row, not a body-text fragment.
+    The bottom bound has two modes. Without `band_bottom` (segment.py's own
+    matching/field-extraction callers, which never rasterize the page, so
+    there's no detected border to anchor to): self-relative -- group_top
+    plus one more row's worth of height (this page's own teacher-to-group
+    spacing, not a fixed constant) plus ROW_ASSIGNMENT_BOTTOM_SLACK_PT --
+    rather than reusing HEADER_SEARCH_MAX_TOP's wide, skew-tolerant slack.
+    HEADER_SEARCH_MAX_TOP is generous on purpose for *finding a label*;
+    reusing that same generous bound for *collecting a row's value words*
+    is what let the printed numbered instruction directly below the header
+    bleed into group_text on a real packet. This self-relative estimate's
+    own margin over real body text turned out to range from -10pt to
+    +38pt across the real dataset (see ROW_ASSIGNMENT_BOTTOM_SLACK_PT in
+    config.py) -- good enough for group_text display, where the cost of
+    getting it wrong is a messier field a reviewer can still see through,
+    but not trustworthy enough for a security check.
+
+    With `band_bottom` (the real, rasterized header border's own bottom
+    edge -- see `redact.detect_header_band`, whose caller, `redact.
+    find_uncovered_group_words`, always has this available): `band_bottom
+    + GROUP_ROW_BAND_SLACK_PT`, a direct measurement instead of a proxy.
+    This is the anchor-relative fix, mirroring how `detect_header_band`
+    itself moved from a fixed search window to one centered on this page's
+    own located anchors -- see GROUP_ROW_BAND_SLACK_PT in config.py for
+    why its slack is deliberately small rather than a bigger constant.
+
+    Neither bound can ever reach name_text, self-relative or band-
+    anchored: name_top is always the row anchor farthest from anything
+    below the header, so nearest-anchor assignment can't route there --
+    but the group field a reviewer sees, and what the leak-check treats as
+    "group ink," should both reflect only the group row, not a body-text
+    fragment.
     """
     anchor_tops = {"name": anchors.name_top, "teacher": anchors.teacher_top, "group": anchors.group_top}
     window_min = min(anchor_tops.values()) - 20
-    row_height = anchors.group_top - anchors.teacher_top
-    if row_height <= 0:
-        row_height = anchors.teacher_top - anchors.name_top
-    if row_height <= 0:
-        row_height = GROUP_ANCHOR["top"] - TEACHER_ANCHOR["top"]
-    window_max = min(HEADER_SEARCH_MAX_TOP, anchors.group_top + row_height + ROW_ASSIGNMENT_BOTTOM_SLACK_PT)
+    if band_bottom is not None:
+        window_max = min(HEADER_SEARCH_MAX_TOP, band_bottom + GROUP_ROW_BAND_SLACK_PT)
+    else:
+        row_height = header_row_height(anchors)
+        window_max = min(HEADER_SEARCH_MAX_TOP, anchors.group_top + row_height + ROW_ASSIGNMENT_BOTTOM_SLACK_PT)
     rows: dict[str, list[Word]] = {"name": [], "teacher": [], "group": []}
     for w in words:
         if not (window_min <= w["top"] <= window_max):
@@ -316,12 +380,17 @@ def segment_pdf(pdf_path: str | Path) -> SegmentResult:
                 header_page_index=idx,
                 declared_total=footer.page_total if footer.readable else None,
                 is_orphan=False,
+                worksheet_type=footer.worksheet_type,
             )
             if not footer.readable:
                 current.issues.append(f"page {idx}: header page footer unreadable, cannot verify page count")
             elif footer.page_num != 1:
                 current.issues.append(
                     f"page {idx}: header page footer claims page {footer.page_num}, expected 1"
+                )
+            if footer.worksheet_type is None:
+                current.issues.append(
+                    f"page {idx}: header page footer worksheet type unreadable, cannot classify output"
                 )
             continue
 

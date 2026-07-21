@@ -4,12 +4,14 @@ Assumes a fresh terminal, cwd = repo root, venv not activated.
 
 ## 0. Files involved
 
-- Scan: `data/Hannel MPR PD2.pdf` (44 pages, ~77MB, ~22 packets)
-- Roster: `data/Teacher Codes_Student Codes_Demographics - 020415.csv`
+- Scan: `data/MPR/Hannel MPR PD2.pdf` (44 pages, ~77MB, ~22 packets)
+- Roster: `data/teacher_codes/Teacher Codes_Student Codes_Demographics - 020415.csv`
 
 Everything identifiable lives under `data/`, no exceptions — both files above are gitignored
-real PII. There's also `data/3 Sample Hannel MPR PD2.pdf` (6 pages) if you ever want a faster
-smoke test before running the full 44-page file.
+real PII. `data/` is organized by subfolder: `MPR/` and `PRT/` for scanned worksheet PDFs by
+type, `teacher_codes/` for roster CSVs, `samples/` for small smoke-test PDFs. There's also
+`data/samples/3 Sample Hannel MPR PD2.pdf` (6 pages) if you ever want a faster smoke test
+before running the full 44-page file.
 
 **About the blank rows in the roster CSV:** this teacher's tab covers multiple periods (02
 through 06 in the current export), with a blank row separating each period's block — that's how
@@ -47,7 +49,7 @@ section). "Processing the file" *is* launching the review app — segmentation a
 scoring happen automatically when it loads, on top of the real scan and real roster:
 
 ```
-streamlit run review_app.py -- "data/Hannel MPR PD2.pdf" "data/Teacher Codes_Student Codes_Demographics - 020415.csv"
+streamlit run review_app.py -- "data/MPR/Hannel MPR PD2.pdf" "data/teacher_codes/Teacher Codes_Student Codes_Demographics - 020415.csv"
 ```
 
 (Quote both paths — both have spaces.) This opens a browser tab. Streamlit will print a local
@@ -129,9 +131,12 @@ Main panel, per packet:
   (marked not-on-roster), never assigned a SID, until the issue is resolved out of band.
 
 Click "Run redaction pipeline" when you've confirmed what you want processed this round. Expect
-a sidebar result like `18 written, 2 deleted, 4 still pending review`, or, if a leak is ever
-caught, `Verify pass failed, output deleted: ...` (see §6 — this path deletes the bad output
-itself, it doesn't leave it sitting in `out/`).
+a sidebar result like `18 written, 2 deleted, 0 held back for review, 4 still pending review`. If
+a packet fails one of §6's checks (or its decision names a SID not on the roster, or it still has
+unresolved segmentation issues), that one packet is held back — its bad output is deleted, not
+left sitting in `out/`, and a separate `Held back: <tag> (sid ...): <reason>` warning appears in
+the sidebar for it — but every other packet in the same run still gets processed; one bad packet
+no longer blocks the rest (see CLAUDE.md's "A per-packet failure holds back only that packet").
 
 ## 4. Running the CLI instead of clicking the button
 
@@ -143,7 +148,7 @@ editing a decision by hand, after a roster correction, or just to re-run headles
 done for the day.
 
 ```
-python -m melredact.cli run --pdf "data/Hannel MPR PD2.pdf" --roster "data/Teacher Codes_Student Codes_Demographics - 020415.csv"
+python -m melredact.cli run --pdf "data/MPR/Hannel MPR PD2.pdf" --roster "data/teacher_codes/Teacher Codes_Student Codes_Demographics - 020415.csv"
 ```
 
 (Quote both paths — both have spaces.) Defaults: `--out out`, `--decisions decisions`. Add
@@ -154,18 +159,30 @@ looks like:
 wrote   out/020415/02/0204150204.pdf
 deleted out/020415/02/0204150211.pdf
 pending Hannel MPR PD2_p024 (not yet reviewed)
+held back Hannel MPR PD2_p002 (sid 0204150204): header border not confidently detected: HeaderBand(...)
 ...
-18 written, 2 deleted, 4 still pending review
+17 written, 2 deleted, 1 held back for review, 4 still pending review
 ```
 
 If nothing has been reviewed yet, it says so and every packet reports pending — that's not a bug,
 it means run the review UI first.
 
+**A held-back packet does not stop the rest of the run.** Before 2026-07-20, any one packet
+failing one of the checks in §6 below (bad header detection, uncovered group-row ink, a leak, an
+unresolved segmentation issue, or a decision naming a SID not on the roster) raised and aborted
+`run_dispositions` for the *whole* pdf — every packet after the failing one in page order was
+silently never attempted, even packets that had nothing wrong with them. That's fixed: each of
+those five conditions now holds back only its own packet (no output written for it, any prior
+output for that same tag left untouched) and the run continues to every other packet. The CLI
+exits 1 whenever anything was held back, so a script can tell "some packets need a human to look
+at them" apart from "clean run" without parsing output. See CLAUDE.md's "A per-packet failure
+holds back only that packet" for the mechanics.
+
 ```
-python -m melredact.cli verify --roster "data/Teacher Codes_Student Codes_Demographics - 020415.csv"
+python -m melredact.cli verify --roster "data/teacher_codes/Teacher Codes_Student Codes_Demographics - 020415.csv"
 ```
 
-Re-checks every `out/<teacher_code>/<period>/<SID>.pdf` against the roster (same check §6 below
+Re-checks every `out/<teacher_code>/<period>/<worksheet_type>/<SID>.pdf` against the roster (same check §6 below
 describes, just invoked directly instead of pasted as a Python snippet). `--out` overrides the
 directory scanned in either subcommand if you're not using the default `out/`. `verify` takes no
 `--pdf` — output file names no longer trace back to a source scan (see CLAUDE.md), so there's
@@ -174,12 +191,15 @@ there at all, that's an error (exit 1), not a silent pass — see §6.
 
 ## 5. Where output lands
 
-- `out/<teacher_code>/<period>/<SID>.pdf` — one redacted PDF per approved packet, e.g.
-  `out/020415/02/0204150204.pdf` (teacher code + period are the SID's own digits). Rejected
+- `out/<teacher_code>/<period>/<worksheet_type>/<SID>.pdf` — one redacted PDF per approved packet,
+  e.g. `out/020415/02/PRT/0204150204.pdf` (teacher code + period are the SID's own digits;
+  worksheet_type is read off the packet's own footer, e.g. "PRT" or "PCMEL_MPR_ADR", since a
+  student has one SID but multiple worksheet types that must never collide on one path). Rejected
   (non-consent) packets never get a file written; pending packets are untouched either way. A
   *corrected* decision (reviewer overrides an earlier match to a different SID) removes the old
-  SID's file and writes the new one. See CLAUDE.md's "present in the output tree iff has a
-  confirmed, approved SID" invariant.
+  SID's file and writes the new one — tracked per-tag via a small ledger under
+  `out/.ledger/<pdf-stem>.json`, not a directory-wide sweep (see CLAUDE.md). See CLAUDE.md's
+  "present in the output tree iff has a confirmed, approved SID" invariant.
 - `decisions/<pdf-stem>.json` — e.g. `decisions/Hannel MPR PD2.json`. The three-state
   `packet_tag -> sid | null` mapping. Safe to inspect directly; it's just JSON.
 - `.cache/melredact/<pdf-stem>/page_<idx>_<dpi>.png` — rendered preview images. Never sync this
@@ -192,9 +212,10 @@ there at all, that's an error (exit 1), not a silent pass — see §6.
 ## 6. Running verify afterward
 
 `run_dispositions` runs two checks on every packet it redacts, *before* declaring success — if
-either were going to fail, the bad file would already have been deleted and you'd have seen the
-sidebar error in §3 (or the CLI's error output, §4). So a clean "N written" result already means
-both checks passed for those N files:
+either were going to fail for a given packet, that packet's bad file would already have been
+deleted and the packet held back with a reason (see §2's "held back" line and §5's note) rather
+than written. So an "N written" result already means both checks passed for those N files
+specifically — a held-back packet elsewhere in the same run doesn't put those N files in doubt:
 
 1. `find_uncovered_group_words` — geometric, not text-based: did the redaction rectangles
    actually cover every word OCR assigned to the Group row, regardless of what OCR thinks that
@@ -209,15 +230,21 @@ If you want to independently re-check everything currently sitting in `out/` (e.
 and reopening the terminal), run:
 
 ```
-python -m melredact.cli verify --roster "data/Teacher Codes_Student Codes_Demographics - 020415.csv"
+python -m melredact.cli verify --roster "data/teacher_codes/Teacher Codes_Student Codes_Demographics - 020415.csv"
 ```
 
 Note this only re-runs check 2 above (text-based) — check 1 needs the original scan and this
 page's located anchors, which aren't available from the finished file alone (see CLAUDE.md); it
 only ever runs at write time, inside `run_dispositions`.
 
-**Pass** looks like a plain `ok   <teacher>/<period>/<SID>.pdf` line for every file — no output
-at all beyond that, no findings.
+**Pass** looks like a plain `ok   <teacher>/<period>/<worksheet_type>/<SID>.pdf` line for every file,
+followed by a summary line: `N file(s) checked, 0 failed`. The summary always prints, pass or fail —
+it's the explicit "this is how many files were actually checked" signal, so a clean-looking run
+can't be confused with a vacuous one that silently checked nothing (the separate hard failure when
+`--out` contains no matching files at all is still there too — see above — this is the count for
+whenever it did run). `verify` covers every worksheet type under `--out` in one unscoped pass, so
+a single invocation's summary count includes both MPR (`PCMEL_MPR_ADR/`) and PRT (`PRT/`) output
+sitting side by side under the same `<teacher>/<period>/`.
 
 **Fail** looks like `FAIL <filename>: [LeakFinding(page_index=..., sid=..., token=..., exact=...)]`
 — one entry per (page, roster student, matched token) triple; `exact=False` means the fuzzy pass

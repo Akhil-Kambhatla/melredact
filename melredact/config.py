@@ -63,13 +63,49 @@ HEADER_SEARCH_MAX_TOP = HEADER_BAND_FALLBACK["bottom"] + 40
 # *value* window's bottom bound is instead self-relative: group_top plus
 # one more row's worth of height (group_top - teacher_top, i.e. whatever
 # spacing this specific page's own anchors show) plus this slack, capped at
-# HEADER_SEARCH_MAX_TOP. Measured off the real file: the header's own
-# content ends by ~135pt (group row + one row height) while body text below
-# doesn't start until ~172pt -- a ~24pt-plus-tail-of-body-content gap, so
-# a bottom bound of "group row + one row height + 10pt" stays clear of it
-# with room to spare, while still comfortably covering a handwritten
-# group-members line that runs a bit taller than the printed label.
+# HEADER_SEARCH_MAX_TOP. This was originally documented as measured off
+# "the real file" with "~24pt of room to spare" over where body text
+# starts -- that number came from a single reference page and was never
+# checked against the rest of the real dataset. Measured properly
+# (2026-07-20) across all 42 real header pages we have (both worksheet
+# types): this self-relative estimate's own margin over the real first
+# line of body text ranges from -10.0pt to +38.36pt, median +5.0pt -- 3 of
+# 42 pages already negative, independent of any single incident packet.
+# `row_height` itself is the reason: it's `group_top - teacher_top` (or a
+# fallback chain when that's degenerate, e.g. the printed "Group" label
+# not being OCR-located at all), an indirect proxy for "how far down does
+# the header content go" that varies with per-page OCR noise, whereas the
+# header block's actual bottom edge is already measured directly and far
+# more reliably by `redact.detect_header_band` (same real-file check:
+# `first_body_top - band.bottom` was positive on all 42 pages, min
+# +1.92pt, median +5.28pt). This constant (and the self-relative formula
+# it slacks) is kept only for callers with no rendered band to anchor to
+# (segment.py's field-extraction/matching path never rasterizes the page).
+# See GROUP_ROW_BAND_SLACK_PT below for the band-anchored replacement used
+# wherever a caller *does* have the real border -- in particular
+# `redact.find_uncovered_group_words`, the leak-check backstop, which is
+# exactly where this self-relative formula's thin/negative margin turned
+# into real false-positive flags on real packets (including the original
+# "Ganik" incident packet, SID 0204150202).
 ROW_ASSIGNMENT_BOTTOM_SLACK_PT = 10
+
+# Band-anchored bottom slack for `_assign_words_to_rows` when a caller
+# passes `band_bottom` (the real, rasterized header border's own bottom
+# edge -- see `redact.detect_header_band`) instead of relying on the
+# self-relative `row_height` estimate above. Deliberately small, not a
+# swapped-in bigger constant: `band_bottom` is already a direct
+# measurement of the header block's true bottom, not a proxy, so it only
+# needs enough slack to (a) still catch real handwritten ink that
+# genuinely overflows a few points past the drawn border -- the scenario
+# this window exists to catch in the first place -- and (b) absorb OCR's
+# own re-measurement noise at a boundary (~0.7-1pt observed between two
+# independent OCR passes over the same word on the real file). It does
+# *not* need to absorb any assumption about where body text starts, the
+# way the old formula did -- that assumption is exactly what went wrong.
+# Measured across the same 42 real pages: `first_body_top - band.bottom`
+# never went below +1.92pt, so this slack has to stay under that with
+# real room to spare, not just barely under it.
+GROUP_ROW_BAND_SLACK_PT = 1.5
 
 # --- Footer ---
 FOOTER_BAND_TOP = 700
@@ -77,6 +113,30 @@ FOOTER_PAGE_MARKER = {"x0": 513, "x1": 570, "top": 747}
 FOOTER_WORKSHEET_TYPE = {"x0": 29, "x1": 160, "top": 736}
 # Regex-extracted from the footer text region, e.g. "Page 1 of 2".
 PAGE_MARKER_PATTERN = r"Page\s+(\d+)\s+of\s+(\d+)"
+
+# Regex-extracted from the *same* already-read footer-band text as
+# PAGE_MARKER_PATTERN (segment.read_footer crops/OCRs the whole footer band
+# once, at FOOTER_BAND_TOP, and both patterns search that one blob) -- this
+# deliberately does not issue a second OCR call at FOOTER_WORKSHEET_TYPE's
+# own narrower bbox, since that would double segmentation's OCR cost (see
+# CLAUDE.md's OCR-caching section on why bbox-keyed calls are kept at their
+# existing granularity). Matches the printed worksheet-type label up to its
+# trailing mm/yyyy revision date, e.g. "PRT (01/2024)" or "pcMEL MPR+ADR
+# (06/2025)" -- both real, distinct worksheet types confirmed on real
+# scans that must never collide in out/ (see "Output layout" in
+# pipeline.py). The parens and slash are made optional deliberately: real
+# scans have no text layer at all (see CLAUDE.md's "Real scans have no
+# text layer" section), so this string only ever reaches segment.py via
+# PaddleOCR, and measured directly on both real files, PaddleOCR drops
+# that punctuation outright -- "pcMEL MPR ADR 06 2025 Page 1 of 2" and
+# "PRT 01 2024 Page 1 of 2", not "(06/2025)"/"(01/2024)" as the printed
+# form actually reads. A pattern requiring the literal punctuation only
+# ever matched a punctuated text-layer fixture, never a real scan, and
+# would have flagged every real header page's worksheet_type as
+# unreadable. The date itself is a form revision, not part of the
+# worksheet's identity, so it's excluded from the captured group either
+# way.
+WORKSHEET_TYPE_PATTERN = r"(.+?)\s*\(?\d{2}[/\s]\d{4}\)?"
 
 # --- Rendering ---
 RENDER_DPI_FINAL = 300
@@ -136,6 +196,42 @@ BORDER_CORNER_WINDOW_PT = 3
 # narrow safe band to read the border's own row without either neighbor
 # bleeding in.
 BORDER_CORNER_SEARCH_SLACK_PT = 8
+
+# Anchor-relative corner search (see detect_header_band's `anchors`
+# parameter): a fixed absolute-position search window (BORDER_CORNER_
+# SEARCH_SLACK_PT around HEADER_BAND_FALLBACK) only works when a worksheet's
+# title/instructions block is the same length as MPR's -- confirmed broken
+# on a real second worksheet type, PRT, whose two-line title+subtitle pushes
+# name_top ~37-44pt further down the page than on MPR: the fixed window
+# either drags the detected box up into blank/title space (its own "clamp
+# outward to fallback" logic overriding a *correctly* detected border back
+# toward MPR's absolute position) or clips its search off before reaching
+# the real bottom border. The located label anchors (name_top/group_top --
+# already found per-page via OCR text search, independent of which
+# worksheet template this is) are a page-specific proxy for "where the
+# block actually is" that a fixed absolute position can never be. Measured
+# on both real files: the top border sits within ~2pt of name_top (MPR
+# +1.7pt, PRT -0.2pt) -- BORDER_TOP_ANCHOR_SLACK_PT gives this a wide
+# margin either side (OCR-located anchors carry a little sub-point jitter
+# of their own, so this can't be pinned exactly to the measured offset).
+BORDER_TOP_ANCHOR_SLACK_PT = 15
+
+# The bottom border sits some distance past group_top + one more row's
+# height (header_row_height(anchors) -- the same self-relative measure
+# segment.py already uses for the matching-assignment window): +8.4pt on
+# MPR, +0.7pt on PRT. This is a *different* boundary than segment.py's
+# ROW_ASSIGNMENT_BOTTOM_SLACK_PT (word-row assignment) -- that one is tuned
+# tight specifically to keep body text out of group_text, whereas this one
+# only has to stay clear of body text becoming a false *border* hit, a
+# looser bar since a false hit needs a solid run at the narrow left/right
+# corner columns specifically, not just any ink in the row. Widened to 15
+# after the fixture's own drawn border (+13pt past this same formula) came
+# up short with a tighter number -- 15 still leaves a few pt of clearance
+# before body text on the real PRT file (~9-11pt gap there). The backward
+# (upward) slack only needs to be small since every real/fixture border
+# sits at or after the expected point, never before it.
+BORDER_BOTTOM_ANCHOR_BACK_SLACK_PT = 5
+BORDER_BOTTOM_ANCHOR_FORWARD_SLACK_PT = 15
 
 # --- Matching ---
 # Auto-assign only when the top candidate's score clears MIN_SCORE *and*

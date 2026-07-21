@@ -258,6 +258,45 @@ def test_invisible_text_op_uses_text_render_mode_3():
     assert b"3 Tr" in op
 
 
+def test_adjacent_words_with_tight_ocr_boxes_do_not_overlap_and_read_back_in_order(tmp_path):
+    """Regression for a real leak-check-corrupting bug found on the actual
+    PRT file: real OCR word boxes are measured to the ink, often much
+    narrower than Helvetica's own advance width for that text at the font
+    size `_font_size_for_word` derives from box height (e.g. real PRT data:
+    "A" boxed at x0=40.32/x1=42.48 -- 2.16pt wide -- but Helvetica renders
+    "A" at ~10pt for that word's height-derived size). Unscaled, each word's
+    Tj run advances well past where the *next* word's own x0 places it, so
+    the two overlap in text-space; pdfplumber's word-clustering (which
+    groups characters by x-proximity, not by which Tj call produced them)
+    then interleaves the overlapping runs into a single garbled token on
+    read-back -- this is exactly what turned the real file's clean "A
+    Plausibility Ranking Task" into "A PlausibilRitya nkinTga sk" and what
+    let `verify_no_leaked_names` see corrupted, name-like fragments it had
+    never actually been asked to check. Reproduced here with a fixture
+    narrow enough to trigger the same overlap without needing the real
+    scan."""
+    words = [
+        {"text": "A", "x0": 40.32, "x1": 42.48, "top": 26.16, "bottom": 41.28},
+        {"text": "Plausibility", "x0": 54.96, "x1": 101.04, "top": 26.16, "bottom": 41.28},
+        {"text": "Ranking", "x0": 109.44, "x1": 145.2, "top": 26.16, "bottom": 41.28},
+        {"text": "Task", "x0": 153.6, "x1": 170.4, "top": 26.16, "bottom": 41.28},
+    ]
+    page_w, page_h = 612.0, 792.0
+    writer = _PdfWriter()
+    blank = Image.new("RGB", (int(page_w), int(page_h)), "white")
+    writer.add_page(blank, words, page_w, page_h)
+    out = tmp_path / "tight_boxes.pdf"
+    writer.save(out)
+
+    with pdfplumber.open(out) as pdf:
+        text = pdf.pages[0].extract_text() or ""
+        got_words = [w["text"] for w in pdf.pages[0].extract_words()]
+
+    assert got_words == ["A", "Plausibility", "Ranking", "Task"]
+    assert "A Plausibility Ranking Task" in text
+    assert "PlausibilRitya" not in text
+
+
 # --- Pixel redaction + text-layer stripping, via the real redact_packet ---
 
 
@@ -478,6 +517,71 @@ def test_group_row_overflow_past_column_split_is_fully_redacted(tmp_path):
     assert "02" in text
 
 
+def test_group_row_overflow_is_covered_when_header_block_sits_lower_on_the_page(tmp_path):
+    """Regression for a second real worksheet type, PRT: its title+subtitle
+    is taller than MPR's, so the *same* bordered block -- same printed
+    labels, same internal row spacing -- sits ~37-44pt further down the
+    real page than it does on MPR. Before detect_header_band became
+    anchor-relative (searching around this page's own located labels
+    instead of a fixed absolute position), this pushed the detected box up
+    into blank/title space and left it short of the true bottom border,
+    shipping a real file (SID 0204150201) with "Group members, if any:
+    Asael, Chevron, Deehiya" fully legible below an incorrectly-placed box.
+
+    Built with the same overflow-past-COLUMN_SPLIT_X shape as the sibling
+    MPR-shaped test above, just at `block_offset_pt=40` (comfortably past
+    the real 37-44pt shift) -- the group row must still end up fully
+    covered, and the box must not have crept up into the title/blank space
+    well above the block.
+    """
+    block_offset_pt = 40.0
+    long_group_text = "Aaaaaaaaaa Bbbbbbbbbb Cccccccccc Ddddddddddd Eeeeeeeeeee Ganiktest"
+    img = render_header_image(
+        name_text="Alex Rivera",
+        teacher_text="Hannel",
+        group_text=long_group_text,
+        date_text="10/03/2025",
+        period_text="02",
+        worksheet_type="PRT (01/2024)",
+        page_marker="Page 1 of 1",
+        shade_blank_rows=False,
+        block_offset_pt=block_offset_pt,
+    )
+    items = [
+        InvisibleText("Name:", GROUP_ANCHOR["x0"], 68 + block_offset_pt, 9),
+        InvisibleText("Alex Rivera", 150, 68 + block_offset_pt),
+        InvisibleText("Teacher:", GROUP_ANCHOR["x0"], 87 + block_offset_pt, 9),
+        InvisibleText("Hannel", 150, 87 + block_offset_pt),
+        InvisibleText("Group members, if any:", GROUP_ANCHOR["x0"], GROUP_ANCHOR["top"] + block_offset_pt, 9),
+        InvisibleText(long_group_text, 150, GROUP_ANCHOR["top"] + block_offset_pt),
+        InvisibleText("10/03/2025", 450, 68 + block_offset_pt),
+        InvisibleText("02", 450, 87 + block_offset_pt),
+        InvisibleText("Page 1 of 1", 513, 747, 9),
+    ]
+    builder = PdfBuilder()
+    builder.add_page(img, items)
+    pdf_path = tmp_path / "prt_shaped_overflow.pdf"
+    builder.save(pdf_path)
+
+    packet = Packet(packet_index=1, page_indices=[0], header_page_index=0, declared_total=1, is_orphan=False, issues=[])
+    out = tmp_path / "prt_shaped_overflow_redacted.pdf"
+    result = redact_packet(pdf_path, packet, out, dpi=DPI)
+
+    assert result.band is not None and result.band.detected, result.band
+    # Must not have been clamped up toward the (unshifted) MPR fallback --
+    # the box has to follow the block down the page, not sit near the top.
+    assert result.band.top > HEADER_BAND_FALLBACK["top"] + block_offset_pt - 15, result.band
+
+    assert result.uncovered_group_words == [], result.uncovered_group_words
+    with pdfplumber.open(out) as pdf:
+        text = pdf.pages[0].extract_text() or ""
+    for word in long_group_text.split():
+        assert word not in text, word
+    # Date/Period, sitting above the overflow strip, must still survive.
+    assert "10/03/2025" in text
+    assert "02" in text
+
+
 def test_find_uncovered_group_words_actually_catches_a_miss():
     """Proves find_uncovered_group_words has teeth: a Group-row word that
     sits outside both redaction rectangles must be reported, not silently
@@ -501,6 +605,55 @@ def test_find_uncovered_group_words_actually_catches_a_miss():
     ]
     escaping = find_uncovered_group_words(header_words, anchors, left_bbox, right_bbox)
     assert escaped_word in escaping
+
+
+def test_group_row_vertical_overflow_below_the_header_border_is_not_silently_missed(tmp_path):
+    """Regression for a real leak (PRT packet 14, CLAUDE.md): Group-row
+    handwriting can overflow *downward*, past the header's own printed/
+    detected bottom border, not just sideways past COLUMN_SPLIT_X (the
+    class test_group_row_overflow_past_column_split_is_fully_redacted
+    already covers). Before this fix, find_uncovered_group_words bounded
+    its own word-collection window at band_bottom + GROUP_ROW_BAND_SLACK_PT
+    (1.5pt), so ink genuinely below the detected border never entered the
+    check as a candidate "group" word at all -- neither redaction
+    rectangle covers anything below band.bottom either, so this class of
+    overflow shipped fully legible with the check reporting nothing wrong.
+    Fictional names stand in for the real ones (never commit real student
+    PII -- see CLAUDE.md/data/README.md)."""
+    overflow_text = "Priya Xavier Noor"
+    img = render_header_image(
+        name_text="Alex Rivera",
+        teacher_text="Hannel",
+        group_text="",  # drawn via the invisible layer below, not here
+        date_text="10/03/2025",
+        period_text="02",
+        worksheet_type="PRT (01/2024)",
+        page_marker="Page 1 of 1",
+        shade_blank_rows=False,
+    )
+    overflow_top_pt = HEADER_BAND_FALLBACK["bottom"] + 12  # past the border, short of the printed instruction at 170
+    items = [
+        InvisibleText("Name:", GROUP_ANCHOR["x0"], 68, 9),
+        InvisibleText("Alex Rivera", 150, 68),
+        InvisibleText("Group members, if any:", GROUP_ANCHOR["x0"], GROUP_ANCHOR["top"], 9),
+        InvisibleText(overflow_text, 150, overflow_top_pt),
+        InvisibleText("10/03/2025", 450, 68),
+        InvisibleText("02", 450, 87),
+        InvisibleText("Page 1 of 1", 513, 747, 9),
+    ]
+    builder = PdfBuilder()
+    builder.add_page(img, items)
+    pdf_path = tmp_path / "vertical_overflow.pdf"
+    builder.save(pdf_path)
+
+    packet = Packet(packet_index=1, page_indices=[0], header_page_index=0, declared_total=1, is_orphan=False, issues=[])
+    out = tmp_path / "vertical_overflow_redacted.pdf"
+    result = redact_packet(pdf_path, packet, out, dpi=DPI)
+
+    assert result.band is not None and result.band.detected, result.band
+    assert result.uncovered_group_words, "vertical overflow past the border must be flagged, not silently missed"
+    escaped = " ".join(w["text"] for w in result.uncovered_group_words)
+    assert any(name in escaped for name in ("Priya", "Xavier", "Noor"))
 
 
 # --- Full-document verify pass ---

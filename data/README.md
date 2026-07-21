@@ -3,10 +3,14 @@
 This directory holds real, identifiable inputs and is gitignored except for
 this file. Nothing else in here should ever be committed.
 
-Expected contents (local only):
+Expected contents (local only), organized by subfolder:
 
-- Scanned PDFs downloaded from Box, one per teacher/period/assessment.
-- Roster CSVs exported from the Google Sheet (`SID`, `Last Name`, `First Name`).
+- `MPR/` — scanned MPR worksheet PDFs downloaded from Box.
+- `PRT/` — scanned PRT worksheet PDFs downloaded from Box.
+- `teacher_codes/` — roster CSVs exported from the Google Sheet (`SID`,
+  `Last Name`, `First Name`).
+- `samples/` — small sample/smoke-test PDFs (a handful of pages cut from a
+  real scan), used for a faster local run than the full file.
 
 ## Do not sync `.cache/`
 

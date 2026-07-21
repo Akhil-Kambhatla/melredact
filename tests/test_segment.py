@@ -2,7 +2,14 @@ import pdfplumber
 import pytest
 
 from melredact.config import GROUP_ANCHOR, HEADER_SEARCH_MAX_TOP, NAME_ANCHOR, TEACHER_ANCHOR
-from melredact.segment import HeaderAnchors, _assign_words_to_rows, extract_header_fields, is_header_page, segment_pdf
+from melredact.segment import (
+    HeaderAnchors,
+    _assign_words_to_rows,
+    _parse_worksheet_type,
+    extract_header_fields,
+    is_header_page,
+    segment_pdf,
+)
 from tests.make_fixture import (
     HEAVY_PACKETS,
     PACKETS,
@@ -76,6 +83,52 @@ def test_complete_packet_before_an_edge_case_is_unaffected(edge_case_pdf):
     normal = result.packets[0]
     assert normal.page_indices == [0, 1]
     assert normal.issues == []
+
+
+# --- Worksheet type (out/ path scoping) ---
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("PRT (01/2024)", "PRT"),
+        ("pcMEL MPR+ADR (06/2025)", "PCMEL_MPR_ADR"),
+        ("PRT (01/2024) Page 3 of 4", "PRT"),  # same joined footer-band blob as page marker
+        ("no parenthetical date here", None),
+        ("", None),
+    ],
+)
+def test_parse_worksheet_type_strips_revision_date_and_slugifies(raw, expected):
+    assert _parse_worksheet_type(raw) == expected
+
+
+def test_main_fixture_packets_carry_the_parsed_worksheet_type(main_fixture):
+    """Every header packet in the fixture embeds the real "pcMEL MPR+ADR
+    (06/2025)" footer text (see make_fixture.WORKSHEET_TYPE_TEXT) -- this
+    must come through segment_pdf as the slugified type, not go unread."""
+    result = segment_pdf(main_fixture.pdf_path)
+    for packet in result.packets:
+        if packet.header_page_index is not None:
+            assert packet.worksheet_type == "PCMEL_MPR_ADR"
+
+
+def test_unreadable_worksheet_type_is_flagged_not_silently_ignored(tmp_path, monkeypatch):
+    """Same treatment as an unreadable page marker (see
+    test_unreadable_footer_is_flagged_not_silently_dropped): a header page
+    whose footer worksheet-type label can't be parsed must not silently
+    fall through with worksheet_type=None -- that would eventually let
+    run_dispositions write to an out/ path missing its type segment, the
+    exact class of bug that let an MPR and a PRT packet collide."""
+    import tests.make_fixture as fixture_mod
+
+    monkeypatch.setattr(fixture_mod, "WORKSHEET_TYPE_TEXT", "Untitled Form")  # no "(mm/yyyy)" to parse
+    fixture = fixture_mod.build_main_fixture(tmp_path)
+    result = segment_pdf(fixture.pdf_path)
+    header_packets = [p for p in result.packets if p.header_page_index is not None]
+    assert header_packets
+    for packet in header_packets:
+        assert packet.worksheet_type is None
+        assert any("worksheet type unreadable" in issue for issue in packet.issues)
 
 
 def test_orphan_page_does_not_get_merged_into_prior_complete_packet(edge_case_pdf):
@@ -173,6 +226,47 @@ def test_group_row_handwriting_just_past_the_label_still_gets_assigned():
     handwriting = {"text": "Nadia,", "x0": 150, "x1": 190, "top": anchors.group_top + row_height - 2, "bottom": anchors.group_top + row_height + 6}
     rows = _assign_words_to_rows([handwriting], anchors)
     assert handwriting in rows["group"]
+
+
+def test_band_bottom_anchor_excludes_body_text_the_self_relative_window_missed():
+    """Regression for a real false positive found regenerating SID
+    0204150202 (the original Ganik incident packet) and SID 0204150203:
+    real per-page `row_height` varies enough that the self-relative window
+    (group_top + row_height + ROW_ASSIGNMENT_BOTTOM_SLACK_PT) swept the
+    printed "1. Please work on this individually:" instruction into the
+    group row on these two real pages, even though the *general* case is
+    already covered by test_body_text_well_below_the_header_does_not_
+    reach_group_row above -- measured across all 42 real header pages we
+    have, this self-relative estimate's own margin over real body text
+    ranged from -10pt to +38pt (see ROW_ASSIGNMENT_BOTTOM_SLACK_PT in
+    config.py), not the "room to spare" it was documented as having.
+
+    Real measured numbers from SID 0204150202's header page: name_top=
+    43.68, teacher_top=78.24, group_top=105.84 (self-relative row_height=
+    27.6, window_max=143.44 -- the "individually" word's real top of
+    143.04 sneaks inside by 0.4pt). The real detected header border
+    (band.bottom) on the same page is 138.24, well clear of it -- this is
+    the anchor-relative fix, mirroring how detect_header_band itself moved
+    from a fixed window to one centered on this page's own located
+    anchors."""
+    anchors = HeaderAnchors(
+        name_top=43.68,
+        teacher_top=78.24,
+        group_top=105.84,
+        name_found=True,
+        teacher_found=True,
+        group_found=True,
+    )
+    instruction_word = {"text": "individually", "x0": 195.6, "x1": 255.84, "top": 143.04, "bottom": 161.52}
+
+    # Without band_bottom, the self-relative window still lets it through --
+    # confirms this is the real, previously-shipped-with bug, not a strawman.
+    rows_self_relative = _assign_words_to_rows([instruction_word], anchors)
+    assert instruction_word in rows_self_relative["group"]
+
+    # With the real detected border passed through, it's correctly excluded.
+    rows_band_anchored = _assign_words_to_rows([instruction_word], anchors, band_bottom=138.24)
+    assert instruction_word not in rows_band_anchored["group"]
 
 
 def test_body_text_bleed_can_never_reach_name_row_even_within_the_wider_search_window():

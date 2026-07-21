@@ -59,11 +59,14 @@ from PIL import Image, ImageDraw, ImageFont
 from pikepdf import Dictionary, Name
 
 from melredact.config import (
+    BORDER_BOTTOM_ANCHOR_BACK_SLACK_PT,
+    BORDER_BOTTOM_ANCHOR_FORWARD_SLACK_PT,
     BORDER_CORNER_SEARCH_SLACK_PT,
     BORDER_CORNER_WINDOW_PT,
     BORDER_DARK_THRESHOLD,
     BORDER_LINE_FRACTION,
     BORDER_SEARCH_SLACK_PT,
+    BORDER_TOP_ANCHOR_SLACK_PT,
     COLUMN_SPLIT_X,
     GROUP_ANCHOR,
     GROUP_ROW_SPLIT_OFFSET_PT,
@@ -81,7 +84,14 @@ from melredact.config import (
     STAMP_PADDING_PT,
 )
 from melredact.roster import Roster
-from melredact.segment import HeaderAnchors, Packet, _assign_words_to_rows, locate_header_anchors, page_words
+from melredact.segment import (
+    HeaderAnchors,
+    Packet,
+    _assign_words_to_rows,
+    header_row_height,
+    locate_header_anchors,
+    page_words,
+)
 
 Word = dict
 Bbox = tuple[float, float, float, float]  # (left, top, right, bottom) in page points, top-down
@@ -100,39 +110,65 @@ def detect_header_band(
     image: Image.Image,
     *,
     dpi: int,
+    anchors: HeaderAnchors | None = None,
+    row_height: float | None = None,
     fallback: dict = HEADER_BAND_FALLBACK,
     search_slack_pt: float = BORDER_SEARCH_SLACK_PT,
     dark_threshold: int = BORDER_DARK_THRESHOLD,
     line_fraction: float = BORDER_LINE_FRACTION,
     corner_window_pt: float = BORDER_CORNER_WINDOW_PT,
     corner_search_slack_pt: float = BORDER_CORNER_SEARCH_SLACK_PT,
+    top_anchor_slack_pt: float = BORDER_TOP_ANCHOR_SLACK_PT,
+    bottom_anchor_back_slack_pt: float = BORDER_BOTTOM_ANCHOR_BACK_SLACK_PT,
+    bottom_anchor_forward_slack_pt: float = BORDER_BOTTOM_ANCHOR_FORWARD_SLACK_PT,
 ) -> HeaderBand:
     """Locate the drawn header border by scanning the raster for rows/
-    columns that are mostly dark pixels (a printed rule), within a search
-    window around HEADER_BAND_FALLBACK.
+    columns that are mostly dark pixels (a printed rule).
 
-    HEADER_BAND_FALLBACK is a floor on the *result*, not merely a
-    substitute used when detection fails outright: whichever edges are
-    actually found are still clamped outward (never inward) toward the
-    fallback numbers, so a smaller-than-expected detected box can never
-    under-redact relative to the measured floor.
+    Left/right (vertical rules) barely move between worksheet templates --
+    same page width, same margins -- so those are still found with a global
+    column scan using a generous fixed slack around `fallback`.
+
+    Top/bottom (horizontal rules) are a different story: their absolute
+    page position depends entirely on how long *this worksheet's* title/
+    instructions block is above the header table, which varies by
+    worksheet type (confirmed on two real files: PRT's two-line title
+    pushes name_top ~37-44pt further down the page than MPR's). A fixed
+    absolute-position search window (the old behavior, still used below
+    when `anchors` is omitted) only finds the right rule when a worksheet
+    happens to share MPR's own title length -- on PRT it either clamped the
+    box up into blank/title space or clipped its own search short of the
+    real bottom border, leaving the Group row's ink outside the redaction
+    box entirely.
+
+    When `anchors` (this page's own located Name/Teacher/Group label
+    positions -- worksheet-agnostic, found by literal OCR text search, not
+    position) is given, the top/bottom search is instead centered on this
+    page's own block: the top rule near `anchors.name_top`
+    (BORDER_TOP_ANCHOR_SLACK_PT either side -- both real files' true border
+    sits within ~2pt of name_top), and the bottom rule near
+    `anchors.group_top + row_height` (one more row's height past Group,
+    the same self-relative measure segment.py already uses for the
+    matching-assignment window), with back/forward slack from config.
+    This adapts to wherever the block actually sits, instead of assuming
+    it's wherever MPR's own title happened to put it.
+
+    Without `anchors` (or when none of its three labels were found), this
+    falls back to the old fixed-window behavior entirely, searching around
+    the static HEADER_BAND_FALLBACK numbers and clamping outward toward
+    them -- the safest available behavior when there's no page-specific
+    information to anchor to at all.
 
     A skewed scan tilts the whole rectangle, top/bottom rules included --
     but confirmed against the real file, no row-based scan can find a
     tilted top/bottom rule cleanly: generous enough to tolerate the tilt,
-    it also reaches the section title sitting close above the box (~5pt
-    gap, measured); narrow enough to exclude the title, it can't span a
-    rule that occupies a different row at each x under tilt. The left/right
-    rules don't have this problem -- even tilted, they stay close enough to
-    vertical for a global column scan to find reliably (unchanged from
-    before). So top/bottom are instead read off the *already-found*
-    left/right columns' own vertical extent: a narrow window right at each
-    detected column, searched over a tight band around the fallback's own
-    top/bottom (see BORDER_CORNER_SEARCH_SLACK_PT -- deliberately much
-    tighter than `search_slack_pt`, to stay clear of both the title above
-    and body text below), gives that corner's own top/bottom hit row
-    directly. top/bottom are then the envelope across the two corners (min
-    top, max bottom) -- the AABB of the tilted rectangle.
+    it also reaches the section title sitting close above the box; narrow
+    enough to exclude the title, it can't span a rule that occupies a
+    different row at each x under tilt. So top/bottom are instead read off
+    the *already-found* left/right columns' own vertical extent: a narrow
+    window right at each detected column gives that corner's own top/
+    bottom hit row directly. top/bottom are then the envelope across the
+    two corners (min top, max bottom) -- the AABB of the tilted rectangle.
     """
     scale = dpi / 72.0
     gray = np.asarray(image.convert("L"))
@@ -141,15 +177,28 @@ def detect_header_band(
     def to_px(v: float) -> int:
         return int(round(v * scale))
 
+    anchored = anchors is not None and (anchors.name_found or anchors.teacher_found or anchors.group_found)
+    if anchored:
+        expected_top = anchors.name_top
+        expected_bottom = anchors.group_top + (row_height if row_height is not None else header_row_height(anchors))
+        col_y_top = min(fallback["top"], expected_top - top_anchor_slack_pt)
+        col_y_bottom = max(fallback["bottom"], expected_bottom + bottom_anchor_forward_slack_pt)
+    else:
+        expected_top = fallback["top"]
+        expected_bottom = fallback["bottom"]
+        col_y_top = fallback["top"]
+        col_y_bottom = fallback["bottom"]
+
     x0 = max(0, to_px(fallback["left"] - search_slack_pt))
     x1 = min(w, to_px(fallback["right"] + search_slack_pt))
 
     dark = gray < dark_threshold
 
-    # Vertical rules (left/right edges) first: a global column scan over the
-    # fallback band's own y-span (tolerates tilt fine, since even a tilted
-    # rule stays close to vertical -- confirmed against the real file).
-    col_slice = dark[to_px(fallback["top"]) : to_px(fallback["bottom"]), x0:x1]
+    # Vertical rules (left/right edges) first: a global column scan over a
+    # y-span wide enough to cover wherever this page's block actually is
+    # (tolerates tilt fine, since even a tilted rule stays close to
+    # vertical -- confirmed against the real file).
+    col_slice = dark[max(0, to_px(col_y_top)) : min(h, to_px(col_y_bottom)), x0:x1]
     col_frac = col_slice.mean(axis=0) if col_slice.size else np.array([])
     col_hits = np.nonzero(col_frac >= line_fraction)[0]
     left_col = int(col_hits[0]) + x0 if len(col_hits) else None
@@ -157,9 +206,23 @@ def detect_header_band(
 
     # Horizontal rules (top/bottom edges), read off each vertical rule's own
     # extent -- see the docstring above for why this replaces a row-based
-    # scan entirely.
-    cy0 = max(0, to_px(fallback["top"] - corner_search_slack_pt))
-    cy1 = min(h, to_px(fallback["bottom"] + corner_search_slack_pt))
+    # scan entirely. Top and bottom get their own independent windows
+    # (anchor-relative, when available) rather than one shared window, since
+    # the two rules can sit far apart on the page and a single window wide
+    # enough to reach both risks grabbing an internal row divider instead.
+    if anchored:
+        top_cy0, top_cy1 = expected_top - top_anchor_slack_pt, expected_top + top_anchor_slack_pt
+        bot_cy0, bot_cy1 = expected_bottom - bottom_anchor_back_slack_pt, expected_bottom + bottom_anchor_forward_slack_pt
+    else:
+        top_cy0 = top_cy1 = bot_cy0 = bot_cy1 = None
+    if not anchored:
+        cy0 = fallback["top"] - corner_search_slack_pt
+        cy1 = fallback["bottom"] + corner_search_slack_pt
+        top_cy0 = bot_cy0 = cy0
+        top_cy1 = bot_cy1 = cy1
+
+    top_py0, top_py1 = max(0, to_px(top_cy0)), min(h, to_px(top_cy1))
+    bot_py0, bot_py1 = max(0, to_px(bot_cy0)), min(h, to_px(bot_cy1))
     corner_px = max(1, to_px(corner_window_pt))
     top_hits: list[int] = []
     bottom_hits: list[int] = []
@@ -168,23 +231,40 @@ def detect_header_band(
             continue
         cx0 = max(0, col - corner_px)
         cx1 = min(w, col + corner_px + 1)
-        corner_slice = dark[cy0:cy1, cx0:cx1]
-        if corner_slice.size == 0:
-            continue
-        corner_row_frac = corner_slice.mean(axis=1)
-        corner_hits = np.nonzero(corner_row_frac >= line_fraction)[0]
-        if len(corner_hits):
-            top_hits.append(int(corner_hits[0]) + cy0)
-            bottom_hits.append(int(corner_hits[-1]) + cy0)
+        top_slice = dark[top_py0:top_py1, cx0:cx1]
+        if top_slice.size:
+            top_frac = top_slice.mean(axis=1)
+            hits = np.nonzero(top_frac >= line_fraction)[0]
+            if len(hits):
+                top_hits.append(int(hits[0]) + top_py0)
+        bottom_slice = dark[bot_py0:bot_py1, cx0:cx1]
+        if bottom_slice.size:
+            bottom_frac = bottom_slice.mean(axis=1)
+            hits = np.nonzero(bottom_frac >= line_fraction)[0]
+            if len(hits):
+                bottom_hits.append(int(hits[-1]) + bot_py0)
     top_row = min(top_hits) if top_hits else None
     bottom_row = max(bottom_hits) if bottom_hits else None
 
     detected = None not in (top_row, bottom_row, left_col, right_col)
 
-    final_top = min(top_row / scale, fallback["top"]) if top_row is not None else fallback["top"]
-    final_bottom = max(bottom_row / scale, fallback["bottom"]) if bottom_row is not None else fallback["bottom"]
-    final_left = min(left_col / scale, fallback["left"]) if left_col is not None else fallback["left"]
-    final_right = max(right_col / scale, fallback["right"]) if right_col is not None else fallback["right"]
+    if anchored:
+        # No clamping toward the (worksheet-specific) fallback numbers here
+        # -- that clamp is exactly what used to override a correctly
+        # detected PRT border back toward MPR's absolute position. Absent a
+        # clean detection, the honest anchor-derived expectation is a
+        # better-informed placeholder than a fixed constant from a
+        # different template, but `detected=False` still means "don't trust
+        # this" to callers (see redact_packet/run_dispositions).
+        final_top = top_row / scale if top_row is not None else expected_top
+        final_bottom = bottom_row / scale if bottom_row is not None else expected_bottom
+        final_left = left_col / scale if left_col is not None else fallback["left"]
+        final_right = right_col / scale if right_col is not None else fallback["right"]
+    else:
+        final_top = min(top_row / scale, fallback["top"]) if top_row is not None else fallback["top"]
+        final_bottom = max(bottom_row / scale, fallback["bottom"]) if bottom_row is not None else fallback["bottom"]
+        final_left = min(left_col / scale, fallback["left"]) if left_col is not None else fallback["left"]
+        final_right = max(right_col / scale, fallback["right"]) if right_col is not None else fallback["right"]
 
     return HeaderBand(left=final_left, top=final_top, right=final_right, bottom=final_bottom, detected=detected)
 
@@ -282,8 +362,10 @@ def render_redaction_preview(
     header_page_image: Image.Image,
     *,
     dpi: int,
+    anchors: HeaderAnchors | None = None,
     group_top: float | None = None,
     stamp_lines: list[str] | None = None,
+    band_override: HeaderBand | None = None,
 ) -> tuple[Image.Image, HeaderBand]:
     """Non-destructive preview of what redact_packet would do to this
     header page: same detection + box-drawing (including the same
@@ -292,17 +374,30 @@ def render_redaction_preview(
     exact mechanism (rather than a simplified stand-in) guarantees the
     preview and the real output can't drift apart.
 
-    `group_top` should be this page's own located Group-row anchor (e.g.
-    `extract_header_fields(...).anchors.group_top`, which the caller
-    typically already has for the field table) so the preview's overflow
-    strip lands in the same place redact_packet's would; falls back to
-    the fixed GROUP_ANCHOR measurement for callers with no anchors handy.
+    `anchors` should be this page's own located anchors (e.g.
+    `extract_header_fields(...).anchors`, which the caller typically
+    already has for the field table) so border detection is anchored to
+    *this* page's block the same way redact_packet's is -- see
+    detect_header_band's docstring for why a fixed-position search doesn't
+    generalize across worksheet types. `group_top` is still accepted
+    separately for a caller that has that one number but not full anchors;
+    defaults to `anchors.group_top` when anchors are given, else the fixed
+    GROUP_ANCHOR measurement.
+
+    `band_override`, when given, skips auto-detection entirely and previews
+    that exact geometry instead -- review_app.py's manual-redaction queue
+    uses this so a human can see what a proposed corrected band would
+    actually cover *before* calling `pipeline.release_from_manual_queue`,
+    the same way the ordinary decision preview lets a reviewer see a
+    candidate match before confirming it.
     """
     preview = header_page_image.copy()
-    band = detect_header_band(preview, dpi=dpi)
-    left_bbox, right_bbox = redact_bboxes_for_band(
-        band, group_top if group_top is not None else GROUP_ANCHOR["top"]
-    )
+    row_height = header_row_height(anchors) if anchors is not None else None
+    band = band_override if band_override is not None else detect_header_band(preview, dpi=dpi, anchors=anchors, row_height=row_height)
+    effective_group_top = group_top
+    if effective_group_top is None:
+        effective_group_top = anchors.group_top if anchors is not None else GROUP_ANCHOR["top"]
+    left_bbox, right_bbox = redact_bboxes_for_band(band, effective_group_top)
     _draw_redaction_box(preview, left_bbox, dpi, stamp_lines)
     _draw_redaction_box(preview, right_bbox, dpi, draw_stamp=False)
     return preview, band
@@ -310,6 +405,72 @@ def render_redaction_preview(
 
 def _font_size_for_word(word: Word) -> float:
     return max(4.0, word["bottom"] - word["top"])
+
+
+# Standard Helvetica advance widths (1/1000 em, StandardEncoding/WinAnsiEncoding
+# agree on all of these), the built-in metrics any PDF reader falls back to for
+# one of the 14 standard fonts when the font dict carries no Widths array (ours
+# doesn't -- see _PdfWriter._font). These are the numbers pdfplumber actually
+# uses to compute each character's on-page position when it reconstructs text,
+# so they're what the real-world overlap bug below has to be measured against,
+# not eyeballed.
+_HELVETICA_WIDTHS = {
+    " ": 278, "!": 278, '"': 355, "#": 556, "$": 556, "%": 889, "&": 667, "'": 191,
+    "(": 333, ")": 333, "*": 389, "+": 584, ",": 278, "-": 333, ".": 278, "/": 278,
+    "0": 556, "1": 556, "2": 556, "3": 556, "4": 556, "5": 556, "6": 556, "7": 556,
+    "8": 556, "9": 556, ":": 278, ";": 278, "<": 584, "=": 584, ">": 584, "?": 556,
+    "@": 1015,
+    "A": 667, "B": 667, "C": 722, "D": 722, "E": 667, "F": 611, "G": 778, "H": 722,
+    "I": 278, "J": 500, "K": 667, "L": 556, "M": 833, "N": 722, "O": 778, "P": 667,
+    "Q": 778, "R": 722, "S": 667, "T": 611, "U": 722, "V": 667, "W": 944, "X": 667,
+    "Y": 667, "Z": 611,
+    "[": 278, "\\": 278, "]": 278, "^": 469, "_": 556, "`": 333,
+    "a": 556, "b": 556, "c": 500, "d": 556, "e": 556, "f": 278, "g": 556, "h": 556,
+    "i": 222, "j": 222, "k": 500, "l": 222, "m": 833, "n": 556, "o": 556, "p": 556,
+    "q": 556, "r": 333, "s": 500, "t": 278, "u": 556, "v": 500, "w": 722, "x": 500,
+    "y": 500, "z": 500,
+    "{": 334, "|": 260, "}": 334, "~": 584,
+}
+_HELVETICA_DEFAULT_WIDTH = 556
+_HSCALE_MIN = 0.05
+_HSCALE_MAX = 20.0
+
+
+def _helvetica_advance_width(text: str, size: float) -> float:
+    """Width Helvetica would actually render `text` at, in page points --
+    the number that matters for _horizontal_scale_for_word below, not the
+    OCR-measured word box, since it's Helvetica's own metrics (not the
+    box) that a reader with no Widths array falls back to."""
+    return sum(_HELVETICA_WIDTHS.get(ch, _HELVETICA_DEFAULT_WIDTH) for ch in text) / 1000.0 * size
+
+
+def _horizontal_scale_for_word(word: Word, size: float) -> float:
+    """Real scans (see melredact/ocr.py) produce OCR word boxes measured to
+    the actual ink -- often narrower than Helvetica's own advance width for
+    the same text at the font size `_font_size_for_word` derives from box
+    height. Positioning every word at its own absolute x0 (already true,
+    see _invisible_text_op) is not enough on its own: with no horizontal
+    scale correction, Helvetica renders each word wider than its measured
+    box, so it advances past the *next* word's x0 and the two overlap in
+    text-space. pdfplumber's word-clustering (which groups characters by
+    x-proximity, not by which Tj call produced them) then interleaves the
+    overlapping characters into a single garbled token on read-back --
+    confirmed on the real PRT file: "A Plausibility Ranking Task" (correct,
+    in-order OCR words) extracted back as "A PlausibilRitya nkinTga sk".
+    Note this is a *positional* corruption, not a content one -- the OCR
+    words themselves were never wrong; the bug is entirely in the writer.
+
+    Scaling the text matrix's horizontal component so each word's rendered
+    advance equals its own measured box width (`x1 - x0`) fixes this at the
+    source: every word ends exactly where the next one's independently-set
+    x0 begins, so nothing can overlap regardless of how tight or wide the
+    original OCR box was.
+    """
+    target_width = max(word["x1"] - word["x0"], 0.01)
+    natural_width = _helvetica_advance_width(word["text"], size)
+    if natural_width <= 0:
+        return 1.0
+    return min(_HSCALE_MAX, max(_HSCALE_MIN, target_width / natural_width))
 
 
 def _pdf_baseline_y(word: Word, page_height_pt: float) -> float:
@@ -335,11 +496,17 @@ def _invisible_text_op(word: Word, page_height_pt: float) -> bytes:
     gap distance -- without it, two genuinely separate words with a small
     on-page gap silently re-merge into one token on read-back. A trailing
     space is invisible either way (Tr 3), so appending one costs nothing
-    and keeps the output's word boundaries matching the input's."""
+    and keeps the output's word boundaries matching the input's.
+
+    The text matrix's horizontal component is `_horizontal_scale_for_word`,
+    not a bare 1 -- see its docstring for why an unscaled Helvetica advance
+    overlaps adjacent words and scrambles read-back text on real scans.
+    """
     size = _font_size_for_word(word)
     y = _pdf_baseline_y(word, page_height_pt)
+    hscale = _horizontal_scale_for_word(word, size)
     text = _escape_pdf_text(word["text"] + " ")
-    return f"BT /F1 {size:.2f} Tf 3 Tr 1 0 0 1 {word['x0']:.2f} {y:.2f} Tm ({text}) Tj ET".encode()
+    return f"BT /F1 {size:.2f} Tf 3 Tr {hscale:.4f} 0 0 1 {word['x0']:.2f} {y:.2f} Tm ({text}) Tj ET".encode()
 
 
 class _PdfWriter:
@@ -428,8 +595,49 @@ def find_uncovered_group_words(
     exposed. Scoping to Group-row words sidesteps that entirely, since
     Date/Period words are assigned to the name/teacher buckets by the same
     row-assignment logic, never to "group".
+
+    **Deliberately does NOT bound the word-collection window to the
+    detected header border (`band.bottom`) the way an earlier version of
+    this check did (fixed 2026-07-21, PRT packet 14, CLAUDE.md).** That
+    version passed `band_bottom` through to `_assign_words_to_rows` so a
+    packet's own row-value window anchored to the real, rasterized border
+    instead of the self-relative row_height estimate whose own margin over
+    real body text ranged from -10pt to +38pt across the real dataset (see
+    ROW_ASSIGNMENT_BOTTOM_SLACK_PT in config.py) -- a real fix for a real
+    false positive (SID 0204150202, the original Ganik incident packet).
+    But it created a worse blind spot: real Group-row handwriting can
+    overflow *downward*, past the header's own printed/detected bottom
+    border, not just sideways past COLUMN_SPLIT_X (the class already
+    covered by `redact_bboxes_for_band`'s second rectangle) -- confirmed
+    on the real PRT file (packet 14: a group-member list that didn't fit
+    the printed row's height, left fully legible below an otherwise
+    correctly-drawn box). Anchoring this check's own word-window to
+    `band.bottom` meant that overflow was excluded from `rows["group"]`
+    *before* the coverage check ever ran, since the box and the check
+    shared the exact same (in this case too-short) idea of where the
+    header ends -- a check that can never disagree with the geometry it
+    exists to verify isn't independent of it. There is also no safe fixed
+    slack past `band.bottom` that could have caught this without
+    reintroducing the Ganik-class false positive: measured on the real
+    file, printed body text can start as little as +1.92pt below
+    `band.bottom` on some pages (see CLAUDE.md), closer than most
+    plausible handwriting-overflow allowances, so no fixed number
+    separates "real overflow ink" from "safe printed text" reliably.
+
+    Given that, this check now uses the full `HEADER_SEARCH_MAX_TOP` bound
+    instead -- the same generous limit already used for *finding* labels in
+    the first place, and the outer bound `header_words` was already
+    fetched under (see `redact_packet`'s own `page_words` call), so this
+    widens what counts as a candidate "group" word, not what gets read off
+    the page at all. This does mean a page whose printed body text sits
+    unusually close below the header (SID 0204150202/0204150203, ~4.8pt
+    below `band.bottom`) will flag as held-back again -- a known, accepted
+    false positive. A held-back false positive costs a human a few seconds
+    in the manual-redaction queue (see pipeline.py's `MANUAL_QUEUE_DIR`); a
+    silently shipped leak does not have a symmetric cost, so this trades
+    toward the former on purpose -- see CLAUDE.md's "packet 14" section.
     """
-    rows = _assign_words_to_rows(header_words, anchors)
+    rows = _assign_words_to_rows(header_words, anchors, band_bottom=HEADER_SEARCH_MAX_TOP)
     return [w for w in rows["group"] if not (_overlaps_bbox(w, left_bbox) or _overlaps_bbox(w, right_bbox))]
 
 
@@ -441,6 +649,7 @@ def redact_packet(
     dpi: int = RENDER_DPI_FINAL,
     flatten: bool = False,
     stamp_lines: list[str] | None = None,
+    band_override: HeaderBand | None = None,
 ) -> RedactResult:
     """Produce a redacted single-packet PDF.
 
@@ -455,6 +664,17 @@ def redact_packet(
     reach the writer, not merely hidden visually. `flatten=True` reproduces
     the pre-reversal all-image behavior with no text layer at all, for any
     packet in the batch.
+
+    `band_override`, when given, is used in place of `detect_header_band`'s
+    own automatic detection -- the manual-redaction queue's release path
+    (`pipeline.release_from_manual_queue`), for a human-supplied corrected
+    geometry after an automated detection or coverage-check hold. Every
+    downstream step (the two redaction rectangles, the coverage check
+    against the *actual* header words) runs exactly the same way against
+    an override band as against an auto-detected one -- the override
+    changes where the geometry comes from, never what gets verified against
+    it, since the coverage check must still have the final say (see
+    CLAUDE.md's "the manual-redaction queue is a backstop" section).
 
     Packets missing a header page (`is_orphan`) have nothing to redact --
     `band`/`redact_bbox`/`redact_strip_bbox` come back None. This function
@@ -471,9 +691,13 @@ def redact_packet(
         if packet.header_page_index is not None:
             header_page = pdf.pages[packet.header_page_index]
             header_image = header_page.to_image(resolution=dpi).original.convert("RGB")
-            band = detect_header_band(header_image, dpi=dpi)
             header_words = page_words(header_page, (0, 0, header_page.width, HEADER_SEARCH_MAX_TOP))
             anchors = locate_header_anchors(header_words)
+            row_height = header_row_height(anchors)
+            if band_override is not None:
+                band = band_override
+            else:
+                band = detect_header_band(header_image, dpi=dpi, anchors=anchors, row_height=row_height)
             left_bbox, right_bbox = redact_bboxes_for_band(band, anchors.group_top)
             uncovered = find_uncovered_group_words(header_words, anchors, left_bbox, right_bbox)
 

@@ -21,32 +21,130 @@ must never be conflated:
   e.g. a reviewer rejects a previously-auto-assigned candidate -- and
   out_dir is not append-only.)
 
+**A packet whose decision names a SID can still fail to redact safely --
+that packet is held back, the rest of the run is not.** `DispositionResult.
+held_back` (with a human-readable `reason`) covers: the named SID isn't on
+the roster, the packet still has unresolved segmentation `issues`,
+`detect_header_band` couldn't confidently locate this page's own border,
+`find_uncovered_group_words` found Group-row ink the redaction boxes
+missed, or `verify_no_leaked_names` found a leak in the written file. Each
+of these was previously a raised exception that aborted `run_dispositions`
+entirely -- which meant one packet with a bad header (real incident,
+2026-07-20: SID 0204150204's page, where OCR simply didn't find the
+printed "Group" label) blocked every *other* already-reviewed, already-
+approved packet in the same file from being written, even though their
+own redaction was completely unaffected. `run_dispositions` now catches
+each of these per packet, appends a `held_back` result with `reason` set,
+and moves on to the next packet -- a held-back packet produces no output
+(any partially-written file for it is deleted, same as before) and leaves
+any *prior* output for that tag untouched (a human hasn't confirmed a
+replacement is safe, so nothing about the old file changes). It remains
+exactly what CLAUDE.md's "Non-negotiable design decisions" calls for --
+abstain-and-flag, never silently guess -- just scoped to the one packet
+that actually has the problem instead of the whole run.
+
+**One of these five holds is human-overridable; the other four are not
+(2026-07-21).** SID 0204150204 exposed a gap in the fix above: it holds
+back every packet in that state forever, with no way for a human to ever
+release it, even after visually confirming (in review_app.py's own preview,
+which draws the exact fallback/anchor-derived box `detect_header_band`
+computed even when `detected=False`) that the box fully covers the name.
+That's backwards -- the entire reason a low-confidence packet routes to a
+human is so a person can make the call the geometry alone couldn't, and an
+unreleasable hold makes review decorative for exactly the packets that
+need it most. But this is true of exactly one of the five hold reasons:
+"header border not confidently detected" is a *confidence* question about
+otherwise-real geometry a human can look at and judge -- it is not true of
+the other four (unknown SID, unresolved segmentation issues,
+`find_uncovered_group_words` finding actual uncovered ink in the pixels, or
+`verify_no_leaked_names` finding an actual leak in the written text layer),
+which are findings of an actual problem, not a confidence gap, and staying
+non-overridable is exactly the point of them existing at all.
+
+`run_dispositions` takes a `detection_overrides: set[str]` of packet_tags a
+human has explicitly approved for release from *only* the detection-
+confidence hold (see `overrides_path`/`load_detection_overrides`/
+`save_detection_overrides` below -- a separate per-(pdf, decisions_dir)
+file, not a richer `decisions` value, since `decisions`' sid|None|absent
+three-state contract is depended on by every test and every existing
+`decisions/*.json` file already on disk). When `tag` is in
+`detection_overrides`, an undetected-border result falls through instead of
+deleting `out_path` and holding back -- but falls through *into* the
+uncovered-group-words and `verify_no_leaked_names` checks, which still run
+unconditionally and still hold back (un-overridably) if either finds a
+real problem. The override only ever answers "is this page's border
+confidently located", never "did anything actually leak" -- those are
+different questions with different answers, and only the first one is a
+human's call to make. A packet written this way still carries a `reason`
+noting the override, so it's visible in review_app.py's and cli.py's
+output, not silently indistinguishable from a clean, confidently-detected
+write.
+
 Packet identity across runs of the *same* source PDF is grounded in the
 packet's first physical page index (see `packet_tag`), not its position in
 the packets list (shifts if an earlier packet's page count changes) or a
 generated SID (doesn't exist before a decision is made).
 
-**Output layout is `out/<teacher_code>/<period>/<SID>.pdf`, one file per
-SID, not per packet_tag** (John, 2026-07-18). The load-bearing invariant is:
-"present in the output tree" iff "has a confirmed, approved SID" --
-non-consented and pending packets are never in the tree under any name,
-including a placeholder. Since a file's name is now the *SID* rather than
-the packet_tag that produced it, a packet_tag alone is no longer enough to
-know which file (if any) needs deleting when a decision is rejected or
-corrected to a different SID -- `run_dispositions` therefore reconciles
-the whole target directory against the current `decisions` values at the
-end of each run (see the reconciliation pass below) rather than deleting a
-single tag-derived path, so a corrected decision's stale SID file is
-cleaned up the same way a rejected one is, with no separate code path
-needed. This only has to be one directory because `roster` passed in here
-is always already narrowed to a single teacher+period block (see
-roster.py) -- every SID `decisions` can legally name shares that same
-teacher_code/period.
+**Output layout is `out/<teacher_code>/<period>/<worksheet_type>/<SID>.pdf`,
+one file per (worksheet_type, SID) pair, not per packet_tag** (John,
+2026-07-18; worksheet_type segment added 2026-07-20). The load-bearing
+invariant is: "present in the output tree" iff "has a confirmed, approved
+SID" -- non-consented and pending packets are never in the tree under any
+name, including a placeholder.
+
+**Two worksheet types for the same student share the same teacher_code and
+period** (both are read off the SID alone -- see roster.py), so without a
+worksheet_type segment in the path, an MPR and a PRT packet for the same
+student would collide on the exact same `<SID>.pdf`, and whichever gets
+redacted+written *second* would silently overwrite the first (a real
+incident: an MPR run's 11 approved outputs were clobbered by a later PRT
+run). `worksheet_type` is read off each packet's own header-page footer
+(`segment.read_footer`/`Packet.worksheet_type`, e.g. "PRT (01/2024)" vs.
+"pcMEL MPR+ADR (06/2025)" -- both real, distinct forms) -- never guessed or
+defaulted, same as `declared_total`; a header page whose footer
+worksheet-type label can't be parsed is flagged as an `issues` packet, same
+as an unreadable page marker, and refused by `run_dispositions` the same
+way.
+
+**Deletion is ledger-based and per-tag, never a whole-directory sweep.** An
+earlier design reconciled a *shared* directory (`out/<teacher>/<period>/`)
+against only the current pdf's `decisions` values at the end of every run --
+safe only under the unstated assumption that exactly one pdf/decisions-store
+ever writes into that directory. Once two different scan files (an MPR scan
+and a PRT scan for the same class) both wrote into what was, pre-
+worksheet_type-segment, the *same* directory, that assumption broke:
+running dispositions for a PRT file -- even with every PRT packet still
+pending, no decision at all -- swept the directory against PRT's own
+(mostly empty) `decisions.values()` and deleted the *other* file's already-
+approved MPR output, since nothing in the sweep logic scoped it to "files
+this pdf's own decisions store actually produced." Adding the
+worksheet_type path segment closes the immediate collision, but the sweep
+itself was the deeper bug: nothing should ever delete a file this run's own
+decisions didn't explicitly say to.
+
+The fix: `run_dispositions` persists a small per-(out_dir, pdf) ledger
+(`ledger_path`/`_load_ledger`/`_save_ledger`, colocated under
+`out_dir/.ledger/<pdf-stem>.json`, not `decisions_dir` -- it's bookkeeping
+about what *this* output tree contains, not a human-editable decision) of
+`packet_tag -> last SID successfully written for it`. A deletion now only
+ever happens for a `packet_tag` this same pdf's own ledger says it
+previously wrote a file for, when *this run's own* decision for that exact
+tag says the old SID is no longer correct -- either an explicit `None`
+(confirmed non-consent: the ledger's old SID's file is removed) or a
+different SID (a correction: the ledger's *old* SID's file is removed once
+the *new* SID's file is confirmed written). A pending tag (absent from
+`decisions`) is never consulted against the ledger at all -- pending can
+never trigger a delete, of its own output or anyone else's, since nothing
+about processing it touches any path but its own. Deletion is now strictly
+a function of an explicit decision for a *specific* tag this run actually
+decided, never a background reconciliation against directory contents that
+might belong to an entirely different pdf.
 """
 
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -54,26 +152,184 @@ import pdfplumber
 
 from melredact.config import RENDER_DPI_FINAL
 from melredact.match import MatchProposal, propose
-from melredact.redact import verify_no_leaked_names
+from melredact.redact import HeaderBand, verify_no_leaked_names
 from melredact.redact import redact_packet as _redact_packet
 from melredact.roster import Roster, RosterEntry
 from melredact.segment import Packet, SegmentResult, extract_header_fields
 
 DECISIONS_DIR = Path("decisions")
 OUT_DIR = Path("out")
+MANUAL_QUEUE_DIRNAME = ".manual_queue"
 
 
 def packet_tag(pdf_path: str | Path, packet: Packet) -> str:
     return f"{Path(pdf_path).stem}_p{packet.page_indices[0]:03d}"
 
 
-def output_path(out_dir: str | Path, entry: RosterEntry) -> Path:
+def output_path(out_dir: str | Path, entry: RosterEntry, worksheet_type: str) -> Path:
     """Where a confirmed packet for this roster entry lands:
-    out/<teacher_code>/<period>/<SID>.pdf. `entry.teacher_code` and
-    `entry.period_display` are the SID's own digits (positions 0:6 and
-    6:8), not anything read off the packet -- so this is stable and
-    derivable from the SID alone, same as the file name itself."""
-    return Path(out_dir) / entry.teacher_code / entry.period_display / f"{entry.sid}.pdf"
+    out/<teacher_code>/<period>/<worksheet_type>/<SID>.pdf. `entry.
+    teacher_code` and `entry.period_display` are the SID's own digits
+    (positions 0:6 and 6:8), not anything read off the packet, so those two
+    segments are stable and derivable from the SID alone. `worksheet_type`
+    is *not* derivable from the SID -- a student has one SID but multiple
+    worksheet types (MPR, PRT, ...) -- so it must come from the packet's own
+    footer (see Packet.worksheet_type); omitting it is exactly the bug that
+    let an MPR and a PRT packet for the same student collide on one path."""
+    return Path(out_dir) / entry.teacher_code / entry.period_display / worksheet_type / f"{entry.sid}.pdf"
+
+
+def ledger_path(out_dir: str | Path, pdf_path: str | Path) -> Path:
+    """Where run_dispositions persists, for this (out_dir, source pdf) pair,
+    which SID it last wrote output for under each packet_tag -- see the
+    module docstring's "Deletion is ledger-based" section. Colocated under
+    out_dir itself (a hidden `.ledger` subdirectory), not decisions_dir:
+    this is bookkeeping about what's actually sitting in *this* output
+    tree, derived, not a human-editable decision."""
+    return Path(out_dir) / ".ledger" / f"{Path(pdf_path).stem}.json"
+
+
+def _load_ledger(out_dir: str | Path, pdf_path: str | Path) -> dict[str, str]:
+    path = ledger_path(out_dir, pdf_path)
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text())
+
+
+def _save_ledger(out_dir: str | Path, pdf_path: str | Path, ledger: dict[str, str]) -> None:
+    path = ledger_path(out_dir, pdf_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(ledger, indent=2, sort_keys=True))
+
+
+def manual_queue_dir(out_dir: str | Path, pdf_path: str | Path) -> Path:
+    """Where a held-back packet's drafted (not-safe-to-ship) redaction
+    attempt waits for a human to fix by hand -- see the module docstring's
+    "The manual-redaction queue is a backstop" section. Colocated under
+    `out_dir` (a hidden `.manual_queue` subdirectory, same gitignored tree
+    as `out/` itself, never synced) since a queued draft can be exactly as
+    unsafe as whatever held it back in the first place."""
+    return Path(out_dir) / MANUAL_QUEUE_DIRNAME / Path(pdf_path).stem
+
+
+def manual_queue_draft_path(out_dir: str | Path, pdf_path: str | Path, tag: str) -> Path:
+    return manual_queue_dir(out_dir, pdf_path) / f"{tag}.pdf"
+
+
+def manual_queue_meta_path(out_dir: str | Path, pdf_path: str | Path, tag: str) -> Path:
+    return manual_queue_dir(out_dir, pdf_path) / f"{tag}.json"
+
+
+def _queue_for_manual_redaction(
+    out_dir: str | Path,
+    pdf_path: str | Path,
+    tag: str,
+    sid: str,
+    worksheet_type: str,
+    reason: str,
+    drafted_path: Path,
+) -> None:
+    """Move (never copy) a held-back packet's already-drawn draft into the
+    manual-redaction queue instead of just deleting it -- the backstop a
+    human needs to actually see what's wrong and fix the geometry by hand,
+    rather than starting over from nothing. Moved, not copied: the draft
+    can be exactly as unsafe as the reason it was held back for (that's the
+    whole reason it's here), so it must exist in at most one place on
+    disk, never both the queue and (however briefly) somewhere else."""
+    qdir = manual_queue_dir(out_dir, pdf_path)
+    qdir.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(drafted_path), manual_queue_draft_path(out_dir, pdf_path, tag))
+    meta = {
+        "packet_tag": tag,
+        "sid": sid,
+        "worksheet_type": worksheet_type,
+        "reason": reason,
+        "pdf_path": str(pdf_path),
+    }
+    manual_queue_meta_path(out_dir, pdf_path, tag).write_text(json.dumps(meta, indent=2))
+
+
+def list_manual_queue(out_dir: str | Path) -> list[dict]:
+    """Enumerate every packet currently sitting in the manual-redaction
+    queue, across every source pdf under this out_dir -- metadata only
+    (packet_tag, sid, worksheet_type, reason, pdf_path), not the drafted
+    PDFs themselves, so a caller (review_app.py, a headless script) can see
+    what needs a human's attention without opening every file."""
+    root = Path(out_dir) / MANUAL_QUEUE_DIRNAME
+    if not root.exists():
+        return []
+    return [json.loads(p.read_text()) for p in sorted(root.glob("*/*.json"))]
+
+
+def _clear_manual_queue_entry(out_dir: str | Path, pdf_path: str | Path, tag: str) -> None:
+    manual_queue_draft_path(out_dir, pdf_path, tag).unlink(missing_ok=True)
+    manual_queue_meta_path(out_dir, pdf_path, tag).unlink(missing_ok=True)
+
+
+@dataclass
+class ManualReleaseResult:
+    packet_tag: str
+    sid: str
+    released: bool
+    out_path: Path | None = None
+    reason: str | None = None
+
+
+def release_from_manual_queue(
+    pdf_path: str | Path,
+    packet: Packet,
+    tag: str,
+    sid: str,
+    roster: Roster,
+    band_override: HeaderBand,
+    *,
+    out_dir: str | Path = OUT_DIR,
+    dpi: int = RENDER_DPI_FINAL,
+    flatten: bool = False,
+) -> ManualReleaseResult:
+    """The human side of the manual-redaction queue: re-redacts `packet`
+    using a human-supplied, corrected `band_override` instead of whatever
+    `detect_header_band` computed automatically, then re-runs the exact
+    same two unconditional checks every other write goes through --
+    `find_uncovered_group_words` and `verify_no_leaked_names`. This is
+    deliberately a backstop for a genuine automated-check miss, not a way
+    around the check itself (see CLAUDE.md's "the manual-redaction queue is
+    a backstop, not a substitute" section): only a redaction that *still*
+    passes both checks with the corrected geometry gets written to the
+    real out/ tree and cleared from the queue. A packet that still fails
+    either check with the human's own corrected geometry stays queued, with
+    no file written anywhere -- the automated checks always have the final
+    say, regardless of who supplied the geometry.
+    """
+    if sid not in roster:
+        return ManualReleaseResult(packet_tag=tag, sid=sid, released=False, reason=f"sid {sid!r} not on roster")
+    entry = roster.by_sid[sid]
+    out_path = output_path(out_dir, entry, packet.worksheet_type)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    stamp_lines = [f"SID: {entry.sid}", f"PD: {entry.period_display}"]
+    redact_result = _redact_packet(
+        pdf_path, packet, out_path, dpi=dpi, flatten=flatten, stamp_lines=stamp_lines, band_override=band_override
+    )
+    if redact_result.uncovered_group_words:
+        out_path.unlink()
+        return ManualReleaseResult(
+            packet_tag=tag,
+            sid=sid,
+            released=False,
+            reason=f"still uncovered group-row ink with this geometry: {redact_result.uncovered_group_words}",
+        )
+    findings = verify_no_leaked_names(out_path, roster)
+    if findings:
+        out_path.unlink()
+        return ManualReleaseResult(
+            packet_tag=tag, sid=sid, released=False, reason=f"verify_no_leaked_names still finds leaks: {findings}"
+        )
+
+    _clear_manual_queue_entry(out_dir, pdf_path, tag)
+    ledger = _load_ledger(out_dir, pdf_path)
+    ledger[tag] = sid
+    _save_ledger(out_dir, pdf_path, ledger)
+    return ManualReleaseResult(packet_tag=tag, sid=sid, released=True, out_path=out_path)
 
 
 def decisions_path(pdf_path: str | Path, decisions_dir: Path = DECISIONS_DIR) -> Path:
@@ -93,6 +349,33 @@ def save_decisions(
     path = decisions_path(pdf_path, decisions_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(decisions, indent=2, sort_keys=True))
+
+
+def overrides_path(pdf_path: str | Path, decisions_dir: Path = DECISIONS_DIR) -> Path:
+    """Where a human's approval to release a packet from *only* the
+    detection-confidence hold is recorded -- see run_dispositions'
+    `detection_overrides` parameter and the module docstring's "One of
+    these five holds is human-overridable" section. A separate file from
+    decisions_path, not a richer decisions value: decisions' sid|None|absent
+    three-state contract is depended on by every existing decisions/*.json
+    file and every test that reads one, and overloading its value shape to
+    also carry this is a needless way to put that at risk."""
+    return Path(decisions_dir) / f"{Path(pdf_path).stem}.overrides.json"
+
+
+def load_detection_overrides(pdf_path: str | Path, decisions_dir: Path = DECISIONS_DIR) -> set[str]:
+    path = overrides_path(pdf_path, decisions_dir)
+    if not path.exists():
+        return set()
+    return set(json.loads(path.read_text()))
+
+
+def save_detection_overrides(
+    pdf_path: str | Path, overrides: set[str], decisions_dir: Path = DECISIONS_DIR
+) -> None:
+    path = overrides_path(pdf_path, decisions_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(sorted(overrides), indent=2))
 
 
 def propose_all(pdf_path: str | Path, segmented: SegmentResult, roster: Roster) -> list[MatchProposal]:
@@ -125,6 +408,17 @@ class DispositionResult:
     out_path: Path | None = None
     deleted_path: Path | None = None
     leak_findings: list = field(default_factory=list)
+    # True for a packet whose decision names a SID but couldn't be safely
+    # redacted this run (header border not confidently detected, group-row
+    # ink left uncovered, a leak found, the named SID not on the roster, or
+    # unresolved segmentation issues). Held back, not written -- and
+    # deliberately does NOT abort the rest of the run: one packet's
+    # geometry or data problem is a reason for a human to look at *that*
+    # packet, not a reason to block every other already-approved packet in
+    # the same file. `reason` is a human-readable explanation, always set
+    # together with held_back=True.
+    held_back: bool = False
+    reason: str | None = None
 
 
 def run_dispositions(
@@ -136,22 +430,54 @@ def run_dispositions(
     out_dir: str | Path = OUT_DIR,
     dpi: int = RENDER_DPI_FINAL,
     flatten: bool = False,
+    detection_overrides: set[str] = frozenset(),
 ) -> list[DispositionResult]:
     """Apply final per-packet decisions. See module docstring for the
     three-state `decisions` contract -- this is where "confirmed
     non-consent" actually becomes a deletion, not just a skipped write --
-    and for why output is named by SID (out/<teacher>/<period>/<SID>.pdf)
-    rather than by packet_tag.
+    and for why output is named by SID under a worksheet_type subdirectory
+    (out/<teacher>/<period>/<worksheet_type>/<SID>.pdf) rather than by
+    packet_tag, and why deletion is ledger-based rather than a directory
+    sweep.
 
     A packet with unresolved segment.py `issues` is refused even if
     `decisions` names a SID for it: those issues mean a human hasn't
     actually confirmed this packet is what its footer claims, and
     `decisions` entries are assumed to come from a review flow built on
-    top of confirmed packets, not to override that.
+    top of confirmed packets, not to override that. A missing/unreadable
+    worksheet_type is one such issue (see segment.segment_pdf), so a
+    packet ever reaches output_path below only once its worksheet_type is
+    known -- never guessed.
+
+    A packet absent from `decisions` (pending) is never looked up in the
+    ledger and never touches any path but its own -- see the module
+    docstring's "Deletion is ledger-based" section for why this is the
+    fix for a pending packet in one pdf being able to delete another pdf's
+    already-approved output.
+
+    `detection_overrides` is a set of packet_tags a human has explicitly
+    approved for release from the detection-confidence hold specifically
+    (see the module docstring's "One of these five holds is human-
+    overridable" section) -- it does not, and must not, affect whether the
+    unrelated uncovered-group-words or verify_no_leaked_names holds fire.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    ledger = _load_ledger(out_dir, pdf_path)
+    ledger_dirty = False
     results: list[DispositionResult] = []
+
+    def _delete_stale_output(stale_sid: str, worksheet_type: str) -> None:
+        # Deliberately doesn't touch `ledger` -- callers own that, since
+        # what the ledger entry should become afterward differs (removed
+        # entirely for a rejection, replaced with the new SID for a
+        # correction).
+        if stale_sid not in roster:
+            return
+        stale_path = output_path(out_dir, roster.by_sid[stale_sid], worksheet_type)
+        if stale_path.exists():
+            stale_path.unlink()
+            results.append(DispositionResult(packet_tag=None, sid=stale_sid, pending=False, deleted_path=stale_path))
 
     for packet in segmented.packets:
         tag = packet_tag(pdf_path, packet)
@@ -161,60 +487,119 @@ def run_dispositions(
             continue
 
         sid = decisions[tag]
+        prior_sid = ledger.get(tag)
 
         if sid is None:
+            # Confirmed non-consent. Delete only the file *this exact tag*
+            # previously wrote (per the ledger), never anything else in
+            # out_dir -- this is the whole point of the ledger over a
+            # directory sweep.
+            if prior_sid is not None and packet.worksheet_type is not None:
+                _delete_stale_output(prior_sid, packet.worksheet_type)
+                ledger.pop(tag, None)
+                ledger_dirty = True
             results.append(DispositionResult(packet_tag=tag, sid=None, pending=False))
             continue
 
         if sid not in roster:
-            raise ValueError(f"{tag}: decision names sid {sid!r}, not on roster")
+            # A held-back result, not a raise -- this is a problem with
+            # this one decision entry (e.g. a typo'd SID), not a reason to
+            # abort every other packet's already-confirmed output in the
+            # same run.
+            results.append(
+                DispositionResult(
+                    packet_tag=tag,
+                    sid=sid,
+                    pending=False,
+                    held_back=True,
+                    reason=f"decision names sid {sid!r}, not on roster",
+                )
+            )
+            continue
         if packet.issues:
-            raise ValueError(f"{tag}: refusing to process a packet with unresolved issues: {packet.issues}")
+            results.append(
+                DispositionResult(
+                    packet_tag=tag,
+                    sid=sid,
+                    pending=False,
+                    held_back=True,
+                    reason=f"refusing to process a packet with unresolved issues: {packet.issues}",
+                )
+            )
+            continue
 
         entry = roster.by_sid[sid]
-        out_path = output_path(out_dir, entry)
+        out_path = output_path(out_dir, entry, packet.worksheet_type)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         stamp_lines = [f"SID: {entry.sid}", f"PD: {entry.period_display}"]
         redact_result = _redact_packet(pdf_path, packet, out_path, dpi=dpi, flatten=flatten, stamp_lines=stamp_lines)
+        detection_note: str | None = None
+        if redact_result.band is not None and not redact_result.band.detected:
+            # detect_header_band couldn't confidently locate this page's
+            # own header border (see its docstring). This is the one hold
+            # reason a human can actually clear: a real box was still drawn
+            # (the anchor- or fallback-derived geometry detect_header_band
+            # falls back to, not a null box), and `tag in detection_overrides`
+            # means a human has looked at review_app.py's own preview of
+            # that exact box and confirmed it covers the name. Absent that
+            # override, this is still held back exactly as before -- never
+            # ship a box whose position we're not sure of with nobody
+            # having looked at it. Held back, not raised, either way: this
+            # page's own geometry problem shouldn't block every other
+            # approved packet in the same run (a real incident -- see
+            # CLAUDE.md -- was exactly this: one packet's failure nuking
+            # unrelated already-approved output).
+            if tag not in detection_overrides:
+                reason = f"header border not confidently detected: {redact_result.band}"
+                _queue_for_manual_redaction(out_dir, pdf_path, tag, sid, packet.worksheet_type, reason, out_path)
+                results.append(DispositionResult(packet_tag=tag, sid=sid, pending=False, held_back=True, reason=reason))
+                continue
+            detection_note = f"shipped despite undetected header border (human-approved override): {redact_result.band}"
         if redact_result.uncovered_group_words:
             # Geometric proof (see find_uncovered_group_words) that the
             # redaction rectangles didn't actually cover real Group-row
             # ink -- independent of, and checked before, the text-based
             # verify pass below, since this is exactly the class of leak
             # (real ink, OCR-garbled into a non-matching token) that a
-            # text check alone can miss.
-            out_path.unlink()
-            raise RuntimeError(
-                f"{tag}: uncovered group-row ink, output deleted: {redact_result.uncovered_group_words}"
-            )
+            # text check alone can miss. Never overridable, detection
+            # override or not: this is a finding of actual uncovered ink in
+            # the pixels, not a confidence question about the geometry.
+            reason = f"uncovered group-row ink: {redact_result.uncovered_group_words}"
+            _queue_for_manual_redaction(out_dir, pdf_path, tag, sid, packet.worksheet_type, reason, out_path)
+            results.append(DispositionResult(packet_tag=tag, sid=sid, pending=False, held_back=True, reason=reason))
+            continue
         findings = verify_no_leaked_names(out_path, roster)
         if findings:
             # The verify pass exists precisely so this can't happen
             # silently -- never leave a leaking file sitting in out_dir.
+            # Never overridable, same reasoning as uncovered_group_words
+            # above: an actual leak finding, not a confidence gap.
             out_path.unlink()
-            raise RuntimeError(f"{tag}: verify_no_leaked_names found leaks, output deleted: {findings}")
+            results.append(
+                DispositionResult(
+                    packet_tag=tag,
+                    sid=sid,
+                    pending=False,
+                    held_back=True,
+                    reason=f"verify_no_leaked_names found leaks: {findings}",
+                )
+            )
+            continue
 
-        results.append(DispositionResult(packet_tag=tag, sid=sid, pending=False, out_path=out_path))
+        results.append(
+            DispositionResult(packet_tag=tag, sid=sid, pending=False, out_path=out_path, reason=detection_note)
+        )
 
-    # Reconciliation: enforce "present in the output tree" iff "has a
-    # confirmed, approved SID" directly, rather than trying to track which
-    # packet_tag used to own which now-stale SID file. `roster` is always
-    # already narrowed to one teacher+period block (see roster.py), so
-    # every SID any decision for this pdf can legally name -- past or
-    # present -- lands in this one directory; sweeping it against the
-    # *current* decisions.json values catches a rejected packet's old file
-    # and a corrected packet's superseded file the same way, with no extra
-    # state to keep in sync.
-    if roster.entries:
-        first = roster.entries[0]
-        target_dir = out_dir / first.teacher_code / first.period_display
-        if target_dir.exists():
-            approved_sids = {v for v in decisions.values() if v is not None}
-            for existing in sorted(target_dir.glob("*.pdf")):
-                if existing.stem not in approved_sids:
-                    existing.unlink()
-                    results.append(
-                        DispositionResult(packet_tag=None, sid=existing.stem, pending=False, deleted_path=existing)
-                    )
+        # A correction (this tag's approved SID changed from a previously
+        # written one) supersedes the old file -- delete it as a direct
+        # consequence of *this* explicit new decision, once the new file is
+        # confirmed written and clean, not as a background sweep.
+        if prior_sid is not None and prior_sid != sid:
+            _delete_stale_output(prior_sid, packet.worksheet_type)
+        ledger[tag] = sid
+        ledger_dirty = True
+
+    if ledger_dirty:
+        _save_ledger(out_dir, pdf_path, ledger)
 
     return results

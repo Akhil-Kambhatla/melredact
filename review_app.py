@@ -26,10 +26,21 @@ import pdfplumber
 import streamlit as st
 from PIL import Image
 
-from melredact.config import CACHE_DIR, MIN_MARGIN, MIN_SCORE, RENDER_DPI_PREVIEW
+from melredact.config import CACHE_DIR, HEADER_BAND_FALLBACK, MIN_MARGIN, MIN_SCORE, RENDER_DPI_PREVIEW
 from melredact.match import assign_all
-from melredact.pipeline import load_decisions, packet_tag, propose_all, run_dispositions, save_decisions
-from melredact.redact import render_redaction_preview
+from melredact.pipeline import (
+    list_manual_queue,
+    load_decisions,
+    load_detection_overrides,
+    manual_queue_draft_path,
+    packet_tag,
+    propose_all,
+    release_from_manual_queue,
+    run_dispositions,
+    save_decisions,
+    save_detection_overrides,
+)
+from melredact.redact import HeaderBand, render_redaction_preview
 from melredact.roster import Roster, RosterError, load_roster
 from melredact.segment import Packet, SegmentResult, extract_header_fields, segment_pdf
 
@@ -111,12 +122,30 @@ def _decision_label(sid: str | None, roster: Roster) -> str:
 def _init_state(pdf_path: str, decisions_dir: str) -> None:
     if "decisions" not in st.session_state:
         st.session_state.decisions = load_decisions(pdf_path, decisions_dir=Path(decisions_dir))
+    if "detection_overrides" not in st.session_state:
+        st.session_state.detection_overrides = load_detection_overrides(pdf_path, decisions_dir=Path(decisions_dir))
 
 
 def _confirm(pdf_path: str, decisions_dir: str, tag: str, sid: str | None) -> None:
     st.session_state.decisions[tag] = sid
     save_decisions(pdf_path, st.session_state.decisions, decisions_dir=Path(decisions_dir))
     st.toast(f"Saved decision for {tag}")
+
+
+def _set_detection_override(pdf_path: str, decisions_dir: str, tag: str, approved: bool) -> None:
+    """Records (or revokes) a human's explicit approval to release `tag`
+    from *only* the detection-confidence hold -- see pipeline.py's
+    `detection_overrides` and CLAUDE.md's "One of these five holds is
+    human-overridable" section. This is deliberately a separate action from
+    `_confirm`: confirming a SID match answers "who is this", not "I've
+    looked at the fallback box and it covers the name" -- conflating the
+    two would mean every ordinary approval silently carried this override
+    too, for packets where it was never actually reviewed."""
+    if approved:
+        st.session_state.detection_overrides.add(tag)
+    else:
+        st.session_state.detection_overrides.discard(tag)
+    save_detection_overrides(pdf_path, st.session_state.detection_overrides, decisions_dir=Path(decisions_dir))
 
 
 def _render_sidebar(args: argparse.Namespace, segmented: SegmentResult, roster: Roster) -> None:
@@ -136,17 +165,41 @@ def _render_sidebar(args: argparse.Namespace, segmented: SegmentResult, roster: 
     if st.sidebar.button("Run redaction pipeline", type="primary", disabled=n_pending == len(segmented.packets) == 0):
         with st.spinner("Redacting approved packets..."):
             fresh_decisions = load_decisions(args.pdf_path, decisions_dir=Path(args.decisions_dir))
-            try:
-                results = run_dispositions(
-                    args.pdf_path, segmented, fresh_decisions, roster, out_dir=Path(args.out_dir)
-                )
-            except RuntimeError as exc:
-                st.sidebar.error(f"Verify pass failed, output deleted: {exc}")
-            else:
-                written = sum(1 for r in results if r.out_path is not None)
-                deleted = sum(1 for r in results if r.deleted_path is not None)
-                pending = sum(1 for r in results if r.pending)
-                st.sidebar.success(f"{written} written, {deleted} deleted, {pending} still pending review")
+            fresh_overrides = load_detection_overrides(args.pdf_path, decisions_dir=Path(args.decisions_dir))
+            results = run_dispositions(
+                args.pdf_path,
+                segmented,
+                fresh_decisions,
+                roster,
+                out_dir=Path(args.out_dir),
+                detection_overrides=fresh_overrides,
+            )
+            written = [r for r in results if r.out_path is not None]
+            deleted = sum(1 for r in results if r.deleted_path is not None)
+            pending = sum(1 for r in results if r.pending)
+            held_back = [r for r in results if r.held_back]
+            overridden = [r for r in written if r.reason]
+            st.sidebar.success(
+                f"{len(written)} written, {deleted} deleted, {len(held_back)} held back for review, {pending} still pending review"
+            )
+            for r in overridden:
+                # Written, not held back -- but only because a human
+                # explicitly released the detection-confidence hold (see
+                # pipeline.py's detection_overrides). Surfaced separately
+                # from a plain "written" so this isn't indistinguishable
+                # from a clean, confidently-detected write.
+                st.sidebar.info(f"Shipped via override: {r.packet_tag} (sid {r.sid}): {r.reason}")
+            for r in held_back:
+                # A held-back packet is a data/geometry problem with this
+                # one packet, not the whole run -- see pipeline.py's
+                # module docstring. Surface it per-packet so a reviewer
+                # knows exactly which tag needs a closer look and why.
+                st.sidebar.warning(f"Held back: {r.packet_tag} (sid {r.sid}): {r.reason}")
+
+    st.sidebar.divider()
+    queue_entries = [e for e in list_manual_queue(args.out_dir) if e["pdf_path"] == str(Path(args.pdf_path))]
+    st.sidebar.write(f"🛠️ Manual-redaction queue: {len(queue_entries)}")
+    st.sidebar.checkbox("Show manual redaction queue", key="show_manual_queue", disabled=not queue_entries)
 
 
 def _render_field_table(fields) -> None:
@@ -186,7 +239,71 @@ def _stamp_lines_for(sid: str | None, roster: Roster) -> list[str] | None:
     return [f"SID: {entry.sid}", f"PD: {entry.period_display}"]
 
 
-def _render_packet(args: argparse.Namespace, packet: Packet, tag: str, roster: Roster, proposal, auto_assignments) -> None:
+def _render_manual_queue(args: argparse.Namespace, roster: Roster, packet_by_tag: dict[str, Packet]) -> None:
+    """The backstop for a genuine detection-confidence or coverage-check
+    miss (see CLAUDE.md's "the manual-redaction queue is a backstop"
+    section) -- never a substitute for the automated checks catching it in
+    the first place. Each queued entry shows the drafted (not-safe-to-ship)
+    attempt exactly as it was held back, lets a human propose a corrected
+    band, previews that correction through the same render_redaction_
+    preview mechanism the ordinary decision preview uses, and only writes
+    to out/ if release_from_manual_queue's own re-check of both automated
+    checks (uncovered_group_words, verify_no_leaked_names) still passes
+    with that geometry -- a wrong correction stays queued, nothing is
+    written."""
+    entries = [e for e in list_manual_queue(args.out_dir) if e["pdf_path"] == str(Path(args.pdf_path))]
+    if not entries:
+        st.info("Manual redaction queue is empty for this scan.")
+        return
+
+    for entry in entries:
+        tag = entry["packet_tag"]
+        sid = entry["sid"]
+        packet = packet_by_tag.get(tag)
+        label = f"{tag} — sid {sid} ({_decision_label(sid, roster) if sid in roster else 'not on roster'})"
+        with st.expander(f"{label}: {entry['reason']}", expanded=False):
+            if packet is None:
+                st.warning("This queued packet no longer matches any packet in this scan (re-segmented differently?).")
+                continue
+
+            draft_path = manual_queue_draft_path(args.out_dir, args.pdf_path, tag)
+            if draft_path.exists():
+                with pdfplumber.open(draft_path) as pdf:
+                    draft_image = pdf.pages[0].to_image(resolution=DPI).original.convert("RGB")
+                st.image(draft_image, caption="Drafted redaction attempt that was held back -- not safe to ship as is")
+
+            st.write("Propose a corrected header band (points, page-top-down):")
+            c1, c2, c3, c4 = st.columns(4)
+            left = c1.number_input("left", value=float(HEADER_BAND_FALLBACK["left"]), key=f"mq_left_{tag}")
+            top = c2.number_input("top", value=float(HEADER_BAND_FALLBACK["top"]), key=f"mq_top_{tag}")
+            right = c3.number_input("right", value=float(HEADER_BAND_FALLBACK["right"]), key=f"mq_right_{tag}")
+            bottom = c4.number_input(
+                "bottom", value=float(HEADER_BAND_FALLBACK["bottom"] + 20), key=f"mq_bottom_{tag}"
+            )
+            candidate_band = HeaderBand(left=left, top=top, right=right, bottom=bottom, detected=True)
+
+            if packet.header_page_index is not None:
+                raw_image = _page_image(args.pdf_path, packet.header_page_index, DPI)
+                stamp_lines = _stamp_lines_for(sid, roster) if sid in roster else None
+                preview_image, _ = render_redaction_preview(
+                    raw_image, dpi=DPI, stamp_lines=stamp_lines, band_override=candidate_band
+                )
+                st.image(preview_image, caption="Preview with your proposed corrected band")
+
+            if st.button("Release to out/", type="primary", key=f"mq_release_{tag}"):
+                result = release_from_manual_queue(
+                    args.pdf_path, packet, tag, sid, roster, candidate_band, out_dir=Path(args.out_dir)
+                )
+                if result.released:
+                    st.success(f"Released {tag} -> {result.out_path}")
+                    st.rerun()
+                else:
+                    st.error(f"Still not safe to release with this band: {result.reason}")
+
+
+def _render_packet(
+    args: argparse.Namespace, packet: Packet, tag: str, roster: Roster, proposal, auto_assignments, tags: list[str]
+) -> None:
     if packet.issues:
         st.warning(
             "This packet has unresolved segmentation issues and cannot be assigned a SID "
@@ -222,9 +339,21 @@ def _render_packet(args: argparse.Namespace, packet: Packet, tag: str, roster: R
 
         raw_image = _page_image(args.pdf_path, packet.header_page_index, DPI)
         stamp_lines = _stamp_lines_for(selected_sid, roster)
-        preview_image, band = render_redaction_preview(
-            raw_image, dpi=DPI, group_top=fields.anchors.group_top, stamp_lines=stamp_lines
-        )
+        preview_image, band = render_redaction_preview(raw_image, dpi=DPI, anchors=fields.anchors, stamp_lines=stamp_lines)
+        if not band.detected:
+            st.warning("Header border not confidently detected on this page -- redaction geometry may be unreliable.")
+            override_checked = st.checkbox(
+                "I've reviewed the preview below and confirm this box fully covers the name "
+                "(and all other identifying handwriting) on this page -- release this packet "
+                "for writing despite the detection failure.",
+                value=tag in st.session_state.detection_overrides,
+                key=f"override_{tag}",
+            )
+            if override_checked != (tag in st.session_state.detection_overrides):
+                _set_detection_override(args.pdf_path, args.decisions_dir, tag, override_checked)
+                st.toast(
+                    f"Detection-hold override {'granted' if override_checked else 'revoked'} for {tag}"
+                )
 
         col1, col2 = st.columns(2)
         col1.image(raw_image, caption="Original scan")
@@ -260,9 +389,31 @@ def _render_packet(args: argparse.Namespace, packet: Packet, tag: str, roster: R
     choice_sid = dict(all_options)[choice_label]
 
     disabled = bool(packet.issues) and choice_sid is not None
-    if st.button("Confirm decision", type="primary", disabled=disabled, key=f"confirm_{tag}"):
+    next_index = tags.index(tag) + 1
+    has_next = next_index < len(tags)
+
+    def _confirm_and_advance() -> None:
+        # Must run as an on_click callback, not inline after a plain
+        # st.button() check: `packet_select`'s own selectbox widget has
+        # already been instantiated earlier in this same script run (see
+        # main()), and Streamlit forbids writing to a widget's session_state
+        # key after that point in the same run -- on_click callbacks run
+        # *before* the next rerun starts, which is exactly what the
+        # existing Prev/Next buttons' `_go` callback already relies on.
+        _confirm(args.pdf_path, args.decisions_dir, tag, choice_sid)
+        if has_next:
+            st.session_state.packet_select = tags[next_index]
+
+    col_confirm, col_confirm_next = st.columns(2)
+    if col_confirm.button("Confirm decision", type="primary", disabled=disabled, key=f"confirm_{tag}"):
         _confirm(args.pdf_path, args.decisions_dir, tag, choice_sid)
         st.rerun()
+    col_confirm_next.button(
+        "Confirm & Next >",
+        disabled=disabled or not has_next,
+        key=f"confirm_next_{tag}",
+        on_click=_confirm_and_advance,
+    )
 
     current = st.session_state.decisions.get(tag)
     if tag in st.session_state.decisions:
@@ -302,6 +453,11 @@ def main() -> None:
         for t in tags:
             st.write(f"{_status_icon(t, packet_by_tag[t], st.session_state.decisions)} {t}")
 
+    if st.session_state.get("show_manual_queue"):
+        st.header("Manual redaction queue")
+        _render_manual_queue(args, roster, packet_by_tag)
+        return
+
     # The selectbox's *value* is always the stable tag -- never a status
     # icon baked into the option text, which would invalidate the widget's
     # stored value the moment that packet's own icon changes (e.g. right
@@ -322,7 +478,7 @@ def main() -> None:
     packet = packet_by_tag[tag]
     status = _status_icon(tag, packet, st.session_state.decisions)
     st.subheader(f"{status} Packet {tag} ({packet.n_pages} page{'s' if packet.n_pages != 1 else ''})")
-    _render_packet(args, packet, tag, roster, proposals_by_tag[tag], auto_assignments)
+    _render_packet(args, packet, tag, roster, proposals_by_tag[tag], auto_assignments, tags)
 
 
 if __name__ == "__main__":
