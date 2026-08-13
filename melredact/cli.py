@@ -3,6 +3,13 @@
     python -m melredact.cli run --pdf <scan.pdf> --roster <roster.csv> [--out out] [--decisions decisions] [--period 2]
     python -m melredact.cli verify --roster <roster.csv> [--out out]
 
+`run`'s summary line also reports a "consent-held" count, separate from
+"held back for review": a packet whose best match is a held name (see
+roster.py's Roster.held_names, pipeline.py's consent_hold) is a permanent
+structural state, not something a fix or a human decision ever turns into
+a write -- it's counted on its own so it doesn't get conflated with
+held_back packets that genuinely need attention.
+
 `run` does not review anything itself -- it applies whatever `decisions`
 already exist on disk (see pipeline.py's three-state contract), exactly
 like review_app.py's "Run redaction pipeline" button. Reviewing packets
@@ -99,6 +106,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     deleted = [r for r in results if r.deleted_path is not None]
     pending = [r for r in results if r.pending]
     held_back = [r for r in results if r.held_back]
+    consent_held = [r for r in results if r.consent_hold]
 
     for r in written:
         note = f"  ({r.reason})" if r.reason else ""
@@ -109,10 +117,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(f"pending {r.packet_tag} (not yet reviewed)")
     for r in held_back:
         print(f"held back {r.packet_tag} (sid {r.sid}): {r.reason}")
+    for r in consent_held:
+        print(f"consent hold {r.packet_tag} (no sid): {r.reason}")
 
     print(
         f"\n{len(written)} written, {len(deleted)} deleted, "
-        f"{len(held_back)} held back for review, {len(pending)} still pending review"
+        f"{len(held_back)} held back for review, {len(consent_held)} consent-held (no SID), "
+        f"{len(pending)} still pending review"
     )
     return 1 if held_back else 0
 

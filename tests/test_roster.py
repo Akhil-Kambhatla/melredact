@@ -1,6 +1,14 @@
 import pytest
 
-from melredact.roster import RosterError, filter_by_period, infer_period_from_filename, load_full_roster, load_roster
+from melredact.roster import (
+    HeldName,
+    RosterError,
+    filter_by_period,
+    holds_path,
+    infer_period_from_filename,
+    load_full_roster,
+    load_roster,
+)
 from tests.make_fixture import ROSTER, build_main_fixture
 
 
@@ -15,6 +23,14 @@ def _write_csv(path, rows):
             else:
                 sid, last, first = row
                 f.write(f"{sid},{last},{first}\n")
+
+
+def _write_holds_csv(path, rows):
+    """rows are (last, first) pairs -- no SID column, see HeldName."""
+    with path.open("w", newline="") as f:
+        f.write("Last Name,First Name\n")
+        for last, first in rows:
+            f.write(f"{last},{first}\n")
 
 
 def test_loads_valid_roster(tmp_path):
@@ -239,3 +255,88 @@ def test_load_full_roster_matches_load_roster_on_a_single_period_roster(tmp_path
     path = tmp_path / "roster.csv"
     _write_csv(path, [("0204150201", "Shaik", "Nuzhat"), ("0204150202", "Pfleger", "Carter")])
     assert {e.sid for e in load_full_roster(path)} == {e.sid for e in load_roster(path)}
+
+
+# --- held names: the third state, for a consented student with an
+# unresolvable SID (a corrupted/duplicated SID run in the source export)
+# -- see roster.py's module docstring.
+
+
+def test_roster_with_no_holds_sidecar_has_no_held_names(tmp_path):
+    path = tmp_path / "roster.csv"
+    _write_csv(path, [("0204150201", "Shaik", "Nuzhat")])
+    assert load_roster(path).held_names == []
+    assert load_full_roster(path).held_names == []
+
+
+def test_holds_sidecar_path_is_roster_stem_plus_holds(tmp_path):
+    path = tmp_path / "010406.csv"
+    assert holds_path(path) == tmp_path / "010406_holds.csv"
+
+
+def test_roster_with_a_holds_file_loads_and_exposes_held_names(tmp_path):
+    """The main scenario: a holds sidecar sitting next to the roster CSV is
+    picked up automatically and its names show up on Roster.held_names,
+    with no sid -- there's nothing trustworthy to put there."""
+    path = tmp_path / "010406.csv"
+    _write_csv(path, [("0104060401", "Ghavami", "Gavin"), ("0104060402", "Ginsberg", "Zoey")])
+    _write_holds_csv(holds_path(path), [("Matheuir", "Ailer"), ("Osman", "Jad")])
+
+    roster = load_roster(path)
+    assert roster.held_names == [
+        HeldName(last_name="Matheuir", first_name="Ailer"),
+        HeldName(last_name="Osman", first_name="Jad"),
+    ]
+    assert roster.held_names[1].full_name == "Jad Osman"
+
+    # load_full_roster picks up the exact same sidecar.
+    assert load_full_roster(path).held_names == roster.held_names
+
+
+def test_held_names_survive_period_narrowing(tmp_path):
+    """held_names carries no SID/period of its own -- filter_by_period must
+    pass the full list through unchanged, not drop or attempt to scope it."""
+    path = tmp_path / "010406.csv"
+    _write_csv(
+        path,
+        [
+            ("0104060101", "Ames", "Jordan"),
+            "",
+            ("0104060201", "Chandra", "Priya"),
+        ],
+    )
+    _write_holds_csv(holds_path(path), [("Osman", "Jad")])
+
+    roster = load_roster(path, period="1")
+    assert {e.sid for e in roster} == {"0104060101"}
+    assert roster.held_names == [HeldName(last_name="Osman", first_name="Jad")]
+
+
+def test_holds_csv_missing_required_column_raises(tmp_path):
+    path = tmp_path / "010406.csv"
+    _write_csv(path, [("0104060101", "Ames", "Jordan")])
+    hp = holds_path(path)
+    with hp.open("w", newline="") as f:
+        f.write("Last Name\nOsman\n")
+    with pytest.raises(RosterError, match="missing required column"):
+        load_roster(path)
+
+
+def test_holds_csv_partially_blank_row_raises(tmp_path):
+    path = tmp_path / "010406.csv"
+    _write_csv(path, [("0104060101", "Ames", "Jordan")])
+    hp = holds_path(path)
+    with hp.open("w", newline="") as f:
+        f.write("Last Name,First Name\nOsman,\n")
+    with pytest.raises(RosterError, match="partially blank"):
+        load_roster(path)
+
+
+def test_holds_csv_tolerates_a_trailing_blank_line(tmp_path):
+    path = tmp_path / "010406.csv"
+    _write_csv(path, [("0104060101", "Ames", "Jordan")])
+    hp = holds_path(path)
+    with hp.open("w", newline="") as f:
+        f.write("Last Name,First Name\nOsman,Jad\n,\n")
+    roster = load_roster(path)
+    assert roster.held_names == [HeldName(last_name="Osman", first_name="Jad")]

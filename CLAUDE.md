@@ -228,6 +228,115 @@ raises `RosterError` immediately, since that means either the blank-row
 block boundaries were misread or the sheet itself has a data error — both
 worth surfacing, neither worth silently picking a winner between.
 
+## Held names: a third state, for a consented student with no trustworthy SID
+
+**Added 2026-08-13, motivated by a real corrupted export: `data/
+teacher_codes/010406.csv`.** Block 04 of that roster had two SIDs each
+claimed by two different students (`0104060410`: Matheuir/Ailer *and*
+Reeves/Taylor; `0104060412`: Monterroso/Brayan *and* Sun/Adam) and a gap
+where `0104060411` should have been — a corrupted numbering run, not a
+one-off typo. `roster.py`'s duplicate-SID check (see "Consent rule" above
+and `RosterError` on any duplicate) correctly refuses to load a roster in
+that state, and correctly so: there is no way to know which of two
+students actually owns a duplicated SID, and guessing would silently
+mislabel a real student's data.
+
+But the roster's existing two states don't fit these students either. "On
+the roster" means a trustworthy SID; these four rows don't have one.
+"Not on the roster" means no consent (see "Consent rule" above) and
+triggers `run_dispositions`'s delete rule — and these are real, consented
+students (they're in the source sheet; only their SID numbering is
+broken). Deleting their worksheets would be actively wrong. A third state
+was needed: **held** — known-consented, SID-unresolvable.
+
+**The holds sidecar: `data/teacher_codes/<teacher_code>_holds.csv`,
+columns `Last Name`, `First Name`, deliberately no SID column** — there is
+nothing trustworthy to put in one. `roster.py`'s `HeldName` dataclass
+mirrors this (no `sid` field) but deliberately keeps the same
+`first_name`/`last_name` attribute names `RosterEntry` uses, so
+`match.py`'s `score_pair` — which only ever reads those two attributes —
+works identically against either kind of entry with zero special-casing.
+`load_roster`/`load_full_roster` both load this file automatically when it
+sits next to the roster CSV (`roster.holds_path`, always
+`<roster_stem>_holds.csv`) via the same `_parse_roster_csv` entry point
+both loaders already share, and expose it as `Roster.held_names`. A
+missing sidecar is not an error — it just means no held names, the
+overwhelmingly common case. Held names are **not** period-scoped (there's
+no SID to derive a period from), so `filter_by_period` (load_roster's
+period-narrowing step) carries the same full `held_names` list through to
+every scoped `Roster` unchanged, same as `load_full_roster`'s unscoped
+one.
+
+**Matching: a held name is scored with the exact same scorer as a roster
+entry, and a packet whose single best match overall is a held name must
+never become a normal proposal or an auto-assignment.** `match.propose`
+now also scores a packet's name text against `roster.held_names`
+(`propose_held`, using `score_pair` unmodified) and
+`MatchProposal.is_held_match` says whether the top-scoring candidate
+across *both* pools is a held name rather than a roster candidate (ties go
+to the held name — of the two possible wrong guesses, silently assigning
+a real roster SID to what might actually be an unresolvable-SID student is
+the more dangerous one). `assign_all` excludes any proposal with
+`is_held_match=True` from the auto-assignable pool entirely, the same way
+it already excludes a proposal with no candidates at all — a held-name
+packet must never be auto-assigned a roster SID just because some roster
+entry also happened to score reasonably well against it.
+
+**Pipeline: a consent hold is fully redacted, but never written to `out/`
+and never deleted.** For a still-*pending* packet (tag absent from
+`decisions` — see "Packet identity and the decisions store" below for that
+three-state contract), `run_dispositions` checks `_held_match_for_packet`
+before falling through to the ordinary pending case; if the packet's best
+match is a held name, it reports `DispositionResult.consent_hold=True`
+(distinct from both `pending` and `held_back` — see below) with a
+human-readable `reason` naming the held name, and is excluded from that
+run's normal decision handling entirely. Redaction still runs
+unconditionally (`_draft_consent_hold_redaction` calls the real
+`redact_packet`, proving the geometry itself is sound) — the draft lands
+in a real temporary directory that's removed the instant the call
+returns, so a consent hold never leaves a file sitting anywhere on disk,
+in `out/` or otherwise. This check only ever fires for a *pending* tag: a
+human who has already recorded an explicit decision for that tag — a real
+roster SID via the review UI's full-roster search, or an explicit
+non-consent rejection — has already looked at the packet and made a call
+that overrides the automatic name-similarity signal, in either direction.
+A `consent_hold` is deliberately **not** folded into `held_back`: the
+existing `held_back` bucket means "a data or geometry problem a human
+might be able to fix" (see "Packet identity and the decisions store"
+below), and `cli.py run` exits 1 whenever it's non-empty. A consent hold
+is the opposite — a permanent structural state that no decision or fix
+ever turns into a write — so it gets its own count in `cli.py`'s summary
+line and `review_app.py`'s sidebar ("N consent-held (no SID)") and does
+not affect the exit code.
+
+`review_app.py` surfaces this as a distinct disposition, not silently
+folded into "pending": a 🔒 status icon (alongside the existing ⏳/✅/🚫/⚠️
+ones) in the "All packets" sidebar list and the packet subheader, plus an
+inline `st.info` banner on the packet's own page naming the held name and
+explaining that recording a decision (a real SID via roster search, or an
+explicit rejection) overrides the hold.
+
+`scripts/prepare_roster.py` is the one-off cleanup this was actually
+built for: given a roster CSV export, it (1) drops trailing columns with
+no header (a colour legend from the source spreadsheet survived the CSV
+export as unlabeled columns), (2) strips trailing punctuation from name
+cells (the real file had `Matheuir?`, a spreadsheet artifact), and (3)
+finds every SID that appears more than once and moves *all* rows sharing
+that SID into the holds sidecar — never guessing or renumbering which row
+"really" owns the SID, and never touching a blank period-block delimiter
+row. It's idempotent (re-running merges into an existing holds file
+rather than overwriting it) specifically so it doesn't clobber a name a
+human added by hand afterward — which is exactly what happened for SID
+`0104060413` (Osman, Jad): not itself duplicated, so the script's
+duplicate-count scan correctly left it alone, but it sits inside the same
+corrupted numbering run as the actual duplicates, which makes it
+untrustworthy for the same underlying reason. Identifying *that* row
+needed a human looking at the shape of the corruption, not a mechanical
+scan — so it was added to `data/teacher_codes/010406_holds.csv` by hand,
+and removed from the main roster CSV (an SID flagged as untrustworthy
+can't also sit in the roster as if it were a normal, trustworthy entry —
+that would defeat the entire point of holding it).
+
 ## Non-negotiable design decisions
 
 - **Abstain by default.** Auto-assign a name match only when the top

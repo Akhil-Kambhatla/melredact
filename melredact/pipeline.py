@@ -21,6 +21,25 @@ must never be conflated:
   e.g. a reviewer rejects a previously-auto-assigned candidate -- and
   out_dir is not append-only.)
 
+**A packet can also land in a fourth state that isn't part of the
+`decisions` contract at all: a consent hold.** roster.py's `held_names`
+covers a student who is genuinely consented but whose SID can't be
+trusted (e.g. a corrupted, duplicated SID run in the source export). For a
+*pending* packet (tag absent from `decisions`), `run_dispositions` checks
+whether match.py's `propose` says this packet's single best-scoring match
+overall is a held name rather than a roster candidate
+(`MatchProposal.is_held_match`) -- if so, the packet is reported as
+`DispositionResult.consent_hold=True` instead of `pending=True`, is fully
+redacted (to a scratch file that's discarded either way, never `out_dir`)
+to prove the redaction geometry itself is sound, and is never written to
+`out_dir` and never deleted, since there's no SID to name a file with and
+no confirmed non-consent to act on. This check only ever applies to a
+still-pending tag: a human who has already recorded an explicit decision
+for that tag (a real SID via the review UI's roster search, or an explicit
+non-consent rejection) has already looked at the packet and made a call
+that should win over an automatic name-similarity signal, in either
+direction.
+
 **A packet whose decision names a SID can still fail to redact safely --
 that packet is held back, the rest of the run is not.** `DispositionResult.
 held_back` (with a human-readable `reason`) covers: the named SID isn't on
@@ -145,13 +164,14 @@ from __future__ import annotations
 
 import json
 import shutil
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pdfplumber
 
 from melredact.config import RENDER_DPI_FINAL
-from melredact.match import MatchProposal, propose
+from melredact.match import HeldCandidate, MatchProposal, propose
 from melredact.redact import HeaderBand, verify_no_leaked_names
 from melredact.redact import redact_packet as _redact_packet
 from melredact.roster import Roster, RosterEntry
@@ -397,6 +417,34 @@ def propose_all(pdf_path: str | Path, segmented: SegmentResult, roster: Roster) 
     return proposals
 
 
+def _held_match_for_packet(pdf_path: str | Path, packet: Packet, roster: Roster) -> HeldCandidate | None:
+    """Re-runs match.py's scoring for one packet (the same name_text/
+    propose call propose_all already does for every packet during review)
+    to answer one narrow question: is this packet's single best match, out
+    of both the roster and the held names, actually a held name? Orphan
+    packets (no header page, nothing to score) never match a held name.
+    Cheap to call per-packet even outside review_app.py's caching, since
+    extract_header_fields' own OCR call is disk-cached (see CLAUDE.md's
+    "OCR is disk-cached" section) -- this isn't a second expensive pass."""
+    if packet.header_page_index is None:
+        return None
+    with pdfplumber.open(pdf_path) as pdf:
+        fields = extract_header_fields(pdf.pages[packet.header_page_index])
+    proposal = propose(packet_tag(pdf_path, packet), fields.name_text, roster)
+    return proposal.top_held if proposal.is_held_match else None
+
+
+def _draft_consent_hold_redaction(pdf_path: str | Path, packet: Packet, dpi: int, flatten: bool) -> None:
+    """Redaction is unconditional, never dependent on whether a SID could
+    ever be resolved (see CLAUDE.md) -- a consent-hold packet still gets
+    fully redacted, proving the geometry is sound, even though the result
+    is never written to out_dir. The draft lands in a real temporary
+    directory that's removed the moment this returns, so nothing about a
+    consent hold ever leaves a file sitting anywhere on disk."""
+    with tempfile.TemporaryDirectory() as scratch_dir:
+        _redact_packet(pdf_path, packet, Path(scratch_dir) / "scratch.pdf", dpi=dpi, flatten=flatten)
+
+
 @dataclass
 class DispositionResult:
     # None only for a synthetic result produced by the end-of-run
@@ -419,6 +467,16 @@ class DispositionResult:
     # together with held_back=True.
     held_back: bool = False
     reason: str | None = None
+    # True for a still-pending packet whose single best match overall is a
+    # held name (see roster.py's Roster.held_names and match.py's
+    # MatchProposal.is_held_match) -- a known-consented student with an
+    # unresolvable SID. Distinct from held_back: this is never a data or
+    # geometry problem to fix, it's a permanent structural state -- there
+    # is no decision that ever turns this packet into a write, so it's
+    # never counted alongside held_back in a caller's "needs attention"
+    # bucket. `reason` is set together with this, same convention as
+    # held_back.
+    consent_hold: bool = False
 
 
 def run_dispositions(
@@ -483,6 +541,17 @@ def run_dispositions(
         tag = packet_tag(pdf_path, packet)
 
         if tag not in decisions:
+            held = _held_match_for_packet(pdf_path, packet, roster)
+            if held is not None:
+                _draft_consent_hold_redaction(pdf_path, packet, dpi, flatten)
+                reason = (
+                    f"best match is a held name ({held.full_name}) -- consent-known, SID unresolvable; "
+                    "never auto-assigned a roster SID, never deleted"
+                )
+                results.append(
+                    DispositionResult(packet_tag=tag, sid=None, pending=False, consent_hold=True, reason=reason)
+                )
+                continue
             results.append(DispositionResult(packet_tag=tag, sid=None, pending=True))
             continue
 

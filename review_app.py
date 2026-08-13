@@ -104,10 +104,16 @@ def _page_image(pdf_path: str, page_index: int, dpi: int) -> Image.Image:
     return image
 
 
-def _status_icon(tag: str, packet: Packet, decisions: dict[str, str | None]) -> str:
+def _status_icon(tag: str, packet: Packet, decisions: dict[str, str | None], proposal) -> str:
     if packet.issues:
         return "⚠️"
     if tag not in decisions:
+        if proposal is not None and proposal.is_held_match:
+            # Consent hold (see pipeline.py's consent_hold): known-
+            # consented, SID-unresolvable -- distinct from ordinary
+            # pending, since no decision a human records here ever turns
+            # this into a write.
+            return "🔒"
         return "⏳"
     return "✅" if decisions[tag] is not None else "🚫"
 
@@ -178,10 +184,17 @@ def _render_sidebar(args: argparse.Namespace, segmented: SegmentResult, roster: 
             deleted = sum(1 for r in results if r.deleted_path is not None)
             pending = sum(1 for r in results if r.pending)
             held_back = [r for r in results if r.held_back]
+            consent_held = [r for r in results if r.consent_hold]
             overridden = [r for r in written if r.reason]
             st.sidebar.success(
-                f"{len(written)} written, {deleted} deleted, {len(held_back)} held back for review, {pending} still pending review"
+                f"{len(written)} written, {deleted} deleted, {len(held_back)} held back for review, "
+                f"{len(consent_held)} consent-held (no SID), {pending} still pending review"
             )
+            for r in consent_held:
+                # Never a "needs fixing" item like held_back -- a permanent
+                # structural state (see pipeline.py's consent_hold), shown
+                # separately so it doesn't read as something actionable.
+                st.sidebar.info(f"Consent hold (no SID): {r.packet_tag}: {r.reason}")
             for r in overridden:
                 # Written, not held back -- but only because a human
                 # explicitly released the detection-confidence hold (see
@@ -309,6 +322,15 @@ def _render_packet(
             "This packet has unresolved segmentation issues and cannot be assigned a SID "
             "until a human resolves them out of band (e.g. a missing/misfiled page). "
             "You may still mark it as not-on-roster to reject it.\n\n" + "\n".join(f"- {i}" for i in packet.issues)
+        )
+
+    if tag not in st.session_state.decisions and proposal.is_held_match:
+        st.info(
+            f"🔒 This packet's best match is a **held name**: {proposal.top_held.full_name} "
+            "-- consent-known, but this student's SID couldn't be trusted in the roster export "
+            f"(see `data/teacher_codes/*_holds.csv`). It will be fully redacted but never written "
+            "to `out/` and never deleted; recording a decision here (a real roster SID, or "
+            "confirmed non-consent) overrides this hold."
         )
 
     if packet.header_page_index is None:
@@ -451,7 +473,7 @@ def main() -> None:
 
     with st.sidebar.expander("All packets"):
         for t in tags:
-            st.write(f"{_status_icon(t, packet_by_tag[t], st.session_state.decisions)} {t}")
+            st.write(f"{_status_icon(t, packet_by_tag[t], st.session_state.decisions, proposals_by_tag.get(t))} {t}")
 
     if st.session_state.get("show_manual_queue"):
         st.header("Manual redaction queue")
@@ -476,7 +498,7 @@ def main() -> None:
     col_next.button("Next >", on_click=_go, args=(1,))
     tag = col_select.selectbox("Packet", options=tags, key="packet_select")
     packet = packet_by_tag[tag]
-    status = _status_icon(tag, packet, st.session_state.decisions)
+    status = _status_icon(tag, packet, st.session_state.decisions, proposals_by_tag.get(tag))
     st.subheader(f"{status} Packet {tag} ({packet.n_pages} page{'s' if packet.n_pages != 1 else ''})")
     _render_packet(args, packet, tag, roster, proposals_by_tag[tag], auto_assignments, tags)
 

@@ -8,7 +8,12 @@ Expected contents (local only), organized by subfolder:
 - `MPR/` — scanned MPR worksheet PDFs downloaded from Box.
 - `PRT/` — scanned PRT worksheet PDFs downloaded from Box.
 - `teacher_codes/` — roster CSVs exported from the Google Sheet (`SID`,
-  `Last Name`, `First Name`).
+  `Last Name`, `First Name`). A roster CSV may have an optional sidecar,
+  `<teacher_code>_holds.csv` (`Last Name`, `First Name`, no SID column) --
+  known-consented students whose SID couldn't be trusted in the export
+  (see CLAUDE.md's "Held names" section). `scripts/prepare_roster.py`
+  builds this sidecar from a corrupted export; both files are real,
+  identifiable data and gitignored the same as everything else here.
 - `samples/` — small sample/smoke-test PDFs (a handful of pages cut from a
   real scan), used for a faster local run than the full file.
 

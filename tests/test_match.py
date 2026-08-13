@@ -1,8 +1,9 @@
 import pdfplumber
 import pytest
 
-from melredact.match import assign_all, propose, score_pair
-from melredact.roster import load_roster
+from melredact.config import MIN_SCORE
+from melredact.match import assign_all, propose, propose_held, score_pair
+from melredact.roster import HeldName, Roster, RosterEntry, load_roster
 from melredact.segment import extract_header_fields, segment_pdf
 from tests.make_fixture import (
     HEAVY_PACKETS,
@@ -137,3 +138,70 @@ def test_decoy_does_not_outrank_the_genuine_match_for_same_entry(heavy_fixture):
     genuine = by_tag["heavy_clean_match"]
     decoy = by_tag["heavy_decoy_jordan_james"]
     assert genuine.top.score >= decoy.top.score
+
+
+# --- held names: a known-consented student with an unresolvable SID (see
+# roster.py's Roster.held_names) is scored with the exact same scorer as a
+# roster entry, and a packet whose best match is a held name must never be
+# auto-assigned a roster SID.
+
+
+def _roster_with_held(entries, held_names):
+    return Roster(entries=entries, by_sid={e.sid: e for e in entries}, held_names=held_names)
+
+
+def test_propose_held_uses_the_same_scorer_as_roster_entries():
+    held = [HeldName(last_name="Osman", first_name="Jad")]
+    candidates = propose_held("Jad Osman", held)
+    assert candidates[0].full_name == "Jad Osman"
+    assert candidates[0].score == score_pair("Jad Osman", held[0])
+
+
+def test_propose_held_sorts_descending_by_score():
+    held = [HeldName(last_name="Osman", first_name="Jad"), HeldName(last_name="Zephyr", first_name="Xin")]
+    candidates = propose_held("Jad Osman", held)
+    assert [c.score for c in candidates] == sorted((c.score for c in candidates), reverse=True)
+    assert candidates[0].full_name == "Jad Osman"
+
+
+def test_proposal_is_held_match_when_a_held_name_scores_highest():
+    held = [HeldName(last_name="Osman", first_name="Jad")]
+    entries = [RosterEntry(sid="0104060401", last_name="Ghavami", first_name="Gavin")]
+    roster = _roster_with_held(entries, held)
+    proposal = propose("packets_p000", "Jad Osman", roster)
+    assert proposal.is_held_match
+    assert proposal.top_held.full_name == "Jad Osman"
+
+
+def test_proposal_is_not_held_match_when_a_roster_entry_scores_highest():
+    held = [HeldName(last_name="Osman", first_name="Jad")]
+    entries = [RosterEntry(sid="0104060401", last_name="Ames", first_name="Jordan")]
+    roster = _roster_with_held(entries, held)
+    proposal = propose("packets_p000", "Jordan Ames", roster)
+    assert not proposal.is_held_match
+
+
+def test_proposal_is_not_held_match_with_no_holds_file(main_fixture):
+    """held_names defaults to empty -- ordinary rosters with no holds
+    sidecar must behave exactly as before."""
+    proposals, roster = _propose_all(main_fixture, PACKETS)
+    assert roster.held_names == []
+    for proposal in proposals:
+        assert not proposal.is_held_match
+
+
+def test_assign_all_never_assigns_a_sid_when_the_best_match_is_a_held_name():
+    """The packet's top roster candidate clears the auto-assign bar on its
+    own (same name, same score) -- assign_all must still abstain, because
+    match.py's own scoring says the single best match overall is the held
+    name, not this roster entry."""
+    held = [HeldName(last_name="Osman", first_name="Jad")]
+    entries = [RosterEntry(sid="0104060401", last_name="Osman", first_name="Jad")]
+    roster = _roster_with_held(entries, held)
+    proposal = propose("packets_p000", "Jad Osman", roster)
+
+    assert proposal.top.score >= MIN_SCORE
+    assert proposal.is_held_match
+
+    assignments = assign_all([proposal])
+    assert assignments["packets_p000"] is None

@@ -681,3 +681,94 @@ def test_manual_queue_release_with_a_still_insufficient_band_stays_queued(tmp_pa
     entry = roster.by_sid[sid]
     assert not output_path(out_dir, entry, seg.packets[0].worksheet_type).exists()
     assert len(list_manual_queue(out_dir)) == 1
+
+
+# --- consent hold: a packet whose best match is a held name (see
+# roster.py's Roster.held_names) is a known-consented student with an
+# unresolvable SID -- must never be written or deleted, see
+# pipeline.py's module docstring.
+
+
+def _build_held_name_fixture(tmp_path):
+    """A single-header-page packet whose handwritten name matches a held
+    name exactly, against a roster with one unrelated entry (so the held
+    name is unambiguously the best match). Fictional name, never real
+    student PII."""
+    from melredact.config import FOOTER_WORKSHEET_TYPE, NAME_ANCHOR
+    from tests.make_fixture import InvisibleText, PdfBuilder, _write_roster_csv, render_header_image
+
+    img = render_header_image(
+        name_text="Jad Osman",
+        teacher_text="Hannel",
+        group_text="",
+        date_text="10/03/2025",
+        period_text="04",
+        worksheet_type="PRT (01/2024)",
+        page_marker="Page 1 of 1",
+        shade_blank_rows=False,
+    )
+    items = [
+        InvisibleText("Name:", NAME_ANCHOR["x0"], NAME_ANCHOR["top"], 9),
+        InvisibleText("Jad Osman", 150, NAME_ANCHOR["top"]),
+        InvisibleText("PRT 01 2024", FOOTER_WORKSHEET_TYPE["x0"], FOOTER_WORKSHEET_TYPE["top"], 9),
+        InvisibleText("Page 1 of 1", 513, 747, 9),
+    ]
+    builder = PdfBuilder()
+    builder.add_page(img, items)
+    pdf_path = tmp_path / "held.pdf"
+    builder.save(pdf_path)
+
+    roster_path = tmp_path / "010406.csv"
+    _write_roster_csv(roster_path, [("0104060401", "Ghavami", "Gavin")])
+    holds_file = roster_path.with_name("010406_holds.csv")
+    with holds_file.open("w", newline="") as f:
+        f.write("Last Name,First Name\nOsman,Jad\n")
+
+    roster = load_roster(roster_path)
+    seg = segment_pdf(pdf_path)
+    tag = packet_tag(pdf_path, seg.packets[0])
+    return pdf_path, roster, seg, tag
+
+
+def test_pending_packet_matching_a_held_name_is_a_consent_hold_not_pending_or_written(tmp_path):
+    """The primary consent-hold behavior: a packet whose best match is a
+    held name must produce a hold -- not a normal pending state, not a
+    roster proposal, and above all not a write or a delete."""
+    pdf_path, roster, seg, tag = _build_held_name_fixture(tmp_path)
+    out_dir = tmp_path / "out"
+
+    results = run_dispositions(pdf_path, seg, {}, roster, out_dir=out_dir, dpi=DPI)
+    result = next(r for r in results if r.packet_tag == tag)
+
+    assert result.consent_hold
+    assert not result.pending
+    assert not result.held_back
+    assert result.out_path is None
+    assert result.deleted_path is None
+    assert "Jad Osman" in result.reason
+    assert not any(out_dir.rglob("*.pdf")), "a consent-held packet must never leave a file in out_dir"
+
+
+def test_consent_hold_never_deletes_prior_output_for_the_same_tag(tmp_path):
+    """A held-name match must not trigger the non-consent delete rule --
+    there is no confirmed non-consent here, just an unresolvable SID."""
+    pdf_path, roster, seg, tag = _build_held_name_fixture(tmp_path)
+    out_dir = tmp_path / "out"
+
+    results = run_dispositions(pdf_path, seg, {}, roster, out_dir=out_dir, dpi=DPI)
+    assert not [r for r in results if r.deleted_path is not None]
+
+
+def test_explicit_decision_overrides_the_consent_hold(tmp_path):
+    """A human who has already recorded a decision for this tag -- here, an
+    explicit non-consent rejection -- must win over the automatic held-name
+    signal; the hold only ever applies to a still-pending tag."""
+    pdf_path, roster, seg, tag = _build_held_name_fixture(tmp_path)
+    out_dir = tmp_path / "out"
+
+    results = run_dispositions(pdf_path, seg, {tag: None}, roster, out_dir=out_dir, dpi=DPI)
+    result = next(r for r in results if r.packet_tag == tag)
+
+    assert not result.consent_hold
+    assert result.sid is None
+    assert not result.pending

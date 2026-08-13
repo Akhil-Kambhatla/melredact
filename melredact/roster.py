@@ -44,17 +44,38 @@ disagreement means either the blank-row block boundaries were misread or
 the sheet itself has a data error (e.g. a mistyped SID) -- both are worth
 surfacing immediately rather than silently trusting one signal over the
 other.
+
+A roster export can also contain a student who is genuinely consented (on
+the source sheet, a real person) but whose SID cannot be trusted -- e.g. a
+corrupted numbering run where a SID is duplicated across two different
+students, or a number that sits inside such a corrupted run even though
+it isn't itself duplicated. Deleting that student's worksheet would be
+wrong (they consented); shipping it under a possibly-wrong SID would be
+worse (mislabeled real student data). Neither of the roster's existing two
+states -- "on the roster" (has a trustworthy SID) or "not on the roster"
+(no consent) -- fits, so there's a third: `held_names`
+(`data/teacher_codes/<teacher_code>_holds.csv`, columns "Last Name",
+"First Name", no SID column -- there's nothing trustworthy to put there).
+`load_roster`/`load_full_roster` load this sidecar file when it sits next
+to the roster CSV (`holds_path`) and expose it on `Roster.held_names`;
+`match.py` scores a packet against held names with the same scorer used
+for roster entries, and a packet whose best match is a held name produces
+a hold (never a proposal, never a delete) in `pipeline.py`. Held names
+aren't period-scoped (the sidecar carries no SID to derive a period from),
+so the same full list is attached to every `Roster` returned for this
+teacher, scoped or not.
 """
 
 from __future__ import annotations
 
 import csv
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 SID_PATTERN = re.compile(r"^\d{10}$")
 REQUIRED_COLUMNS = ("SID", "Last Name", "First Name")
+HOLDS_REQUIRED_COLUMNS = ("Last Name", "First Name")
 
 
 class RosterError(ValueError):
@@ -90,10 +111,32 @@ class RosterEntry:
         return self.sid[8:10]
 
 
+@dataclass(frozen=True)
+class HeldName:
+    """A known-consented student whose SID cannot be trusted -- see the
+    module docstring's "third state" section. No `sid` field: that's the
+    entire point, there's nothing trustworthy to put there. Deliberately
+    shares the `first_name`/`last_name` attribute names `RosterEntry` uses
+    so match.py's `score_pair` (which only ever reads those two attributes)
+    works identically against either kind of entry with no special-casing."""
+
+    last_name: str
+    first_name: str
+
+    @property
+    def full_name(self) -> str:
+        return f"{self.first_name} {self.last_name}"
+
+
 @dataclass
 class Roster:
     entries: list[RosterEntry]
     by_sid: dict[str, RosterEntry]
+    # Known-consented, SID-unresolvable students -- see the module
+    # docstring. Not period-scoped (no SID to derive a period from), so the
+    # same list is carried through unchanged by both load_roster's period
+    # narrowing (filter_by_period) and load_full_roster.
+    held_names: list[HeldName] = field(default_factory=list)
 
     def __contains__(self, sid: str) -> bool:
         return sid in self.by_sid
@@ -130,7 +173,50 @@ def filter_by_period(roster: Roster, period: str | int) -> Roster:
     if not entries:
         found = sorted({e.period_display for e in roster})
         raise RosterError(f"no roster entries found for period {code!r} (roster has periods: {found})")
-    return Roster(entries=entries, by_sid={e.sid: e for e in entries})
+    return Roster(entries=entries, by_sid={e.sid: e for e in entries}, held_names=roster.held_names)
+
+
+def holds_path(roster_path: str | Path) -> Path:
+    """Where a roster CSV's held-names sidecar would live -- always
+    <roster_stem>_holds.csv next to the roster itself (e.g.
+    data/teacher_codes/010406_holds.csv for data/teacher_codes/010406.csv).
+    Loading is optional: a roster with no corrupted SIDs simply has no
+    sidecar file, and `_load_held_names` treats that as "no held names",
+    not an error."""
+    roster_path = Path(roster_path)
+    return roster_path.with_name(f"{roster_path.stem}_holds.csv")
+
+
+def _parse_holds_csv(path: Path) -> list[HeldName]:
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        missing = [c for c in HOLDS_REQUIRED_COLUMNS if c not in fieldnames]
+        if missing:
+            raise RosterError(f"holds CSV {path} missing required column(s): {missing}")
+
+        held: list[HeldName] = []
+        for row_num, row in enumerate(reader, start=2):  # header is row 1
+            last = (row["Last Name"] or "").strip()
+            first = (row["First Name"] or "").strip()
+            if not last and not first:
+                # Tolerate a trailing blank line the same way the roster
+                # itself tolerates a period-block delimiter -- not
+                # structural here (holds aren't period-blocked), just a
+                # harmless blank row a spreadsheet export can leave behind.
+                continue
+            if not (last and first):
+                raise RosterError(
+                    f"row {row_num} of {path}: partially blank held-name row "
+                    f"(Last Name={last!r}, First Name={first!r}) -- a valid row needs both fields"
+                )
+            held.append(HeldName(last_name=last, first_name=first))
+    return held
+
+
+def _load_held_names(roster_path: str | Path) -> list[HeldName]:
+    path = holds_path(roster_path)
+    return _parse_holds_csv(path) if path.exists() else []
 
 
 def _parse_roster_csv(path: str | Path) -> Roster:
@@ -140,7 +226,9 @@ def _parse_roster_csv(path: str | Path) -> Roster:
     data-integrity checks (malformed/duplicate SID, partially-blank row,
     SID-period/block-position cross-check) apply identically either way,
     since those are about whether the roster itself is trustworthy, not
-    about which period a caller wants."""
+    about which period a caller wants. Also the one place `held_names` is
+    loaded (see `_load_held_names`) -- both loaders get it for free."""
+    held_names = _load_held_names(path)
     with open(path, newline="") as f:
         reader = csv.DictReader(f)
         fieldnames = reader.fieldnames or []
@@ -192,7 +280,7 @@ def _parse_roster_csv(path: str | Path) -> Roster:
 
             entries.append(entry)
 
-    return Roster(entries=entries, by_sid={e.sid: e for e in entries})
+    return Roster(entries=entries, by_sid={e.sid: e for e in entries}, held_names=held_names)
 
 
 def load_roster(
