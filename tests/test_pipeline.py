@@ -1,5 +1,6 @@
 import pytest
 
+from melredact.blocks import round_label
 from melredact.config import RENDER_DPI_PREVIEW
 from melredact.pipeline import (
     DispositionResult,
@@ -14,9 +15,17 @@ from melredact.pipeline import (
 )
 from melredact.roster import load_roster
 from melredact.segment import segment_pdf
-from tests.make_fixture import PACKETS, build_footer_edge_case_fixture, build_main_fixture
+from tests.make_fixture import PACKETS, ROSTER, PacketSpec, _build_packets_pdf, build_footer_edge_case_fixture, build_main_fixture
 
 DPI = RENDER_DPI_PREVIEW
+
+# Every packet spec in the main fixture (and the packet14/held-name
+# fixtures built inline below) uses PacketSpec's default date_text,
+# "10/03/2025" -- a single, uniform date, so the whole file resolves to one
+# contiguous round group with this label (see blocks.group_into_rounds).
+# Computed via the real round_label(), not hardcoded, so this stays correct
+# if the fixture's default date_text ever changes.
+FIXTURE_ROUND = round_label("10/03/2025")
 
 
 @pytest.fixture(scope="module")
@@ -151,9 +160,15 @@ def test_output_path_is_teacher_period_sid_not_packet_tag(main_fixture, segmente
     result = next(r for r in results if r.packet_tag == tag)
     assert (
         result.out_path
-        == out_dir / entry.teacher_code / entry.period_display / packet.worksheet_type / "NA" / f"{sid}.pdf"
+        == out_dir
+        / entry.teacher_code
+        / entry.period_display
+        / packet.worksheet_type
+        / "NA"
+        / FIXTURE_ROUND
+        / f"{sid}.pdf"
     )
-    assert result.out_path == output_path(out_dir, entry, packet.worksheet_type)
+    assert result.out_path == output_path(out_dir, entry, packet.worksheet_type, round_label=FIXTURE_ROUND)
 
 
 def test_explicit_non_consent_deletes_existing_output_not_just_skips_it(main_fixture, segmented, roster, tmp_path):
@@ -215,7 +230,7 @@ def test_corrected_decision_writes_new_sid_and_removes_old(main_fixture, segment
     second = run_dispositions(main_fixture.pdf_path, segmented, {tag: new_entry.sid}, roster, out_dir=out_dir, dpi=DPI)
     tag_result = next(r for r in second if r.packet_tag == tag)
     assert tag_result.sid == new_entry.sid
-    assert tag_result.out_path == output_path(out_dir, new_entry, packet.worksheet_type)
+    assert tag_result.out_path == output_path(out_dir, new_entry, packet.worksheet_type, round_label=FIXTURE_ROUND)
     assert tag_result.out_path.exists()
     assert not old_path.exists()
 
@@ -315,7 +330,10 @@ def test_topic_from_filename_defaults_to_NA_with_constant_path_depth(tmp_path, r
     no_topic_path = output_path(tmp_path, entry, "PRT")
     with_topic_path = output_path(tmp_path, entry, "PRT", "EW")
     assert len(no_topic_path.relative_to(tmp_path).parts) == len(with_topic_path.relative_to(tmp_path).parts)
-    assert no_topic_path.parent.name == NO_TOPIC
+    # One level deeper than the topic segment itself now (see the round
+    # segment, output_path's fifth component) -- parent is the round dir,
+    # parent.parent is the topic dir.
+    assert no_topic_path.parent.parent.name == NO_TOPIC
 
 
 def test_different_topics_in_the_source_filename_do_not_collide(tmp_path, roster):
@@ -332,8 +350,8 @@ def test_different_topics_in_the_source_filename_do_not_collide(tmp_path, roster
     ew_path = output_path(tmp_path, entry, "PRT", ew_topic)
     fr_path = output_path(tmp_path, entry, "PRT", fr_topic)
     assert ew_path != fr_path
-    assert ew_path.parent.name == "EW"
-    assert fr_path.parent.name == "FR"
+    assert ew_path.parent.parent.name == "EW"
+    assert fr_path.parent.parent.name == "FR"
 
 
 def test_second_packet_claiming_an_owned_path_gets_suffixed_not_overwritten(main_fixture, segmented, roster, tmp_path):
@@ -446,7 +464,7 @@ def test_leak_finding_deletes_output_and_holds_back_not_raises(main_fixture, seg
     result = next(r for r in results if r.packet_tag == tag)
     assert result.held_back
     assert "leaks" in result.reason
-    assert not output_path(out_dir, entry, packet.worksheet_type).exists()
+    assert not output_path(out_dir, entry, packet.worksheet_type, round_label=FIXTURE_ROUND).exists()
 
 
 def test_undetected_header_border_holds_back_only_that_packet_not_the_whole_run(
@@ -719,7 +737,7 @@ def test_vertical_group_row_overflow_is_auto_held_not_shipped_as_clean(tmp_path)
     # Nothing is present at the real, servable out/ path -- the held-back
     # draft only exists in the manual-redaction queue, never in out/ itself.
     entry = roster.by_sid[sid]
-    assert not output_path(out_dir, entry, seg.packets[0].worksheet_type).exists()
+    assert not output_path(out_dir, entry, seg.packets[0].worksheet_type, round_label=FIXTURE_ROUND).exists()
     queued = list_manual_queue(out_dir)
     assert len(queued) == 1
     assert queued[0]["packet_tag"] == tag
@@ -747,7 +765,7 @@ def test_manual_queue_release_with_a_corrected_band_writes_and_clears_the_queue(
 
     assert release.released, release.reason
     entry = roster.by_sid[sid]
-    expected_path = output_path(out_dir, entry, seg.packets[0].worksheet_type)
+    expected_path = output_path(out_dir, entry, seg.packets[0].worksheet_type, round_label=FIXTURE_ROUND)
     assert release.out_path == expected_path
     assert expected_path.exists()
     assert list_manual_queue(out_dir) == []
@@ -776,7 +794,7 @@ def test_manual_queue_release_with_a_still_insufficient_band_stays_queued(tmp_pa
     assert not release.released
     assert "uncovered group-row ink" in release.reason
     entry = roster.by_sid[sid]
-    assert not output_path(out_dir, entry, seg.packets[0].worksheet_type).exists()
+    assert not output_path(out_dir, entry, seg.packets[0].worksheet_type, round_label=FIXTURE_ROUND).exists()
     assert len(list_manual_queue(out_dir)) == 1
 
 
@@ -869,3 +887,101 @@ def test_explicit_decision_overrides_the_consent_hold(tmp_path):
     assert not result.consent_hold
     assert result.sid is None
     assert not result.pending
+
+
+# --- round path segment (see CLAUDE.md's "A round segment" section): a
+# student can legitimately complete the same worksheet+topic more than
+# once, in different collection sessions -- round is what keeps those from
+# colliding in out/. Round is derived purely from each packet's own OCR'd
+# Date field (blocks.group_into_rounds), never the source filename, and
+# must never influence matching/scoring/claiming -- only the output path.
+
+
+def _one_student_multi_round_fixture(tmp_path, date_texts):
+    """A single-page-per-packet PDF, one packet per date in `date_texts`,
+    every packet naming the *same* roster student (ROSTER[0], "Jordan
+    Ames") -- isolates the round segment as the only thing that can
+    distinguish these packets' output paths (same sid, same worksheet_type,
+    same NO_TOPIC filename)."""
+    name = f"{ROSTER[0][2]} {ROSTER[0][1]}"
+    specs = [
+        PacketSpec(f"pkt{i}", name, "Hannel", "none", 1, ROSTER[0][0], date_text=date_text)
+        for i, date_text in enumerate(date_texts)
+    ]
+    pdf_path = tmp_path / "multi_round.pdf"
+    roster_path = tmp_path / "roster.csv"
+    return _build_packets_pdf(specs, ROSTER, [], pdf_path, roster_path)
+
+
+def test_three_contiguous_groups_produce_three_round_labels_and_distinct_paths(tmp_path):
+    fx = _one_student_multi_round_fixture(tmp_path, ["10/01/2025", "2/01/2026", "3/01/2026"])
+    roster = load_roster(fx.roster_path)
+    seg = segment_pdf(fx.pdf_path)
+    sid = ROSTER[0][0]
+    decisions = {packet_tag(fx.pdf_path, p): sid for p in seg.packets}
+    out_dir = tmp_path / "out"
+
+    results = run_dispositions(fx.pdf_path, seg, decisions, roster, out_dir=out_dir, dpi=DPI)
+    written = [r for r in results if r.out_path is not None]
+
+    assert len(written) == 3
+    assert {r.out_path.parent.name for r in written} == {"2025-10", "2026-02", "2026-03"}
+    assert len({r.out_path for r in written}) == 3, "three distinct paths for the same SID, one per round"
+    assert all(r.collision_note is None for r in written), "distinct round dirs need no suffix backstop"
+
+
+def test_undated_group_still_writes_under_the_undated_round_segment(tmp_path):
+    fx = _one_student_multi_round_fixture(tmp_path, ["not a real date"])
+    roster = load_roster(fx.roster_path)
+    seg = segment_pdf(fx.pdf_path)
+    sid = ROSTER[0][0]
+    tag = packet_tag(fx.pdf_path, seg.packets[0])
+    out_dir = tmp_path / "out"
+
+    results = run_dispositions(fx.pdf_path, seg, {tag: sid}, roster, out_dir=out_dir, dpi=DPI)
+    result = next(r for r in results if r.packet_tag == tag)
+
+    assert not result.held_back, "an unparseable date is not a reason to withhold otherwise-approved output"
+    assert result.out_path is not None
+    assert result.out_path.exists()
+    from melredact.blocks import UNDATED_ROUND
+
+    assert result.out_path.parent.name == UNDATED_ROUND
+
+
+def test_single_round_file_with_no_topic_has_constant_path_depth(main_fixture, segmented, roster, tmp_path):
+    """A file with no topic segment (every teacher except one with per-topic
+    filenames) and a single round group must still produce the full,
+    constant-depth path -- teacher/period/worksheet_type/topic/round/sid.pdf --
+    not a shallower path just because there's nothing round- or
+    topic-specific to say."""
+    packet = segmented.packets[0]  # clean_match
+    tag = packet_tag(main_fixture.pdf_path, packet)
+    sid = _sid_for(roster, "Jordan Ames")
+    out_dir = tmp_path / "out"
+
+    results = run_dispositions(main_fixture.pdf_path, segmented, {tag: sid}, roster, out_dir=out_dir, dpi=DPI)
+    result = next(r for r in results if r.packet_tag == tag)
+
+    rel_parts = result.out_path.relative_to(out_dir).parts
+    assert len(rel_parts) == 6  # teacher / period / worksheet_type / topic / round / sid.pdf
+    assert rel_parts[3] == "NA"
+    assert rel_parts[4] == FIXTURE_ROUND
+    assert rel_parts[5] == f"{sid}.pdf"
+
+
+def test_round_label_does_not_alter_match_proposals(tmp_path):
+    """Two packets differing only in their own date_text (and therefore
+    only in which round they'll eventually be assigned to) must produce
+    byte-identical match proposals -- round labelling is output-path
+    metadata only, and must never leak into candidate scoring, ranking, or
+    claiming."""
+    fx = _one_student_multi_round_fixture(tmp_path, ["3/01/2026", "10/01/2025"])
+    roster = load_roster(fx.roster_path)
+    seg = segment_pdf(fx.pdf_path)
+
+    proposals = propose_all(fx.pdf_path, seg, roster)
+    assert len(proposals) == 2
+    p0, p1 = proposals
+    assert [(c.sid, c.score) for c in p0.candidates] == [(c.sid, c.score) for c in p1.candidates]
+    assert [(c.full_name, c.score) for c in p0.held_candidates] == [(c.full_name, c.score) for c in p1.held_candidates]

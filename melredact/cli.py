@@ -25,7 +25,7 @@ for why a scan is only ever matched against one period's roster block.
 against the whole roster, every period included -- it's a safety net, and
 narrowing its search space would only make it worse at its one job. It
 also does not take `--pdf`: output is named
-out/<teacher>/<period>/<worksheet_type>/<topic>/<SID>.pdf (see pipeline.py), which
+out/<teacher>/<period>/<worksheet_type>/<topic>/<round>/<SID>.pdf (see pipeline.py), which
 carries no trace of which scan produced it, so there is nothing
 scan-specific left for verify to filter by -- it walks every file under
 `--out` and checks it against the whole roster.
@@ -60,13 +60,16 @@ from pathlib import Path
 
 from melredact.blocks import (
     collect_packet_dates,
+    collect_packet_rounds,
     decisions_scope_mismatches,
     disagreeing_packets,
     format_month_histogram,
     format_resolution_report,
+    format_round_report,
     load_block_metadata,
     normalize_block,
     resolve_block,
+    round_labels_by_tag,
     save_resolved_block_record,
 )
 from melredact.pipeline import decisions_path, load_decisions, load_detection_overrides, packet_tag, run_dispositions
@@ -87,9 +90,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if out_dir.suffix.lower() == ".pdf":
         print(
             f"error: --out {out_dir} looks like a single file, but output is one redacted PDF per "
-            f"approved packet, named by SID under a <teacher>/<period>/<worksheet_type> subdirectory "
-            f"(e.g. {out_dir.stem}/020415/02/PRT/NA/0204150204.pdf), written into --out as a directory -- "
-            f"pass a directory name instead (e.g. --out {out_dir.stem})",
+            f"approved packet, named by SID under a <teacher>/<period>/<worksheet_type>/<topic>/<round> "
+            f"subdirectory (e.g. {out_dir.stem}/020415/02/PRT/NA/2026-03/0204150204.pdf), written into "
+            f"--out as a directory -- pass a directory name instead (e.g. --out {out_dir.stem})",
             file=sys.stderr,
         )
         return 1
@@ -99,6 +102,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if not roster_path.exists():
         print(f"Roster CSV not found: {roster_path}", file=sys.stderr)
         return 1
+
+    # Segmented once, up front, and reused everywhere else in this command
+    # (block-date collection, round grouping, run_dispositions itself) --
+    # segmentation is cheap on its own, but re-segmenting needlessly would
+    # also mean re-deriving packet identity (packet_tag) from scratch each
+    # time, which is only ever safe when it's the exact same SegmentResult.
+    segmented = segment_pdf(pdf_path)
+
+    round_groups = collect_packet_rounds(pdf_path, segmented=segmented)
+    print(format_round_report(round_groups))
+    round_labels = round_labels_by_tag(round_groups)
 
     metadata = load_block_metadata(roster_path)
     resolved_block = None
@@ -119,7 +133,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 return 1
             class_period = int(inferred)
 
-        dates = collect_packet_dates(pdf_path)
+        dates = collect_packet_dates(pdf_path, segmented=segmented)
         resolution = resolve_block(dates, class_period, metadata)
         print(format_resolution_report(resolution))
 
@@ -180,14 +194,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
         # signal for a human skimming the run, never something that gates
         # or alters this run. Only a `_blocks.json` sidecar makes date
         # resolution load-bearing (the branch above).
-        print(format_month_histogram(collect_packet_dates(pdf_path)))
+        print(format_month_histogram(collect_packet_dates(pdf_path, segmented=segmented)))
 
     try:
         roster = load_roster(roster_path, period=period_for_roster, infer_period_from=pdf_path)
     except RosterError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    segmented = segment_pdf(pdf_path)
     decisions = load_decisions(pdf_path, decisions_dir=Path(args.decisions))
     detection_overrides = load_detection_overrides(pdf_path, decisions_dir=Path(args.decisions))
 
@@ -220,6 +233,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         out_dir=out_dir,
         flatten=args.flatten,
         detection_overrides=detection_overrides,
+        round_labels=round_labels,
     )
 
     written = [r for r in results if r.out_path is not None]
@@ -265,7 +279,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         return 1
 
     out_dir = Path(args.out)
-    # Layout: out/<teacher_code>/<period>/<worksheet_type>/<topic>/<SID>.pdf
+    # Layout: out/<teacher_code>/<period>/<worksheet_type>/<topic>/<round>/<SID>.pdf
     # -- but the exact depth isn't verify's business to assume (a topic
     # segment was added after this layout was first fixed at four levels,
     # and nothing guarantees another segment is never added later), so this
@@ -280,7 +294,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     if not pdfs:
         print(
             f"error: no output files found under {out_dir} (expected "
-            f"{out_dir}/<teacher>/<period>/<worksheet_type>/<topic>/<SID>.pdf) -- nothing to verify. "
+            f"{out_dir}/<teacher>/<period>/<worksheet_type>/<topic>/<round>/<SID>.pdf) -- nothing to verify. "
             "If this is unexpected, check --out points at the right directory "
             "rather than trusting a vacuous pass.",
             file=sys.stderr,

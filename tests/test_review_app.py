@@ -86,6 +86,7 @@ def test_confirm_persists_decision_to_disk(main_fixture, tmp_path):
 
 
 def test_reject_after_approve_deletes_prior_output(main_fixture, tmp_path):
+    from melredact.blocks import round_label
     from melredact.pipeline import output_path
     from melredact.roster import load_roster
 
@@ -99,7 +100,9 @@ def test_reject_after_approve_deletes_prior_output(main_fixture, tmp_path):
     roster = load_roster(main_fixture.roster_path, infer_period_from=main_fixture.pdf_path)
     sid = main_fixture.expected_auto_assign_sid["clean_match"]
     packet = next(p for p in segment_pdf(main_fixture.pdf_path).packets if packet_tag(main_fixture.pdf_path, p) == "packets_p000")
-    out_file = output_path(out_dir, roster.by_sid[sid], packet.worksheet_type)
+    # Every fixture packet shares PacketSpec's default date_text
+    # ("10/03/2025"), one contiguous round group for the whole file.
+    out_file = output_path(out_dir, roster.by_sid[sid], packet.worksheet_type, round_label=round_label("10/03/2025"))
     assert out_file.exists()
 
     at2 = _launch(main_fixture.pdf_path, main_fixture.roster_path, out_dir, decisions_dir)
@@ -214,6 +217,7 @@ def test_manual_queue_panel_lists_a_queued_packet_and_can_release_it(tmp_path):
     panel with a working release path -- releasing with a corrected band
     that actually covers the overflow ink must write the file and clear
     the queue; the panel must not be a dead end."""
+    from melredact.blocks import round_label
     from melredact.pipeline import list_manual_queue, output_path, run_dispositions
     from melredact.roster import load_roster
     from melredact.segment import segment_pdf as _segment_pdf
@@ -240,7 +244,9 @@ def test_manual_queue_panel_lists_a_queued_packet_and_can_release_it(tmp_path):
     assert not at.exception
 
     entry = roster.by_sid[sid]
-    assert output_path(out_dir, entry, seg.packets[0].worksheet_type).exists()
+    assert output_path(
+        out_dir, entry, seg.packets[0].worksheet_type, round_label=round_label("10/03/2025")
+    ).exists()
     assert list_manual_queue(out_dir) == []
 
 

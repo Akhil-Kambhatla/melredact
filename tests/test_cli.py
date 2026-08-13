@@ -92,11 +92,12 @@ def test_verify_fails_loudly_on_a_directory_with_no_matching_output(tmp_path, ca
     assert str(empty_out) in err
 
 
-def test_verify_recursive_glob_finds_files_under_the_topic_segment(main_fixture, tmp_path, capsys):
+def test_verify_recursive_glob_finds_files_under_the_topic_and_round_segments(main_fixture, tmp_path, capsys):
     """Output now lands at out/<teacher>/<period>/<worksheet_type>/<topic>/
-    <SID>.pdf -- one level deeper than verify's old fixed four-level glob.
-    verify must walk recursively and still report a nonzero checked count,
-    not silently find nothing at the old fixed depth."""
+    <round>/<SID>.pdf -- two levels deeper than verify's old fixed
+    four-level glob. verify must walk recursively and still report a
+    nonzero checked count, not silently find nothing at the old fixed
+    depth."""
     segmented = segment_pdf(main_fixture.pdf_path)
     decisions_dir = tmp_path / "decisions"
     tag = packet_tag(main_fixture.pdf_path, segmented.packets[0])
@@ -121,7 +122,12 @@ def test_verify_recursive_glob_finds_files_under_the_topic_segment(main_fixture,
 
     written = list(out.rglob("*.pdf"))
     assert written
-    assert any(p.parent.name == "NA" for p in written), "fixture filename carries no topic -- must fall to NA"
+    assert any(p.parent.parent.name == "NA" for p in written), "fixture filename carries no topic -- must fall to NA"
+    from melredact.blocks import round_label
+
+    assert any(
+        p.parent.name == round_label("10/03/2025") for p in written
+    ), "fixture packets share one date -- must resolve to one round group"
 
     rc = main(["verify", "--roster", str(main_fixture.roster_path), "--out", str(out)])
     assert rc == 0

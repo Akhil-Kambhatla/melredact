@@ -3,20 +3,25 @@ import json
 import pytest
 
 from melredact.blocks import (
+    UNDATED_ROUND,
     BlockMeaning,
     BlockMetadata,
     PacketDate,
     decisions_scope_mismatches,
     disagreeing_packets,
+    duplicate_round_labels,
+    group_into_rounds,
     load_block_metadata,
     load_resolved_block_record,
     parse_month,
     resolve_block,
+    round_disagreeing_tags,
+    round_label,
 )
 from melredact.cli import main
 from melredact.pipeline import packet_tag, save_decisions
 from melredact.roster import infer_period_from_filename
-from melredact.segment import segment_pdf
+from melredact.segment import Packet, segment_pdf
 from tests.make_fixture import ROSTER, PacketSpec, _build_packets_pdf, build_main_fixture
 
 TEACHER_CODE = "010406"
@@ -306,3 +311,102 @@ def test_no_block_metadata_sidecar_behaves_exactly_as_before(tmp_path):
     # feature's behavior should engage.
     assert rc == 0
     assert out.is_dir()
+
+
+# --- round labelling and contiguous-group assignment (see CLAUDE.md's "A
+# round segment" section) -- unrelated to the _blocks.json-gated block
+# resolution feature above: round grouping applies to every teacher, not
+# just one with a corrupted/dual-round roster export. ---
+
+
+def test_round_label_good_inputs_and_undated():
+    assert round_label("3/31/2026") == "2026-03"
+    assert round_label("03/31/26") == "2026-03"
+    assert round_label("December 1, 2025") == "2025-12"
+    assert round_label("garbage") == UNDATED_ROUND
+    assert round_label("") == UNDATED_ROUND
+    assert round_label(None) == UNDATED_ROUND
+
+
+def _packet(i: int) -> Packet:
+    return Packet(
+        packet_index=i,
+        page_indices=[i],
+        header_page_index=i,
+        declared_total=1,
+        is_orphan=False,
+        worksheet_type="PRT",
+    )
+
+
+def test_group_into_rounds_three_contiguous_groups_produce_three_labels():
+    packets = [_packet(i) for i in range(9)]
+    dates = (
+        [PacketDate(f"o{i}", f"10/{i + 1}/2025", 10) for i in range(3)]
+        + [PacketDate(f"f{i}", f"2/{i + 1}/2026", 2) for i in range(3)]
+        + [PacketDate(f"m{i}", f"3/{i + 1}/2026", 3) for i in range(3)]
+    )
+    groups = group_into_rounds(packets, dates)
+    assert [g.label for g in groups] == ["2025-10", "2026-02", "2026-03"]
+    assert [g.n_packets for g in groups] == [3, 3, 3]
+    assert all(g.n_disagreeing == 0 for g in groups)
+    assert groups[0].first_page == 1 and groups[0].last_page == 3
+    assert groups[2].first_page == 7 and groups[2].last_page == 9
+
+
+def test_single_misread_date_inside_a_run_inherits_the_runs_label():
+    """The core robustness property: a boundary is only recognized when the
+    new month actually sticks (confirmed by a later packet), not merely
+    differs once -- a lone misread must be absorbed into the surrounding
+    run, counted as disagreeing, never split into its own round."""
+    packets = [_packet(i) for i in range(5)]
+    dates = [
+        PacketDate("t0", "3/1/2026", 3),
+        PacketDate("t1", "3/2/2026", 3),
+        PacketDate("t2", "2/2/2026", 2),  # lone misread, surrounded by March
+        PacketDate("t3", "3/4/2026", 3),
+        PacketDate("t4", "3/5/2026", 3),
+    ]
+    groups = group_into_rounds(packets, dates)
+    assert len(groups) == 1
+    assert groups[0].label == "2026-03"
+    assert groups[0].packet_tags == ["t0", "t1", "t2", "t3", "t4"]
+    assert groups[0].n_disagreeing == 1
+    assert round_disagreeing_tags(groups, dates) == frozenset({"t2"})
+
+
+def test_group_with_no_parseable_dates_labels_undated():
+    packets = [_packet(i) for i in range(3)]
+    dates = [PacketDate(f"u{i}", "", None) for i in range(3)]
+    groups = group_into_rounds(packets, dates)
+    assert len(groups) == 1
+    assert groups[0].label == UNDATED_ROUND
+    assert groups[0].n_disagreeing == 0
+
+
+def test_undated_packet_rides_along_inside_a_dated_run_without_disagreeing():
+    packets = [_packet(i) for i in range(4)]
+    dates = [
+        PacketDate("t0", "10/1/2025", 10),
+        PacketDate("t1", "10/2/2025", 10),
+        PacketDate("t2", "", None),  # unreadable date, not a misread
+        PacketDate("t3", "10/4/2025", 10),
+    ]
+    groups = group_into_rounds(packets, dates)
+    assert len(groups) == 1
+    assert groups[0].label == "2025-10"
+    assert groups[0].n_disagreeing == 0
+    assert round_disagreeing_tags(groups, dates) == frozenset()
+
+
+def test_nonadjacent_groups_sharing_a_label_are_reported_not_silently_merged():
+    packets = [_packet(i) for i in range(6)]
+    dates = (
+        [PacketDate(f"m1_{i}", f"3/{i + 1}/2026", 3) for i in range(2)]
+        + [PacketDate(f"f{i}", f"2/{i + 1}/2026", 2) for i in range(2)]
+        + [PacketDate(f"m2_{i}", f"3/{i + 20}/2026", 3) for i in range(2)]
+    )
+    groups = group_into_rounds(packets, dates)
+    assert [g.label for g in groups] == ["2026-03", "2026-02", "2026-03"]
+    assert len(groups) == 3, "non-adjacent March groups must never be merged into one"
+    assert duplicate_round_labels(groups) == ["2026-03"]

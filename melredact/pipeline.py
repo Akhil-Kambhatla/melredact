@@ -169,6 +169,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from melredact.blocks import UNDATED_ROUND, collect_packet_rounds, round_labels_by_tag
 from melredact.config import RENDER_DPI_FINAL
 from melredact.match import HeldCandidate, MatchProposal, propose
 from melredact.pdfio import open_pdf
@@ -193,6 +194,14 @@ MANUAL_QUEUE_DIRNAME = ".manual_queue"
 NO_TOPIC = "NA"
 _TOPIC_FROM_FILENAME = re.compile(r"^[^_]+_PD\d+_[^_]+_([A-Za-z0-9]+)$", re.IGNORECASE)
 
+# Same literal blocks.round_label() returns for a packet whose own date
+# couldn't be confidently parsed (blocks.UNDATED_ROUND) -- reused here as
+# output_path's default `round_label` so a caller that doesn't care about
+# rounds (most direct callers outside run_dispositions/release_from_
+# manual_queue, which always compute and pass a real one) still gets a
+# stable, constant-depth path rather than an omitted segment.
+NO_ROUND = UNDATED_ROUND
+
 
 def packet_tag(pdf_path: str | Path, packet: Packet) -> str:
     return f"{Path(pdf_path).stem}_p{packet.page_indices[0]:03d}"
@@ -210,10 +219,12 @@ def topic_from_filename(pdf_path: str | Path) -> str:
     return m.group(1).upper() if m else NO_TOPIC
 
 
-def output_path(out_dir: str | Path, entry: RosterEntry, worksheet_type: str, topic: str = NO_TOPIC) -> Path:
+def output_path(
+    out_dir: str | Path, entry: RosterEntry, worksheet_type: str, topic: str = NO_TOPIC, round_label: str = NO_ROUND
+) -> Path:
     """Where a confirmed packet for this roster entry lands:
-    out/<teacher_code>/<period>/<worksheet_type>/<topic>/<SID>.pdf. `entry.
-    teacher_code` and `entry.period_display` are the SID's own digits
+    out/<teacher_code>/<period>/<worksheet_type>/<topic>/<round>/<SID>.pdf.
+    `entry.teacher_code` and `entry.period_display` are the SID's own digits
     (positions 0:6 and 6:8), not anything read off the packet, so those two
     segments are stable and derivable from the SID alone. `worksheet_type`
     is *not* derivable from the SID -- a student has one SID but multiple
@@ -222,8 +233,25 @@ def output_path(out_dir: str | Path, entry: RosterEntry, worksheet_type: str, to
     let an MPR and a PRT packet for the same student collide on one path.
     `topic` (see topic_from_filename) defaults to NO_TOPIC so every caller
     that hasn't been updated for per-topic worksheets keeps computing the
-    exact same path as before this segment existed."""
-    return Path(out_dir) / entry.teacher_code / entry.period_display / worksheet_type / topic / f"{entry.sid}.pdf"
+    exact same path as before that segment existed.
+
+    `round_label` (see blocks.group_into_rounds/round_labels_by_tag) is the
+    same story one segment deeper: a student can legitimately complete the
+    *same* worksheet+topic more than once, in different collection sessions
+    (the real motivating file, 010406_PD1_PRT.pdf, is three concatenated
+    PRT administrations of the same class), and without a round segment
+    those sessions collide on one path the same way an MPR/PRT collision
+    used to. Defaults to NO_ROUND so a caller that genuinely has no round
+    information at all still gets a stable, constant-depth path."""
+    return (
+        Path(out_dir)
+        / entry.teacher_code
+        / entry.period_display
+        / worksheet_type
+        / topic
+        / round_label
+        / f"{entry.sid}.pdf"
+    )
 
 
 def ledger_path(out_dir: str | Path, pdf_path: str | Path) -> Path:
@@ -255,22 +283,30 @@ def _save_ledger(out_dir: str | Path, pdf_path: str | Path, ledger: dict[str, di
 
 
 def _claim_output_path(
-    ledger: dict[str, dict], tag: str, out_dir: str | Path, entry: RosterEntry, worksheet_type: str, topic: str
+    ledger: dict[str, dict],
+    tag: str,
+    out_dir: str | Path,
+    entry: RosterEntry,
+    worksheet_type: str,
+    topic: str,
+    round_label: str,
 ) -> tuple[Path, str | None]:
     """The natural output path for this packet, unless that exact path
     already exists on disk *and* this run's own ledger attributes it to a
     different packet_tag -- in which case a numbered-suffix alternative
     (`<SID>_2.pdf`, `_3.pdf`, ...) is returned instead, so one packet's
     output can never silently replace another's. This is a backstop for the
-    case the topic path segment (see output_path) doesn't fully disambiguate
-    on its own: two distinct packets in the *same* scan file, decided to the
-    same student and worksheet type (a teacher whose students genuinely
-    complete the same worksheet+topic more than once). Re-running the same
-    tag against its own previously-claimed path is not a collision -- the
-    ledger lookup excludes `tag` itself, so a packet re-processed after a
-    decision change keeps overwriting its own prior file exactly as before.
+    case the topic and round path segments (see output_path) don't fully
+    disambiguate on their own: two distinct packets in the *same* scan
+    file, decided to the same student, worksheet type, *and* round (e.g.
+    two packets whose own dates both landed in the same round group by
+    honest majority vote, but are nonetheless different physical packets).
+    Re-running the same tag against its own previously-claimed path is not
+    a collision -- the ledger lookup excludes `tag` itself, so a packet
+    re-processed after a decision change keeps overwriting its own prior
+    file exactly as before.
     """
-    base_path = output_path(out_dir, entry, worksheet_type, topic)
+    base_path = output_path(out_dir, entry, worksheet_type, topic, round_label)
     owner_tag = next((t for t, e in ledger.items() if t != tag and e.get("path") == str(base_path)), None)
     if owner_tag is None or not base_path.exists():
         return base_path, None
@@ -371,6 +407,7 @@ def release_from_manual_queue(
     out_dir: str | Path = OUT_DIR,
     dpi: int = RENDER_DPI_FINAL,
     flatten: bool = False,
+    round_label: str | None = None,
 ) -> ManualReleaseResult:
     """The human side of the manual-redaction queue: re-redacts `packet`
     using a human-supplied, corrected `band_override` instead of whatever
@@ -390,13 +427,26 @@ def release_from_manual_queue(
     ordinary write in `run_dispositions` -- a manually-released packet is
     just as capable of colliding with another packet's already-claimed
     output path as an automatic one.
+
+    `round_label` (see blocks.group_into_rounds) is normally left to be
+    computed here -- this function re-segments and re-reads dates for the
+    whole file to get it, since a lone queued packet has no group context
+    of its own to derive a round from. This is a comparatively rare,
+    human-driven action (clicking "Release to out/" in the manual queue
+    panel), not something in a hot per-packet loop, so paying for a fresh
+    `collect_packet_rounds` call here -- OCR-cached, so a warm re-run is
+    cheap regardless -- is the simpler choice over threading the whole
+    file's round groups through the manual-queue call chain. A caller that
+    already has it (none currently do) can still pass it directly.
     """
     if sid not in roster:
         return ManualReleaseResult(packet_tag=tag, sid=sid, released=False, reason=f"sid {sid!r} not on roster")
     entry = roster.by_sid[sid]
     topic = topic_from_filename(pdf_path)
+    if round_label is None:
+        round_label = round_labels_by_tag(collect_packet_rounds(pdf_path)).get(tag, UNDATED_ROUND)
     ledger = _load_ledger(out_dir, pdf_path)
-    out_path, collision_note = _claim_output_path(ledger, tag, out_dir, entry, packet.worksheet_type, topic)
+    out_path, collision_note = _claim_output_path(ledger, tag, out_dir, entry, packet.worksheet_type, topic, round_label)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     stamp_lines = [f"SID: {entry.sid}", f"PD: {entry.period_display}"]
     redact_result = _redact_packet(
@@ -567,6 +617,7 @@ def run_dispositions(
     dpi: int = RENDER_DPI_FINAL,
     flatten: bool = False,
     detection_overrides: set[str] = frozenset(),
+    round_labels: dict[str, str] | None = None,
 ) -> list[DispositionResult]:
     """Apply final per-packet decisions. See module docstring for the
     three-state `decisions` contract -- this is where "confirmed
@@ -596,6 +647,19 @@ def run_dispositions(
     (see the module docstring's "One of these five holds is human-
     overridable" section) -- it does not, and must not, affect whether the
     unrelated uncovered-group-words or verify_no_leaked_names holds fire.
+
+    `round_labels` (packet_tag -> "YYYY-MM"|"undated", see blocks.
+    group_into_rounds/round_labels_by_tag) is the round path segment for
+    each packet (see output_path) -- a student can legitimately complete
+    the same worksheet+topic more than once, in different collection
+    sessions, and the round segment is what keeps those sessions from
+    colliding in out/. Left as None (the default), it's computed here from
+    `segmented` -- already paid for by the caller, so no re-segmentation --
+    via a fresh date-OCR pass; a caller that's already computed it for its
+    own report (cli.py, review_app.py, both of which print the round
+    report before ever calling this) should pass it through directly
+    rather than paying for that pass twice. Round labelling never touches
+    matching, scoring, or claiming -- it is output-path metadata only.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -603,6 +667,8 @@ def run_dispositions(
     ledger_dirty = False
     results: list[DispositionResult] = []
     topic = topic_from_filename(pdf_path)
+    if round_labels is None:
+        round_labels = round_labels_by_tag(collect_packet_rounds(pdf_path, segmented=segmented))
 
     def _delete_stale_output(stale_path: Path, stale_sid: str) -> None:
         # Deliberately doesn't touch `ledger` -- callers own that, since
@@ -677,7 +743,10 @@ def run_dispositions(
             continue
 
         entry = roster.by_sid[sid]
-        out_path, collision_note = _claim_output_path(ledger, tag, out_dir, entry, packet.worksheet_type, topic)
+        round_label = round_labels.get(tag, UNDATED_ROUND)
+        out_path, collision_note = _claim_output_path(
+            ledger, tag, out_dir, entry, packet.worksheet_type, topic, round_label
+        )
         out_path.parent.mkdir(parents=True, exist_ok=True)
         stamp_lines = [f"SID: {entry.sid}", f"PD: {entry.period_display}"]
         redact_result = _redact_packet(pdf_path, packet, out_path, dpi=dpi, flatten=flatten, stamp_lines=stamp_lines)

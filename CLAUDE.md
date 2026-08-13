@@ -177,6 +177,37 @@ below) and a "Confirm & Next" button in `review_app.py` next to "Confirm
 decision", so confirming a packet and advancing to the next one is one
 click instead of two.
 
+**Round path segment added 2026-08-13** — see "A round segment: the same
+worksheet completed more than once, dated" below for the full design.
+Output is now `out/<teacher>/<period>/<worksheet_type>/<topic>/<round>/
+<SID>.pdf`, one level deeper than the topic segment above. Verified
+against the real `data/PRT/010406_PD1_PRT.pdf` (read-only diagnostic:
+correctly recovered all 3 real administrations — March 2026/20 packets,
+February 2026/19 packets, October 2025/7 packets — 0 disagreeing) and
+against real teacher 020415 output (`Hannel MPR PD2.pdf`/`Hannel PRT
+PD2.pdf`, regenerated at the new depth): the real PRT file wrote 5
+packets cleanly and verified clean; the real MPR file's 11 packets and
+the PRT file's other 6 all held back on the already-documented,
+already-accepted bug #7 uncovered-ink trade-off (see "Seven
+regression-tested bugs" #7) — confirmed this session to be firing far
+more broadly on real data than the two packets it was previously measured
+against, still not a round-segment regression, still not fixed this
+session (needs either manual-queue review time or a follow-up
+recalibration, out of scope for a path-layout change). Regenerating also
+surfaced and fixed one unrelated pre-existing bug: both real ledgers
+(`out/.ledger/Hannel MPR PD2.json`, `.../Hannel PRT PD2.json`) were still
+in the bare-SID-string schema from before an earlier session's ledger
+migration, which crashed `run_dispositions` outright — reconstructed from
+`decisions/*.json` paired against what was actually sitting in `out/`,
+into the current `{"sid", "path"}` schema. **What's actually still
+open, unchanged from before this session:** SID 0204150204 still needs a
+human to review and release its detection-confidence hold; the 19
+unreviewed PRT packets (020415) still need a human review pass; and now
+also, the bug #7 uncovered-ink trade-off firing broadly on real MPR/PRT
+data means most of 020415's real output needs either manual-queue review
+or a recalibration before it can ship at all — not something this
+session's round-segment work was scoped to fix.
+
 ## Consent rule
 
 The roster **is** the consent list. A student not on the roster is not
@@ -1563,6 +1594,260 @@ accept (e.g. "3 3112026", "3021", "3130126" all fail the strict
 concrete demonstration of why this stays informational-only rather than
 becoming a second, weaker gate: a signal this noisy has no business
 blocking a run.
+
+## A round segment: the same worksheet completed more than once, dated
+
+**Added 2026-08-13, motivated by the same real file the topic segment
+above was built for: `data/PRT/010406_PD1_PRT.pdf` turned out to be three
+concatenated PRT administrations of the same ~14 students, not one.** The
+topic segment (see above) disambiguates *sessions with different topic
+codes in the filename* — it does nothing for this file, since
+`010406_PD1_PRT.pdf` carries no topic segment at all, so every one of a
+given student's three packets computed the exact same `topic_from_filename`
+result (`NA`) and therefore the exact same output path before this
+feature, saved only by the no-silent-overwrite numbered-suffix backstop
+(`_1.pdf`, `_2.pdf`, `_3.pdf` — safe, but gives a downstream consumer no
+way to tell which physical file is which round). What actually
+distinguishes the three sessions is each packet's own handwritten Date
+field — already OCR'd by `segment.extract_header_fields` for every packet
+(`date_text`), with no new OCR bbox required.
+
+**New path segment, one level deeper, constant depth for every teacher:
+`out/<teacher>/<period>/<worksheet_type>/<topic>/<round>/<SID>.pdf`.**
+`round` is a `"YYYY-MM"` label (`blocks.round_label`, e.g. `"2026-03"`) or
+the literal `"undated"` (`blocks.UNDATED_ROUND`) when a packet's own date
+can't be confidently parsed — never an omitted segment, same reasoning as
+`NO_TOPIC` above: omitting it would make path depth vary by how legible a
+class's handwriting happened to be. `pipeline.output_path` gained a fifth
+parameter, `round_label`, defaulting to `NO_ROUND` (`= blocks.
+UNDATED_ROUND`) so a caller that doesn't care about rounds still gets a
+stable, constant-depth path. The no-silent-overwrite suffix backstop
+(`_claim_output_path`) still sits underneath this unchanged — it's now the
+last line of defense rather than the primary mechanism, exactly the way
+the topic segment described it would end up: even two packets that
+legitimately land in the *same* round group (see below) but are genuinely
+different physical packets still can't silently clobber each other.
+
+**`blocks.parse_year_month` is a new sibling to `parse_month`, not a
+replacement — it returns the full `(year, month)`, not just the month.**
+Block resolution only ever needs to disambiguate two same-numbered months
+*within one roster's own block metadata* (e.g. "is this February or
+March"), so `parse_month` dropping the year was fine there. A round label
+has to distinguish sessions that can span different *years* — the real
+010406 PRT file alone spans October 2025, February 2026, and March
+2026 — so round labelling needed the year too. Same conservative posture
+as `parse_month`: returns `None`, never a best-effort guess, on anything
+out of range, partially matched, or (for a written month name) with no
+recognizable 4-digit year nearby.
+
+**Round grouping is contiguous-run majority, the same file-level-not-
+per-packet lesson date-driven block resolution already learned the hard
+way (see that section above) — just applied one level more granular.**
+`blocks.group_into_rounds(packets, dates)` walks a file's packets in
+physical page order and looks for *boundaries*: a point where the parsed
+year-month changes and the change actually sticks, rather than a single
+packet's own date being trusted on its own. Every packet inside a
+confirmed contiguous run gets that run's own **majority** label
+(`RoundGroup.label`) — not its own individually-parsed value — with the
+count of packets whose own parse actually disagreed with the group's
+majority tracked separately (`RoundGroup.n_disagreeing`), for a human to
+see, never for the pipeline to act on.
+
+**Why grouping beats trusting each packet's own date, concretely:** a
+single misread digit in one student's handwritten date (the same class of
+noise `disagreeing_packets` already exists to tolerate for block
+resolution) would, under a naive per-packet scheme, silently route that
+one packet's *output file* into a different round directory than every
+other packet from the same physical scanning session — invisible to a
+reviewer, since nothing about the packet's name or content looks wrong,
+only its date. Confirmed directly against the real file (see the
+diagnostic below): only 5 of 010406 PRT's 46 packets have a date OCR'd
+cleanly enough for `parse_year_month` to accept at all — most raw text is
+things like `"3 3112026"`, `"3021"`, `"2120 26"` (no `/` or `-` separator,
+so the strict numeric pattern correctly refuses rather than guesses). A
+per-packet scheme fed this input would have most packets landing in
+whatever bucket "unparseable" defaults to, with no structure at all. The
+grouping scheme instead only needs a *few* successfully-parsed dates near
+each true boundary to correctly place all 46 packets — proven on the real
+file: the diagnostic run (step below) correctly recovered all three real
+administrations, 0 disagreeing, despite the 41 unparseable dates riding
+along inside whichever run they physically sat in.
+
+**Boundary confirmation rule, and the one real correction made while
+building it:** a boundary at packet *i* (whose own parsed label differs
+from the run's current label) is only accepted when the *next* dated
+packet's own parse does **not** revert back to the run's old label — not,
+as first implemented, only when the next dated packet's parse exactly
+repeats packet *i*'s new label. The first version failed a straightforward
+case that turned out to matter immediately: a file with exactly one
+packet per round (no repeated value to confirm against) had every single
+transition treated as an unconfirmed blip and absorbed into the first
+round, collapsing three real rounds into one — caught by
+`test_three_contiguous_groups_produce_three_round_labels_and_distinct_paths`
+(`tests/test_pipeline.py`) before this ever reached real data. The fixed
+rule — reject only a change that snaps straight back to the *old* value —
+correctly treats "the next value differs *again*, to a third label" or
+"there's no more dated data at all" as confirmation, while still catching
+the actual failure mode (a lone misread flanked by the same label on both
+sides). Both directions are regression-tested:
+`test_single_misread_date_inside_a_run_inherits_the_runs_label`
+(`tests/test_blocks.py`, the misread-absorption case) and the
+three-contiguous-groups test above (the single-packet-per-round case).
+
+**Non-adjacent groups sharing a label are reported, never silently
+merged.** `group_into_rounds` never merges two groups just because they
+end up with the same majority label — each confirmed boundary always
+starts a fresh `RoundGroup`. `blocks.duplicate_round_labels(groups)`
+flags any label that appears in more than one group (necessarily
+non-adjacent, since adjacent same-label runs would never have been split
+in the first place) — a signal the file may not be simply "N sessions
+concatenated back to back" the way the round segment otherwise assumes
+(e.g. an interleaved scan, or a page reinserted out of order), worth a
+human's attention rather than a silent merge. Surfaced in
+`blocks.format_round_report`'s own output whenever it fires. Test:
+`test_nonadjacent_groups_sharing_a_label_are_reported_not_silently_merged`.
+
+**A group with no parseable dates at all still ships, labelled
+`"undated"`.** An unreadable date is not a reason to withhold otherwise-
+approved output — see `test_undated_group_still_writes_under_the_
+undated_round_segment` — it's only a reason the round segment in that
+packet's path can't be more specific than the literal.
+
+**Reporting happens before anything is written, on both surfaces.**
+`cli.py run` calls `blocks.collect_packet_rounds` immediately after
+segmenting (reusing that same `SegmentResult`, not re-segmenting) and
+prints `blocks.format_round_report` — group label, packet count, page
+range, disagreeing count, and the non-adjacent-duplicate-label note if any
+— before the block-resolution report, before loading the roster, before
+touching `out_dir`. The computed `packet_tag -> round_label` mapping
+(`blocks.round_labels_by_tag`) is then threaded straight into
+`run_dispositions(..., round_labels=...)` so the report and the actual
+write use the *identical* computed rounds, not two independent OCR passes
+that could in principle disagree. `review_app.py` shows the identical
+report text (`format_round_report`) in a "Round grouping" header, always,
+for every teacher — unlike the `_blocks.json`-gated block-resolution
+banner, this is purely informational and never a confirmation gate: round
+disagreement is never held or blocked (see the next paragraph), so
+there's nothing here that needs a human's explicit sign-off before
+packets are shown.
+
+**A packet's own date disagreeing with its group is flagged, never held
+or blocked — the same posture block resolution already takes toward a
+single packet's date, deliberately extended here.** `review_app.py` shows
+each packet's assigned round label directly in the existing OCR'd-fields
+table (a new "Round (assigned)" row, right under "Date", so a reviewer
+approving a name can see which administration they're actually approving
+it into) and, when `blocks.round_disagreeing_tags` flags this specific
+packet, an `st.warning` naming the packet's own raw date next to the
+group's label — informational only. `run_dispositions` never reads this
+signal at all; a disagreeing packet is written to its *group's* path
+exactly the same as any other packet in that group. Students get their
+own written date wrong, and OCR misreads a correctly-written one, often
+enough (the same lesson `LEAK_FUZZY_MIN_TOKEN_LEN`'s false-positive story
+and block resolution's own `disagreeing_packets` already taught) that a
+single packet's date is a flag for a human to notice, never a signal the
+pipeline should act on.
+
+**Round labelling has zero influence on matching, scoring, or claiming —
+verified, not just asserted.** `match.propose`/`match.assign_all` take a
+packet's `name_text` and the roster; neither was touched by this feature,
+and neither ever sees a packet's date or round label. Regression test:
+`test_round_label_does_not_alter_match_proposals` (`tests/test_
+pipeline.py`) builds two packets identical in every field except
+`date_text` and asserts `propose_all` returns byte-identical candidate
+lists (roster and held-name) for both — round is output-path metadata
+only, added after matching has already run, never an input to it.
+
+**`release_from_manual_queue` computes its own round rather than
+threading it through the call chain,** since a single queued packet (see
+"The manual-redaction queue is a backstop" below) has no group context of
+its own to derive a round from — releasing one packet re-reads that
+packet's own date via a fresh `collect_packet_rounds(pdf_path)` call. This
+is a comparatively rare, human-driven action (clicking "Release to out/"),
+not a per-packet hot path, and OCR is disk-cached regardless (see "OCR is
+disk-cached" above), so the extra pass costs nothing on a warm cache.
+
+**Real diagnostic, read-only (no matching, no redaction, no writes, no
+deletes) against the real `data/PRT/010406_PD1_PRT.pdf` (92 pages, 46
+packets):** the grouping correctly recovered all three real
+administrations in physical page order —
+
+```
+Round grouping report:
+  2026-03: 20 packet(s), pages 1-40, 0 disagreeing
+  2026-02: 19 packet(s), pages 41-78, 0 disagreeing
+  2025-10: 7 packet(s), pages 79-92, 0 disagreeing
+```
+
+— with 0 disagreeing in every group despite the heavy OCR noise
+documented above (only 5/46 packets parsed at all): the few dates that
+*did* parse cleanly (e.g. `"3-30-26"` at page 25, `"2-20-26"` at page 41,
+`"10-24-25"` at page 79 — all hyphen-separated, which is exactly why they
+cleared the strict numeric pattern when space- or no-separator variants
+like `"3 30 26"`/`"3130126"` didn't) landed close enough to each real
+boundary to confirm it, and the 41 unparseable dates rode along inside
+whichever run they were physically part of without needing to parse at
+all. This matches the "same ~14 students, three sessions" shape the
+original 92-page/46-packet diagnostic (see "Teacher 010406 roster
+reissue" above) already inferred from repeated OCR'd names across three
+date clusters — the round-grouping feature turns that same shape into an
+actual, load-bearing output-path decision instead of just an observation.
+
+**Regenerating real teacher 020415 output at the new path depth surfaced
+one unrelated, pre-existing bug, now fixed, and reconfirmed one already-
+documented, still-open limitation — neither is a round-segment
+regression.** Running `cli.py run` against the real `data/MPR/Hannel MPR
+PD2.pdf` and `data/PRT/Hannel PRT PD2.pdf` (to satisfy exactly this
+session's own requirement — "make sure that path still works" — against
+real, not synthetic, data) crashed immediately with `TypeError: string
+indices must be integers, not 'str'` in `run_dispositions`'s `prior_sid =
+prior_entry["sid"]` line: `out/.ledger/Hannel MPR PD2.json` and `out/
+.ledger/Hannel PRT PD2.json` were still in the *bare-SID-string* ledger
+schema from before the topic-segment session's own ledger migration (see
+"The ledger itself changed shape" under "Teacher 010406 roster reissue"
+above) — that session added the `{"sid": ..., "path": ...}` shape and the
+code to read it, but never actually re-ran `cli.py run` against these two
+real files to migrate the ledgers sitting on disk. Not a round-segment bug
+(reproduces identically on a `git stash` of this session's own changes),
+but it blocked this session's own verification step, so it's fixed here:
+both ledgers were reconstructed from `decisions/*.json` (still fully
+trustworthy — decisions were never touched) paired against the real files
+already sitting in `out/` at their pre-round paths, into the current
+`{"sid", "path"}` schema.
+
+With the ledgers fixed, the real PRT file wrote 5 packets cleanly to the
+new depth (`out/020415/02/PRT/NA/2025-10/<SID>.pdf`, one round, "October
+2025") and held back 6 with `uncovered group-row ink` naming fragments of
+the printed title "Plausibility is..." — and the real MPR file held back
+all 11 with the *same* check naming fragments of the printed "1. Please
+work on this individually: Is extreme weather relevant..." instruction
+text. Both are the already-documented, already-accepted bug #7 trade-off
+(see "Two rectangles are redacted per header page"'s "Correction,
+2026-07-21" and "Seven regression-tested bugs" #7 above): widening
+`find_uncovered_group_words`'s window to `HEADER_SEARCH_MAX_TOP` to catch
+real vertical Group-row overflow also means printed body text close below
+the header re-triggers the same check. CLAUDE.md already named
+0204150202/0204150203 as accepted false positives on regeneration; this
+session's real run shows the same trade-off firing on effectively *every*
+packet in both real files, not just those two — a wider real-world cost
+than previously measured, still the accepted trade-off (a silently
+shipped leak is worse than a held-back false positive cleared through the
+manual-redaction queue), but worth recording plainly rather than
+undersold. **Not a task for this session to fix** — clearing it needs
+either a human manually releasing each packet through the manual-
+redaction queue (real review time, one packet at a time) or a follow-up
+recalibration of the coverage-window trade-off itself, out of scope for a
+path-layout change. The 5 successfully-written PRT files were verified
+clean (`cli.py verify`, 20 files checked across the whole real `out/`
+tree including the untouched 11 MPR files at their old, pre-round path,
+`0` failed) and the 5 stale duplicate files left behind at the old,
+pre-round PRT path were removed (confirmed with a human first, since
+deleting real output files is exactly the kind of action this project's
+own working agreement requires checking before doing) once the new-depth
+copies were confirmed written and verified. The 11 MPR files were left
+untouched at their old path, since nothing safely regenerated them this
+session — deleting a still-current, still-valid file just because its
+path shape predates a later feature would be actively wrong.
 
 ## Working preferences
 

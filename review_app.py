@@ -28,13 +28,18 @@ from PIL import Image
 from melredact.blocks import (
     BlockMeaning,
     BlockResolution,
+    RoundGroup,
     collect_packet_dates,
     decisions_scope_mismatches,
     disagreeing_packets,
     format_resolution_report,
+    format_round_report,
+    group_into_rounds,
     load_block_metadata,
     normalize_block,
     resolve_block,
+    round_disagreeing_tags,
+    round_labels_by_tag,
     save_resolved_block_record,
 )
 from melredact.config import CACHE_DIR, HEADER_BAND_FALLBACK, MIN_MARGIN, MIN_SCORE, RENDER_DPI_PREVIEW
@@ -112,6 +117,21 @@ def _block_resolution(pdf_path: str, class_period: int, roster_path: str) -> Blo
     metadata = load_block_metadata(roster_path)
     dates = collect_packet_dates(pdf_path)
     return resolve_block(dates, class_period, metadata)
+
+
+@st.cache_data(show_spinner="Reading packet dates for round grouping...")
+def _round_data(pdf_path: str) -> tuple[list, list[RoundGroup]]:
+    """(dates, groups) -- computed together and cached once per pdf_path
+    (same OCR-cached date-extraction pass as block resolution's own
+    _block_resolution, just grouped into contiguous rounds instead of
+    reduced to one file-level majority) so every rerun of this Streamlit
+    script (a button click, Prev/Next) doesn't repeat it. See blocks.
+    group_into_rounds for the grouping rule; round labelling never
+    influences matching, so this is entirely independent of _proposals."""
+    segmented = _segment(pdf_path)
+    dates = collect_packet_dates(pdf_path, segmented=segmented)
+    groups = group_into_rounds(segmented.packets, dates)
+    return dates, groups
 
 
 @st.cache_data(show_spinner="Loading roster...")
@@ -202,7 +222,11 @@ def _set_detection_override(pdf_path: str, decisions_dir: str, tag: str, approve
 
 
 def _render_sidebar(
-    args: argparse.Namespace, segmented: SegmentResult, roster: Roster, resolved_block: BlockMeaning | None = None
+    args: argparse.Namespace,
+    segmented: SegmentResult,
+    roster: Roster,
+    resolved_block: BlockMeaning | None = None,
+    round_labels: dict[str, str] | None = None,
 ) -> None:
     decisions = st.session_state.decisions
     n_pending = sum(1 for p in segmented.packets if packet_tag(args.pdf_path, p) not in decisions)
@@ -230,6 +254,7 @@ def _render_sidebar(
                 roster,
                 out_dir=Path(args.out_dir),
                 detection_overrides=fresh_overrides,
+                round_labels=round_labels,
             )
             written = [r for r in results if r.out_path is not None]
             deleted = sum(1 for r in results if r.deleted_path is not None)
@@ -276,13 +301,18 @@ def _render_sidebar(
     st.sidebar.checkbox("Show manual redaction queue", key="show_manual_queue", disabled=not queue_entries)
 
 
-def _render_field_table(fields) -> None:
-    st.table(
-        {
-            "Field": ["Name (used for matching)", "Teacher", "Group members (context only)", "Date", "Period"],
-            "OCR'd text": [fields.name_text, fields.teacher_text, fields.group_text, fields.date_text, fields.period_text],
-        }
-    )
+def _render_field_table(fields, round_label_text: str | None = None) -> None:
+    fields_col = ["Name (used for matching)", "Teacher", "Group members (context only)", "Date", "Period"]
+    values_col = [fields.name_text, fields.teacher_text, fields.group_text, fields.date_text, fields.period_text]
+    if round_label_text is not None:
+        # Shown directly below Date, side by side with the raw OCR'd text
+        # that produced it -- so a reviewer approving a name can see which
+        # collection round (not just which raw date) they're approving it
+        # into. This is the *group's* label (see blocks.group_into_rounds),
+        # not necessarily what this one packet's own date parses to.
+        fields_col.append("Round (assigned)")
+        values_col.append(round_label_text)
+    st.table({"Field": fields_col, "OCR'd text": values_col})
 
 
 def _render_candidates(proposal, top5, roster: Roster, auto_assignments: dict[str, str | None], tag: str):
@@ -385,6 +415,8 @@ def _render_packet(
     tags: list[str],
     resolved_block: BlockMeaning | None = None,
     disagreeing_tags: frozenset[str] = frozenset(),
+    round_labels: dict[str, str] | None = None,
+    output_round_disagreeing: frozenset[str] = frozenset(),
 ) -> None:
     if resolved_block is not None:
         st.caption(f"Approving into: {resolved_block.describe()}")
@@ -457,13 +489,21 @@ def _render_packet(
             preview_caption += " -- no packet would be written for 'Not on roster'"
         col2.image(preview_image, caption=preview_caption)
 
-        _render_field_table(fields)
+        _render_field_table(fields, round_labels.get(tag) if round_labels else None)
         if tag in disagreeing_tags:
             st.warning(
                 f"This packet's own date ({fields.date_text!r}) disagrees with the file's resolved "
                 "collection round -- shown for awareness, not held or blocked (see the block "
                 "resolution banner above; students get their own written date wrong often enough "
                 "that a single packet's date is a flag, not a signal to act on)."
+            )
+        if tag in output_round_disagreeing:
+            st.warning(
+                f"This packet's own date ({fields.date_text!r}) disagrees with its **output round** "
+                f"group's assigned label ({round_labels.get(tag) if round_labels else '?'}) -- shown for "
+                "awareness only, never held or blocked (see the round grouping report above; a single "
+                "packet's own date is a flag, not a signal to act on -- the group's majority label is "
+                "what actually decides this packet's output path)."
             )
         _render_candidates(proposal, top5, roster, auto_assignments, tag)
 
@@ -626,6 +666,18 @@ def main() -> None:
 
     segmented = _segment(args.pdf_path)
 
+    # Round grouping (see blocks.group_into_rounds) applies to every
+    # teacher, unlike the _blocks.json-gated block-resolution feature
+    # below -- shown as a plain informational banner, never a gate:
+    # CLAUDE.md's round-segment design deliberately never holds or blocks a
+    # packet on its own date disagreeing with its group (see the per-packet
+    # warning in _render_packet), so there's nothing here to confirm.
+    round_dates, round_groups = _round_data(args.pdf_path)
+    round_labels = round_labels_by_tag(round_groups)
+    output_round_disagreeing = round_disagreeing_tags(round_groups, round_dates)
+    st.header("Round grouping")
+    st.code(format_round_report(round_groups), language=None)
+
     resolved_block: BlockMeaning | None = None
     disagreeing_tags: frozenset[str] = frozenset()
     period_for_roster = args.period
@@ -646,7 +698,7 @@ def main() -> None:
     proposals_by_tag = {p.packet_tag: p for p in proposals}
 
     _init_state(args.pdf_path, args.decisions_dir)
-    _render_sidebar(args, segmented, roster, resolved_block)
+    _render_sidebar(args, segmented, roster, resolved_block, round_labels)
 
     tags = [packet_tag(args.pdf_path, p) for p in segmented.packets]
     packet_by_tag = dict(zip(tags, segmented.packets))
@@ -680,7 +732,19 @@ def main() -> None:
     packet = packet_by_tag[tag]
     status = _status_icon(tag, packet, st.session_state.decisions, proposals_by_tag.get(tag))
     st.subheader(f"{status} Packet {tag} ({packet.n_pages} page{'s' if packet.n_pages != 1 else ''})")
-    _render_packet(args, packet, tag, roster, proposals_by_tag[tag], auto_assignments, tags, resolved_block, disagreeing_tags)
+    _render_packet(
+        args,
+        packet,
+        tag,
+        roster,
+        proposals_by_tag[tag],
+        auto_assignments,
+        tags,
+        resolved_block,
+        disagreeing_tags,
+        round_labels,
+        output_round_disagreeing,
+    )
 
 
 if __name__ == "__main__":

@@ -65,7 +65,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from melredact.pdfio import open_pdf
-from melredact.segment import extract_header_fields, segment_pdf
+from melredact.segment import Packet, SegmentResult, extract_header_fields, segment_pdf
 
 # Require at least this many packets with a parseable date before resolving
 # anything -- a file-level majority computed from one or two dates carries
@@ -189,7 +189,7 @@ class PacketDate:
     month: int | None
 
 
-def collect_packet_dates(pdf_path: str | Path) -> list[PacketDate]:
+def collect_packet_dates(pdf_path: str | Path, segmented: SegmentResult | None = None) -> list[PacketDate]:
     """One (packet_tag, raw OCR'd date text, parsed month) per packet in the
     file -- the file-level resolution rule's raw material. Deliberately
     takes no roster: segmentation and header-field extraction (segment.py)
@@ -200,10 +200,17 @@ def collect_packet_dates(pdf_path: str | Path) -> list[PacketDate]:
     segment.py) has no Date field to read; it's still included, with an
     empty raw text and month=None, so it's counted in the file's total
     packet count without ever voting on the majority month.
+
+    `segmented` lets a caller that already has a `SegmentResult` (run_
+    dispositions, the round-grouping report below) skip a redundant re-
+    segmentation of the same file -- segmentation itself is cheap, but
+    callers that already paid for it shouldn't pay again. Defaults to
+    segmenting fresh, same as before this parameter existed.
     """
     from melredact.pipeline import packet_tag as _packet_tag
 
-    segmented = segment_pdf(pdf_path)
+    if segmented is None:
+        segmented = segment_pdf(pdf_path)
     dates: list[PacketDate] = []
     with open_pdf(pdf_path) as pdf:
         for packet in segmented.packets:
@@ -214,6 +221,256 @@ def collect_packet_dates(pdf_path: str | Path) -> list[PacketDate]:
             fields = extract_header_fields(pdf.pages[packet.header_page_index])
             dates.append(PacketDate(packet_tag=tag, raw_date_text=fields.date_text, month=parse_month(fields.date_text)))
     return dates
+
+
+def parse_year_month(date_text: str | None) -> tuple[int, int] | None:
+    """Full (year, month) from a packet's OCR'd date, for round labelling
+    (round_label below). parse_month alone is enough for block resolution,
+    which only ever has to disambiguate two same-numbered months within one
+    file's own block metadata -- but a round label has to distinguish
+    collection sessions that can span different *years* (the real 010406
+    PRT file spans October 2025, February 2026, and March 2026), so it
+    needs the full year too. Same conservative posture as parse_month:
+    returns None -- never a best-effort guess -- on anything out of range,
+    partially matched, or with no recognizable 4-digit year nearby.
+    """
+    if not date_text:
+        return None
+    text = date_text.strip()
+    if not text:
+        return None
+
+    m = _NUMERIC_DATE.match(text)
+    if m:
+        month, day, year = (int(g) for g in m.groups())
+        if not (1 <= month <= 12 and 1 <= day <= 31):
+            return None
+        if year < 100:
+            year += 2000
+        return year, month
+
+    lowered = text.lower()
+    year_match = re.search(r"\b(19|20)\d{2}\b", text)
+    if year_match is None:
+        return None
+    year = int(year_match.group(0))
+    for name, num in _MONTH_NAMES.items():
+        if name and re.search(rf"\b{re.escape(name)}\b", lowered):
+            return year, num
+    for abbr, num in _MONTH_ABBR.items():
+        if abbr and re.search(rf"\b{re.escape(abbr)}\b", lowered):
+            return year, num
+    return None
+
+
+def round_label(date_text: str | None) -> str:
+    """The raw, per-packet "YYYY-MM" round label from one packet's own
+    OCR'd date text, or the literal "undated" when it can't be confidently
+    parsed (parse_year_month returns None far more readily than it
+    guesses -- see its own docstring). This is deliberately per-packet, not
+    the label a packet should actually be shipped under: a single misread
+    date inside an otherwise-uniform run must inherit the *run's* label,
+    not its own (see group_into_rounds below) -- callers building an
+    output path must always go through group_into_rounds/round_labels_by_
+    tag, never this function alone, except when computing the raw per-
+    packet vote group_into_rounds itself needs.
+    """
+    parsed = parse_year_month(date_text)
+    if parsed is None:
+        return "undated"
+    year, month = parsed
+    return f"{year:04d}-{month:02d}"
+
+
+UNDATED_ROUND = "undated"
+
+
+@dataclass(frozen=True)
+class RoundGroup:
+    label: str
+    packet_tags: list[str]
+    first_page: int  # 1-indexed physical page number, for the report
+    last_page: int
+    n_disagreeing: int  # packets in this group whose own parsed date != label
+
+    @property
+    def n_packets(self) -> int:
+        return len(self.packet_tags)
+
+
+def group_into_rounds(packets: list[Packet], dates: list[PacketDate]) -> list[RoundGroup]:
+    """Group packets into contiguous "rounds" (collection sessions) by their
+    own OCR'd Date field, in physical page order -- the raw material for the
+    round path segment (see CLAUDE.md's "A round segment" section for the
+    full real-file motivation: one file, `010406_PD1_PRT.pdf`, turned out to
+    be three concatenated PRT administrations of the same ~14 students,
+    dated October 2025 / February 2026 / March 2026, with nothing in the
+    filename to tell them apart).
+
+    `packets` and `dates` must be the same length and in the same order --
+    both come from iterating the same `SegmentResult.packets` list (see
+    collect_packet_rounds below, the normal entry point), so index i in one
+    always describes the same physical packet as index i in the other.
+
+    **Grouping trusts a contiguous run, never a single packet's own date.**
+    A boundary between two rounds is only recognized when the new month
+    actually *sticks* -- confirmed by whatever the *next* dated packet
+    parses to not reverting back to the current run's own label. A single
+    misread date (real handwriting OCR noise, the same class of error
+    `blocks.disagreeing_packets` already exists to tolerate for block
+    resolution) looks like a brief detour that immediately snaps back to
+    where it was -- exactly what "reverts back" catches -- and is absorbed
+    into whichever run it physically sits inside, counted in that run's
+    `n_disagreeing` instead of splitting the run into two. A change that
+    doesn't revert (including one where the next value is a *third*,
+    different label, or where there's no further dated packet to check
+    against at all) is trusted as a real boundary -- this is what lets a
+    file with only one packet per session, not just a file with several
+    packets per session, still produce one round group per session, while
+    still refusing to be fooled by a single-packet blip inside a longer
+    run. This mirrors the same lesson date-driven block resolution already
+    learned the hard way (see this module's own docstring on why
+    resolution is file-level, not per-packet): a signal this noisy has no
+    business making a structural decision -- moving a packet to a
+    different output path -- on its own, single-packet say-so.
+
+    An undated packet (no parseable date at all) never itself creates or
+    breaks a boundary -- it simply rides along inside whichever run it
+    falls positionally within. A run with no parseable dates at all (every
+    packet inside it undated) is labelled "undated" via UNDATED_ROUND,
+    and still ships -- an unreadable date is not a reason to withhold
+    otherwise-approved output, only a reason the round segment in its path
+    can't be more specific.
+    """
+    n = len(packets)
+    raw = [round_label(d.raw_date_text) for d in dates]
+    raw = [None if label == UNDATED_ROUND else label for label in raw]
+
+    next_nonnone: list[int | None] = [None] * n
+    nxt: int | None = None
+    for i in range(n - 1, -1, -1):
+        next_nonnone[i] = nxt
+        if raw[i] is not None:
+            nxt = i
+
+    groups: list[RoundGroup] = []
+    current_indices: list[int] = []
+
+    def flush() -> None:
+        if not current_indices:
+            return
+        labels_in_group = [raw[i] for i in current_indices if raw[i] is not None]
+        majority_label = Counter(labels_in_group).most_common(1)[0][0] if labels_in_group else UNDATED_ROUND
+        n_disagreeing = sum(1 for i in current_indices if raw[i] is not None and raw[i] != majority_label)
+        first_page = packets[current_indices[0]].page_indices[0] + 1
+        last_page = packets[current_indices[-1]].page_indices[-1] + 1
+        groups.append(
+            RoundGroup(
+                label=majority_label,
+                packet_tags=[dates[i].packet_tag for i in current_indices],
+                first_page=first_page,
+                last_page=last_page,
+                n_disagreeing=n_disagreeing,
+            )
+        )
+
+    current_anchor: str | None = None
+    for i in range(n):
+        label = raw[i]
+        if label is None:
+            current_indices.append(i)
+            continue
+        if current_anchor is None or label == current_anchor:
+            current_anchor = label
+            current_indices.append(i)
+            continue
+        # label differs from the current run's anchor -- a candidate
+        # boundary. Only rejected (treated as a single misread, absorbed
+        # into the current run) when the *next* dated packet reverts back
+        # to the current run's own label -- confirming this was a brief
+        # detour, not a real change. Anything else (no further dated
+        # packet to check, or the next one differs too) confirms the move.
+        j = next_nonnone[i]
+        if j is None or raw[j] != current_anchor:
+            flush()
+            current_indices = [i]
+            current_anchor = label
+        else:
+            current_indices.append(i)
+    flush()
+
+    return groups
+
+
+def round_labels_by_tag(groups: list[RoundGroup]) -> dict[str, str]:
+    return {tag: g.label for g in groups for tag in g.packet_tags}
+
+
+def duplicate_round_labels(groups: list[RoundGroup]) -> list[str]:
+    """Labels shared by more than one *group* -- since group_into_rounds
+    never merges non-adjacent groups (each confirmed boundary always starts
+    a fresh RoundGroup, even if its label matches an earlier, already-closed
+    one), any duplicate found here is inherently non-adjacent. That means
+    the file isn't simply "N sessions concatenated back to back" the way
+    the round segment assumes -- e.g. a scan interleaving two sessions, or
+    a re-scanned page reinserted out of order -- and is worth a human's
+    attention, not a silent merge back into one round."""
+    counts = Counter(g.label for g in groups if g.label != UNDATED_ROUND)
+    return sorted(label for label, count in counts.items() if count > 1)
+
+
+def round_disagreeing_tags(groups: list[RoundGroup], dates: list[PacketDate]) -> frozenset[str]:
+    """packet_tags whose own parsed round label differs from their group's
+    label -- mirrors disagreeing_packets (block resolution) but for round
+    grouping, so a caller (review_app.py) can flag the specific packet next
+    to its own date field. Never used to hold, reroute, or otherwise act on
+    the packet (see group_into_rounds' own docstring): the group's majority
+    label is what's trusted; a single packet's own date is only ever a flag
+    for a human, the same lesson block resolution already learned."""
+    by_tag = {d.packet_tag: d for d in dates}
+    result: set[str] = set()
+    for g in groups:
+        for tag in g.packet_tags:
+            d = by_tag.get(tag)
+            if d is None:
+                continue
+            label = round_label(d.raw_date_text)
+            if label != UNDATED_ROUND and label != g.label:
+                result.add(tag)
+    return frozenset(result)
+
+
+def collect_packet_rounds(pdf_path: str | Path, segmented: SegmentResult | None = None) -> list[RoundGroup]:
+    """The normal entry point: segment (unless already done), read every
+    packet's own Date field, and group into contiguous rounds. See
+    group_into_rounds for the grouping rule itself."""
+    if segmented is None:
+        segmented = segment_pdf(pdf_path)
+    dates = collect_packet_dates(pdf_path, segmented=segmented)
+    return group_into_rounds(segmented.packets, dates)
+
+
+def format_round_report(groups: list[RoundGroup]) -> str:
+    """Human-readable round-group table shown by both cli.py and
+    review_app.py *before* anything is written -- so a human can eyeball
+    the detected rounds (label, packet count, page range, and how many
+    packets in that group had their own date disagree with the group's
+    majority label) before approving any packet into one. See CLAUDE.md's
+    "A round segment" section for why grouping, not a single packet's own
+    date, is what a reviewer should trust here."""
+    lines = ["Round grouping report:"]
+    for g in groups:
+        lines.append(
+            f"  {g.label}: {g.n_packets} packet(s), pages {g.first_page}-{g.last_page}, "
+            f"{g.n_disagreeing} disagreeing"
+        )
+    dupes = duplicate_round_labels(groups)
+    if dupes:
+        lines.append(
+            f"  NOTE: {len(dupes)} label(s) appear in more than one non-adjacent group -- "
+            f"this file may not be simply concatenated sessions: {dupes}"
+        )
+    return "\n".join(lines)
 
 
 @dataclass(frozen=True)
