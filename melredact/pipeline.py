@@ -254,6 +254,31 @@ def output_path(
     )
 
 
+def filter_packets_by_round(
+    pdf_path: str | Path, segmented: SegmentResult, round_labels: dict[str, str], round_label: str
+) -> SegmentResult:
+    """Restrict a SegmentResult to just the packets belonging to one round
+    group (see blocks.group_into_rounds) -- the mechanism behind --round,
+    for piloting or otherwise scoping a run to a single collection session
+    inside a larger concatenated scan (the real motivating file,
+    010406_PD1_PRT.pdf, is three concatenated PRT administrations).
+
+    Round grouping is necessarily whole-file (see blocks.py's own module
+    docstring on why grouping trusts a contiguous run, not a single
+    packet's own date) -- this filters *after* segmentation and round
+    grouping have already run over the full file, rather than trying to
+    segment only part of it. Every caller downstream of this (propose_all,
+    assign_all, run_dispositions, analyze_redaction_holds) only ever
+    iterates `segmented.packets`, so a packet excluded here is not scored,
+    not matched, not redacted, not written, and never looked up in the
+    ledger -- an earlier or later round's already-shipped output is never
+    touched by a run scoped to a different round, since nothing about
+    processing an excluded packet's tag ever runs at all.
+    """
+    kept = [p for p in segmented.packets if round_labels.get(packet_tag(pdf_path, p), UNDATED_ROUND) == round_label]
+    return SegmentResult(packets=kept, page_count=segmented.page_count)
+
+
 def ledger_path(out_dir: str | Path, pdf_path: str | Path) -> Path:
     """Where run_dispositions persists, for this (out_dir, source pdf) pair,
     which SID and exact path it last wrote output to under each packet_tag
@@ -567,6 +592,111 @@ def _draft_consent_hold_redaction(pdf_path: str | Path, packet: Packet, dpi: int
 
 
 @dataclass
+class HoldAnalysis:
+    packet_tag: str
+    round_label: str
+    detection_hold: bool = False
+    uncovered_ink_hold: bool = False
+    leak_hold: bool = False
+    reason: str | None = None
+
+    @property
+    def clean(self) -> bool:
+        return not (self.detection_hold or self.uncovered_ink_hold or self.leak_hold)
+
+
+def analyze_redaction_holds(
+    pdf_path: str | Path,
+    segmented: SegmentResult,
+    roster: Roster,
+    round_labels: dict[str, str] | None = None,
+    *,
+    dpi: int = RENDER_DPI_FINAL,
+    flatten: bool = False,
+) -> list[HoldAnalysis]:
+    """Read-only redaction analysis: reports which of run_dispositions'
+    three unconditional per-packet checks (detection confidence, uncovered
+    group-row ink, verify_no_leaked_names) each packet would trigger, or
+    that it would pass cleanly, WITHOUT ever writing to out_dir, touching
+    decisions, the ledger, or the manual-redaction queue, or deleting
+    anything. Exists so a real, never-before-processed file (see CLAUDE.md's
+    bug #7 trade-off, and its own finding that the trade-off fires far more
+    broadly on real data than first measured) can be sized up before
+    committing to a real run.
+
+    Each packet's own redaction is drafted to a scratch file inside a
+    TemporaryDirectory removed the instant this function returns -- the
+    same pattern `_draft_consent_hold_redaction` already uses for a consent
+    hold, for the same reason: prove the real geometry/leak checks actually
+    ran, without ever leaving a file sitting on disk anywhere.
+
+    Mirrors run_dispositions' own hold precedence exactly -- detection
+    confidence checked first, then uncovered-ink, then a full
+    verify_no_leaked_names pass, each gating the next the same way
+    run_dispositions' `continue`s do -- rather than checking all three
+    independently, so a packet reported here as "held for detection
+    confidence" is the same packet a real run (absent a
+    detection_overrides entry for it) would actually hold for that reason,
+    not a looser union of every check that happens to fire on it.
+
+    Orphan packets (no header page) have nothing to redact and are
+    skipped -- a real run would refuse them via `packet.issues` before ever
+    reaching redaction, so they carry no redaction-hold signal to report
+    here. `roster` should be scoped the same way a real run's would be
+    (see roster.load_roster); this function never assigns or reads a SID,
+    it only needs a roster to run the same full-document leak check
+    verify_no_leaked_names always runs.
+    """
+    results: list[HoldAnalysis] = []
+    labels = round_labels or {}
+    with tempfile.TemporaryDirectory() as scratch_dir:
+        for packet in segmented.packets:
+            if packet.header_page_index is None:
+                continue
+            tag = packet_tag(pdf_path, packet)
+            scratch_path = Path(scratch_dir) / f"{tag}.pdf"
+            redact_result = _redact_packet(pdf_path, packet, scratch_path, dpi=dpi, flatten=flatten)
+            analysis = HoldAnalysis(packet_tag=tag, round_label=labels.get(tag, UNDATED_ROUND))
+            if redact_result.band is not None and not redact_result.band.detected:
+                analysis.detection_hold = True
+                analysis.reason = f"header border not confidently detected: {redact_result.band}"
+            elif redact_result.uncovered_group_words:
+                analysis.uncovered_ink_hold = True
+                analysis.reason = f"uncovered group-row ink: {redact_result.uncovered_group_words}"
+            else:
+                findings = verify_no_leaked_names(scratch_path, roster)
+                if findings:
+                    analysis.leak_hold = True
+                    analysis.reason = f"verify_no_leaked_names found leaks: {findings}"
+            scratch_path.unlink(missing_ok=True)
+            results.append(analysis)
+    return results
+
+
+def format_hold_analysis_report(results: list[HoldAnalysis]) -> str:
+    """Per-round-group summary of analyze_redaction_holds' output: how many
+    packets would be held for each reason, and how many would pass
+    cleanly, grouped and sorted the same way blocks.format_round_report
+    groups its own table, for a human comparing the two side by side
+    before deciding whether to actually run anything."""
+    by_round: dict[str, list[HoldAnalysis]] = {}
+    for r in results:
+        by_round.setdefault(r.round_label, []).append(r)
+    lines = ["Redaction hold analysis (read-only -- nothing written, redacted to disk, or deleted):"]
+    for label in sorted(by_round):
+        group = by_round[label]
+        n_detection = sum(1 for r in group if r.detection_hold)
+        n_ink = sum(1 for r in group if r.uncovered_ink_hold)
+        n_leak = sum(1 for r in group if r.leak_hold)
+        n_clean = sum(1 for r in group if r.clean)
+        lines.append(
+            f"  {label}: {len(group)} packet(s) -- {n_clean} clean, {n_detection} detection-confidence "
+            f"hold(s), {n_ink} uncovered-ink hold(s), {n_leak} leak hold(s)"
+        )
+    return "\n".join(lines)
+
+
+@dataclass
 class DispositionResult:
     # None only for a synthetic result produced by the end-of-run
     # reconciliation sweep (see run_dispositions), which finds a stale
@@ -605,6 +735,14 @@ class DispositionResult:
     # prominently (cli.py's run summary, review_app.py's sidebar) rather
     # than looking like an ordinary clean write.
     collision_note: str | None = None
+    # True whenever `allow_delete=False` suppressed a deletion this result
+    # would otherwise have performed (confirmed non-consent, or a
+    # correction superseding an old SID) -- see run_dispositions'
+    # `allow_delete` parameter. `reason` explains what was left in place.
+    # A caller must surface this explicitly (it fits none of written/
+    # deleted/pending/held_back/consent_hold) rather than let it go
+    # silently unreported.
+    deletion_skipped: bool = False
 
 
 def run_dispositions(
@@ -618,6 +756,7 @@ def run_dispositions(
     flatten: bool = False,
     detection_overrides: set[str] = frozenset(),
     round_labels: dict[str, str] | None = None,
+    allow_delete: bool = True,
 ) -> list[DispositionResult]:
     """Apply final per-packet decisions. See module docstring for the
     three-state `decisions` contract -- this is where "confirmed
@@ -660,6 +799,19 @@ def run_dispositions(
     report before ever calling this) should pass it through directly
     rather than paying for that pass twice. Round labelling never touches
     matching, scoring, or claiming -- it is output-path metadata only.
+
+    `allow_delete` (default True, unchanged behavior) is a blanket safety
+    switch for a pilot or first-ever run against a real file that hasn't
+    been through this code before: when False, every deletion this
+    function would otherwise perform -- a confirmed non-consent packet's
+    prior output, or a correction's stale old-SID file -- is skipped
+    entirely, and the ledger entry for that tag is left exactly as it was.
+    Nothing else changes: matching, redaction, and writing new output all
+    proceed normally, so a pilot can still see what *would* happen on
+    write, just with deletion categorically off regardless of what any
+    individual decision says. The skipped deletion is still surfaced (a
+    `DispositionResult.reason` noting the file that was left in place),
+    never silently dropped.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -709,9 +861,21 @@ def run_dispositions(
             # anything else in out_dir -- this is the whole point of the
             # ledger over a directory sweep.
             if prior_entry is not None:
-                _delete_stale_output(Path(prior_entry["path"]), prior_sid)
-                ledger.pop(tag, None)
-                ledger_dirty = True
+                if allow_delete:
+                    _delete_stale_output(Path(prior_entry["path"]), prior_sid)
+                    ledger.pop(tag, None)
+                    ledger_dirty = True
+                else:
+                    results.append(
+                        DispositionResult(
+                            packet_tag=tag,
+                            sid=None,
+                            pending=False,
+                            reason=f"deletion disabled for this run -- {prior_entry['path']} left in place",
+                            deletion_skipped=True,
+                        )
+                    )
+                    continue
             results.append(DispositionResult(packet_tag=tag, sid=None, pending=False))
             continue
 
@@ -821,7 +985,12 @@ def run_dispositions(
         # the ledger's own recorded path, not a recomputed one, same as the
         # non-consent case above.
         if prior_entry is not None and prior_sid != sid:
-            _delete_stale_output(Path(prior_entry["path"]), prior_sid)
+            if allow_delete:
+                _delete_stale_output(Path(prior_entry["path"]), prior_sid)
+            else:
+                stale_note = f"deletion disabled for this run -- stale {prior_entry['path']} left in place"
+                results[-1].reason = f"{results[-1].reason}; {stale_note}" if results[-1].reason else stale_note
+                results[-1].deletion_skipped = True
         ledger[tag] = {"sid": sid, "path": str(out_path)}
         ledger_dirty = True
 

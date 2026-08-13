@@ -7,9 +7,13 @@ doesn't clear the auto-assign gate still needs its correct candidate
 visible so a reviewer can approve/correct it, rather than starting from
 nothing. Only entries that clear MIN_SCORE, beat the runner-up by
 MIN_MARGIN, and are still unclaimed get auto-assigned. "Unclaimed" is
-necessarily a whole-batch property (see assign_all), not a per-packet one,
-since the build spec's own auto-assign rule requires knowing whether some
-other packet has already claimed that roster entry.
+necessarily a batch property (see assign_all), not a per-packet one, since
+the build spec's own auto-assign rule requires knowing whether some other
+packet has already claimed that roster entry -- and, since 2026-08-13,
+scoped to a *round group* rather than the whole file when the caller
+supplies one (see assign_all's own docstring): a student can legitimately
+have one packet per collection round, so claiming across rounds would
+produce false abstentions rather than catch anything unsafe.
 
 MIN_SCORE/MIN_MARGIN are placeholders (see config.py) pending calibration
 against the real ~22-packet file's score distribution.
@@ -30,6 +34,7 @@ ranked pool the same way an empty candidate list already is.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass, field
 
 from rapidfuzz import fuzz
@@ -147,7 +152,9 @@ def propose(packet_tag: str, name_text: str, roster: Roster) -> MatchProposal:
     return MatchProposal(packet_tag=packet_tag, candidates=scored, held_candidates=held_candidates)
 
 
-def assign_all(proposals: list[MatchProposal]) -> dict[str, str | None]:
+def assign_all(
+    proposals: list[MatchProposal], round_labels: dict[str, str] | None = None
+) -> dict[str, str | None]:
     """Auto-assign SIDs with zero human input: packet_tag -> sid or None.
 
     Processes (packet, top candidate) pairs in descending score order, so a
@@ -162,9 +169,31 @@ def assign_all(proposals: list[MatchProposal]) -> dict[str, str | None]:
     candidates at all -- auto-assign must never hand a held-consent, SID-
     unresolvable packet a roster SID just because some roster entry also
     scored reasonably well.
+
+    `round_labels` (packet_tag -> round label, see blocks.
+    round_labels_by_tag) scopes claim-and-remove to *within* each round
+    group rather than across the whole file. This matters for a teacher
+    whose students legitimately complete the same worksheet more than once
+    across separate collection sessions (the real motivating file,
+    010406_PD1_PRT.pdf, is three concatenated PRT administrations of the
+    same ~14 students): within one round, a file routinely has more packets
+    than roster entries, since non-consented students also have worksheets,
+    so an eager matcher there could hand a consented student's SID to a
+    different, merely-similar packet's worksheet -- claim-and-remove within
+    a round is real safety, not an arbitrary restriction. Across rounds the
+    risk doesn't exist the same way: a student has one legitimate worksheet
+    per administration, so file-wide claiming would only produce false
+    abstentions (packet 2 and 3 for the same real student silently routed
+    to human review just because packet 1 already claimed that SID), not
+    protect against anything. Left as None (the default), every packet is
+    treated as one single group -- byte-identical to file-wide claiming, so
+    every caller that hasn't been updated for round-scoping keeps its exact
+    existing behavior. round labelling is computed independently of
+    matching (see blocks.py) and is passed in here, never inferred --
+    match.py stays free of date/round logic of its own.
     """
     assignments: dict[str, str | None] = {p.packet_tag: None for p in proposals}
-    claimed: set[str] = set()
+    claimed: dict[str, set[str]] = defaultdict(set)
 
     ranked = sorted(
         (p for p in proposals if p.top is not None and not p.is_held_match),
@@ -176,8 +205,9 @@ def assign_all(proposals: list[MatchProposal]) -> dict[str, str | None]:
         assert top is not None
         if top.score < MIN_SCORE or proposal.margin < MIN_MARGIN:
             continue
-        if top.sid in claimed:
+        group = round_labels.get(proposal.packet_tag, "") if round_labels is not None else ""
+        if top.sid in claimed[group]:
             continue
         assignments[proposal.packet_tag] = top.sid
-        claimed.add(top.sid)
+        claimed[group].add(top.sid)
     return assignments

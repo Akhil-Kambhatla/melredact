@@ -135,6 +135,125 @@ def test_verify_recursive_glob_finds_files_under_the_topic_and_round_segments(ma
     assert "1 file(s) checked, 0 failed" in out_text
 
 
+# --- --round / --no-delete / analyze (2026-08-13) ---
+
+
+def test_run_rejects_an_unknown_round_label(main_fixture, tmp_path, capsys):
+    out = tmp_path / "out"
+    rc = main(
+        [
+            "run",
+            "--pdf",
+            str(main_fixture.pdf_path),
+            "--roster",
+            str(main_fixture.roster_path),
+            "--out",
+            str(out),
+            "--round",
+            "not-a-real-round",
+        ]
+    )
+    assert rc == 1
+    assert not out.exists()
+    err = capsys.readouterr().err
+    assert "not-a-real-round" in err
+
+
+def test_run_round_flag_processes_the_matching_round_normally(main_fixture, tmp_path):
+    """The fixture's packets share one date, so its own round label (see
+    blocks.round_label) must still process normally when explicitly passed
+    via --round -- the flag restricts, it doesn't break, a run that
+    genuinely only has that one round."""
+    from melredact.blocks import round_label
+
+    segmented = segment_pdf(main_fixture.pdf_path)
+    decisions_dir = tmp_path / "decisions"
+    tag = packet_tag(main_fixture.pdf_path, segmented.packets[0])
+    consented_sid = main_fixture.expected_final_sid["clean_match"]
+    save_decisions(main_fixture.pdf_path, {tag: consented_sid}, decisions_dir=decisions_dir)
+
+    out = tmp_path / "out"
+    rc = main(
+        [
+            "run",
+            "--pdf",
+            str(main_fixture.pdf_path),
+            "--roster",
+            str(main_fixture.roster_path),
+            "--out",
+            str(out),
+            "--decisions",
+            str(decisions_dir),
+            "--round",
+            round_label("10/03/2025"),
+        ]
+    )
+    assert rc == 0
+    assert list(out.rglob("*.pdf"))
+
+
+def test_run_no_delete_flag_leaves_prior_output_in_place(main_fixture, tmp_path, capsys):
+    segmented = segment_pdf(main_fixture.pdf_path)
+    decisions_dir = tmp_path / "decisions"
+    tag = packet_tag(main_fixture.pdf_path, segmented.packets[0])
+    consented_sid = main_fixture.expected_final_sid["clean_match"]
+    save_decisions(main_fixture.pdf_path, {tag: consented_sid}, decisions_dir=decisions_dir)
+
+    out = tmp_path / "out"
+    rc = main(
+        [
+            "run",
+            "--pdf",
+            str(main_fixture.pdf_path),
+            "--roster",
+            str(main_fixture.roster_path),
+            "--out",
+            str(out),
+            "--decisions",
+            str(decisions_dir),
+        ]
+    )
+    assert rc == 0
+    written = list(out.rglob("*.pdf"))
+    assert len(written) == 1
+    out_path = written[0]
+
+    # A reviewer flips the same tag to confirmed non-consent -- but this
+    # run passes --no-delete, so the previously-written file must survive.
+    save_decisions(main_fixture.pdf_path, {tag: None}, decisions_dir=decisions_dir)
+    rc = main(
+        [
+            "run",
+            "--pdf",
+            str(main_fixture.pdf_path),
+            "--roster",
+            str(main_fixture.roster_path),
+            "--out",
+            str(out),
+            "--decisions",
+            str(decisions_dir),
+            "--no-delete",
+        ]
+    )
+    assert rc == 0
+    assert out_path.exists()
+    out_text = capsys.readouterr().out
+    assert "deletion disabled" in out_text
+    assert "0 deleted" in out_text
+
+
+def test_cmd_analyze_reports_without_writing_or_deleting(main_fixture, tmp_path, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    rc = main(["analyze", "--pdf", str(main_fixture.pdf_path), "--roster", str(main_fixture.roster_path)])
+    assert rc == 0
+    assert not (tmp_path / "out").exists()
+    assert not (tmp_path / "decisions").exists()
+    out_text = capsys.readouterr().out
+    assert "Round grouping report" in out_text
+    assert "Redaction hold analysis" in out_text
+    assert "nothing written" in out_text.lower() or "nothing is written" in out_text.lower()
+
+
 def test_verify_succeeds_against_a_roster_spanning_multiple_periods(main_fixture, tmp_path, capsys):
     """Regression: verify used to call the *scoped* loader, which raises
     RosterError the moment the roster spans more than one period and no

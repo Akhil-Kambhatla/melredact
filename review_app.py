@@ -1,6 +1,14 @@
 """Human review UI for MEL MPR+ADR packet redaction.
 
     streamlit run review_app.py -- <scan.pdf> <roster.csv> [--out-dir DIR] [--decisions-dir DIR]
+        [--round 2025-10]
+
+`--round` restricts the whole session to one round group's packets (see
+pipeline.filter_packets_by_round) -- useful for a small pilot against one
+collection session inside a larger concatenated scan. The sidebar's
+"Disable deletion (safety)" checkbox suppresses every deletion "Run
+redaction pipeline" would otherwise perform, regardless of what any
+individual decision says -- see pipeline.run_dispositions' `allow_delete`.
 
 Nothing here writes a redacted PDF or deletes anything on its own -- this
 is where a human turns match.py's candidate proposals into the final,
@@ -46,6 +54,7 @@ from melredact.config import CACHE_DIR, HEADER_BAND_FALLBACK, MIN_MARGIN, MIN_SC
 from melredact.match import assign_all
 from melredact.pdfio import open_pdf
 from melredact.pipeline import (
+    filter_packets_by_round,
     list_manual_queue,
     load_decisions,
     load_detection_overrides,
@@ -93,6 +102,16 @@ def _parse_args() -> argparse.Namespace:
         help="explicit block override, ONLY meaningful when block metadata exists -- for when "
         "packet dates can't be resolved automatically. Still requires ticking the on-screen "
         "confirmation before any packet is shown.",
+    )
+    parser.add_argument(
+        "--round",
+        default=None,
+        help="restrict this whole review session to one round group's packets (e.g. '2025-10' or "
+        "'undated', see the 'Round grouping' report shown on screen) -- packets outside it are "
+        "not segmented for matching, not shown, not redacted, not written, and never looked up in "
+        "the ledger when 'Run redaction pipeline' is used, so a session scoped to one round can "
+        "never delete or disturb another round's already-shipped output. Useful for a small pilot "
+        "against one session inside a larger concatenated scan.",
     )
     return parser.parse_args(sys.argv[1:])
 
@@ -243,6 +262,14 @@ def _render_sidebar(
     st.sidebar.write(f"⏳ Pending: {n_pending}  ✅ Approved: {n_consented}  🚫 Rejected: {n_rejected}")
 
     st.sidebar.divider()
+    disable_deletion = st.sidebar.checkbox(
+        "Disable deletion (safety)",
+        key="disable_deletion",
+        help="Suppresses every deletion 'Run redaction pipeline' would otherwise perform (confirmed "
+        "non-consent, or a correction superseding an old SID), regardless of what any individual "
+        "decision says. Matching, redaction, and writing new output still proceed normally -- use "
+        "this for a pilot or a file that hasn't been through this code before.",
+    )
     if st.sidebar.button("Run redaction pipeline", type="primary", disabled=n_pending == len(segmented.packets) == 0):
         with st.spinner("Redacting approved packets..."):
             fresh_decisions = load_decisions(args.pdf_path, decisions_dir=Path(args.decisions_dir))
@@ -255,6 +282,7 @@ def _render_sidebar(
                 out_dir=Path(args.out_dir),
                 detection_overrides=fresh_overrides,
                 round_labels=round_labels,
+                allow_delete=not disable_deletion,
             )
             written = [r for r in results if r.out_path is not None]
             deleted = sum(1 for r in results if r.deleted_path is not None)
@@ -263,10 +291,12 @@ def _render_sidebar(
             consent_held = [r for r in results if r.consent_hold]
             overridden = [r for r in written if r.reason]
             collided = [r for r in written if r.collision_note]
+            deletion_skipped = [r for r in results if r.deletion_skipped]
             st.sidebar.success(
                 f"{len(written)} written ({len(collided)} collision(s) avoided), {deleted} deleted, "
                 f"{len(held_back)} held back for review, {len(consent_held)} consent-held (no SID), "
                 f"{pending} still pending review"
+                + (f", {len(deletion_skipped)} deletion(s) skipped (disabled)" if deletion_skipped else "")
             )
             for r in collided:
                 # A different packet's output already claimed this packet's
@@ -294,6 +324,12 @@ def _render_sidebar(
                 # module docstring. Surface it per-packet so a reviewer
                 # knows exactly which tag needs a closer look and why.
                 st.sidebar.warning(f"Held back: {r.packet_tag} (sid {r.sid}): {r.reason}")
+            for r in deletion_skipped:
+                # "Disable deletion (safety)" was checked -- this packet's
+                # decision would otherwise have deleted a file. Surfaced
+                # explicitly so it's never mistaken for an ordinary,
+                # untouched pending packet.
+                st.sidebar.info(f"Deletion skipped (disabled): {r.packet_tag}: {r.reason}")
 
     st.sidebar.divider()
     queue_entries = [e for e in list_manual_queue(args.out_dir) if e["pdf_path"] == str(Path(args.pdf_path))]
@@ -678,6 +714,26 @@ def main() -> None:
     st.header("Round grouping")
     st.code(format_round_report(round_groups), language=None)
 
+    # --round restricts this whole session to one collection session inside
+    # a larger concatenated scan (see pipeline.filter_packets_by_round).
+    # Round grouping itself is always computed over the whole file above --
+    # grouping is inherently file-level (see blocks.py) -- but every packet
+    # a reviewer can actually see, match against, or send through "Run
+    # redaction pipeline" below only ever comes from `segmented` after this
+    # point, so an excluded packet is never touched: not segmented for
+    # matching, not shown, not redacted, not written, and never looked up
+    # in the ledger.
+    if args.round is not None:
+        known_labels = sorted({g.label for g in round_groups})
+        if args.round not in known_labels:
+            st.error(f"--round {args.round!r} is not one of this file's round groups ({known_labels}).")
+            return
+        segmented = filter_packets_by_round(args.pdf_path, segmented, round_labels, args.round)
+        if not segmented.packets:
+            st.error(f"Round {args.round!r} has no packets to show.")
+            return
+        st.info(f"Restricting this session to round {args.round!r}: {len(segmented.packets)} packet(s).")
+
     resolved_block: BlockMeaning | None = None
     disagreeing_tags: frozenset[str] = frozenset()
     period_for_roster = args.period
@@ -693,8 +749,9 @@ def main() -> None:
     except RosterError as exc:
         st.error(f"Roster error: {exc}")
         return
-    proposals = _proposals(args.pdf_path, args.roster_path, period_for_roster)
-    auto_assignments = assign_all(proposals)
+    session_tags = {packet_tag(args.pdf_path, p) for p in segmented.packets}
+    proposals = [p for p in _proposals(args.pdf_path, args.roster_path, period_for_roster) if p.packet_tag in session_tags]
+    auto_assignments = assign_all(proposals, round_labels=round_labels)
     proposals_by_tag = {p.packet_tag: p for p in proposals}
 
     _init_state(args.pdf_path, args.decisions_dir)

@@ -234,7 +234,8 @@ def test_manual_queue_panel_lists_a_queued_packet_and_can_release_it(tmp_path):
 
     at = _launch(pdf_path, roster_path, out_dir, decisions_dir)
     assert "🛠️ Manual-redaction queue: 1" in [w.value for w in at.sidebar.markdown]
-    at.sidebar.checkbox[0].set_value(True).run()
+    show_queue_checkbox = next(c for c in at.sidebar.checkbox if c.key == "show_manual_queue")
+    show_queue_checkbox.set_value(True).run()
     assert not at.exception
     assert any(tag in expander.label for expander in at.expander)
 

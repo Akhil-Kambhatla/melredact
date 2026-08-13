@@ -1,7 +1,30 @@
 """Command-line entry point.
 
     python -m melredact.cli run --pdf <scan.pdf> --roster <roster.csv> [--out out] [--decisions decisions] [--period 2]
+    python -m melredact.cli analyze --pdf <scan.pdf> --roster <roster.csv> [--period 2]
     python -m melredact.cli verify --roster <roster.csv> [--out out]
+
+`analyze` is read-only: it segments the file, prints the round grouping
+report, then drafts (never writes) a redaction attempt for every header
+packet to report how many packets, per round group, would be held for
+detection confidence, held for uncovered group-row ink, held for a
+text-layer leak, or would pass cleanly -- see pipeline.analyze_redaction_
+holds. Nothing is written to `--out`, nothing is deleted, and no decision
+or ledger file is touched. Meant for sizing up a real file (especially one
+that has never been through this code before) before running anything for
+real -- e.g. CLAUDE.md's bug #7 uncovered-ink trade-off, which real-data
+runs have shown firing far more broadly than first measured.
+
+`run` accepts `--round <label>` (e.g. '2025-10', from the round grouping
+report both `run` and `analyze` print) to restrict a run to a single
+collection session inside a larger concatenated scan -- packets outside it
+are not segmented for matching, not redacted, not written, and never
+looked up in the ledger, so a run scoped to one round can never delete or
+disturb another round's already-shipped output (see pipeline.
+filter_packets_by_round). `run` also accepts `--no-delete`, a blanket
+safety switch that suppresses every deletion the run would otherwise
+perform regardless of what any individual decision says -- useful for a
+pilot against a file that hasn't been through this code before.
 
 `run`'s summary line also reports a "consent-held" count, separate from
 "held back for review": a packet whose best match is a held name (see
@@ -72,7 +95,16 @@ from melredact.blocks import (
     round_labels_by_tag,
     save_resolved_block_record,
 )
-from melredact.pipeline import decisions_path, load_decisions, load_detection_overrides, packet_tag, run_dispositions
+from melredact.pipeline import (
+    analyze_redaction_holds,
+    decisions_path,
+    filter_packets_by_round,
+    format_hold_analysis_report,
+    load_decisions,
+    load_detection_overrides,
+    packet_tag,
+    run_dispositions,
+)
 from melredact.redact import verify_no_leaked_names
 from melredact.roster import RosterError, infer_period_from_filename, load_full_roster, load_roster
 from melredact.segment import segment_pdf
@@ -113,6 +145,28 @@ def _cmd_run(args: argparse.Namespace) -> int:
     round_groups = collect_packet_rounds(pdf_path, segmented=segmented)
     print(format_round_report(round_groups))
     round_labels = round_labels_by_tag(round_groups)
+
+    # --round restricts this run to one collection session inside a larger
+    # concatenated scan (see pipeline.filter_packets_by_round). Round
+    # grouping itself is always computed over the *whole* file above --
+    # grouping is inherently file-level (see blocks.py) -- but everything
+    # from here on that actually matches, redacts, writes, or deletes
+    # (run_dispositions below) only ever sees `run_segmented`, so a packet
+    # outside the chosen round is never touched: not segmented for
+    # matching, not redacted, not written, and never looked up in the
+    # ledger, which is what lets a later round's run never disturb an
+    # earlier round's already-shipped output.
+    run_segmented = segmented
+    if args.round is not None:
+        known_labels = sorted({g.label for g in round_groups})
+        if args.round not in known_labels:
+            print(
+                f"error: --round {args.round!r} is not one of this file's round groups ({known_labels})",
+                file=sys.stderr,
+            )
+            return 1
+        run_segmented = filter_packets_by_round(pdf_path, segmented, round_labels, args.round)
+        print(f"  restricting to round {args.round!r}: {len(run_segmented.packets)} of {len(segmented.packets)} packet(s)")
 
     metadata = load_block_metadata(roster_path)
     resolved_block = None
@@ -227,13 +281,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     results = run_dispositions(
         pdf_path,
-        segmented,
+        run_segmented,
         decisions,
         roster,
         out_dir=out_dir,
         flatten=args.flatten,
         detection_overrides=detection_overrides,
         round_labels=round_labels,
+        allow_delete=not args.no_delete,
     )
 
     written = [r for r in results if r.out_path is not None]
@@ -241,6 +296,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     pending = [r for r in results if r.pending]
     held_back = [r for r in results if r.held_back]
     consent_held = [r for r in results if r.consent_hold]
+    deletion_skipped = [r for r in results if r.deletion_skipped]
 
     collided = [r for r in written if r.collision_note]
 
@@ -257,13 +313,47 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(f"held back {r.packet_tag} (sid {r.sid}): {r.reason}")
     for r in consent_held:
         print(f"consent hold {r.packet_tag} (no sid): {r.reason}")
+    for r in deletion_skipped:
+        print(f"deletion disabled -- kept {r.packet_tag}: {r.reason}")
 
     print(
         f"\n{len(written)} written ({len(collided)} collision(s) avoided), {len(deleted)} deleted, "
         f"{len(held_back)} held back for review, {len(consent_held)} consent-held (no SID), "
         f"{len(pending)} still pending review"
+        + (f", {len(deletion_skipped)} deletion(s) skipped (--no-delete)" if deletion_skipped else "")
     )
     return 1 if held_back else 0
+
+
+def _cmd_analyze(args: argparse.Namespace) -> int:
+    pdf_path = Path(args.pdf)
+    roster_path = Path(args.roster)
+    if not pdf_path.exists():
+        print(f"PDF not found: {pdf_path}", file=sys.stderr)
+        return 1
+    if not roster_path.exists():
+        print(f"Roster CSV not found: {roster_path}", file=sys.stderr)
+        return 1
+
+    segmented = segment_pdf(pdf_path)
+    round_groups = collect_packet_rounds(pdf_path, segmented=segmented)
+    print(format_round_report(round_groups))
+    round_labels = round_labels_by_tag(round_groups)
+
+    try:
+        roster = load_roster(roster_path, period=args.period, infer_period_from=pdf_path)
+    except RosterError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print(
+        "\nDrafting a redaction attempt for every header packet to check hold reasons -- nothing "
+        "is written to out/, redacted output is discarded immediately after inspection, and "
+        "nothing is deleted.\n"
+    )
+    results = analyze_redaction_holds(pdf_path, segmented, roster, round_labels)
+    print(format_hold_analysis_report(results))
+    return 0
 
 
 def _cmd_verify(args: argparse.Namespace) -> int:
@@ -364,7 +454,40 @@ def main(argv: list[str] | None = None) -> int:
         "dates can't be resolved automatically (too few readable dates, no clear majority). Still "
         "requires --confirm-block to match this value.",
     )
+    p_run.add_argument(
+        "--round",
+        default=None,
+        help="restrict this run to one round group's packets (e.g. '2025-10' or 'undated', see the "
+        "'Round grouping report' printed above) -- packets outside it are not segmented for "
+        "matching, not redacted, not written, and never looked up in the ledger, so a run scoped "
+        "to one round can never delete or disturb another round's already-shipped output. Useful "
+        "for a small pilot against one session inside a larger concatenated scan.",
+    )
+    p_run.add_argument(
+        "--no-delete",
+        action="store_true",
+        dest="no_delete",
+        help="disable every deletion this run would otherwise perform (confirmed non-consent, or a "
+        "correction superseding an old SID) -- a blanket safety switch for a pilot or a file that "
+        "hasn't been through this code before. Matching, redaction, and writing new output all "
+        "proceed normally; only deletion is suppressed, and a suppressed deletion is still reported.",
+    )
     p_run.set_defaults(func=_cmd_run)
+
+    p_analyze = sub.add_parser(
+        "analyze",
+        help="read-only redaction hold analysis: report per-round-group hold counts (detection "
+        "confidence, uncovered group-row ink, text-layer leaks) without writing, redacting to "
+        "disk, or deleting anything",
+    )
+    _add_common_args(p_analyze)
+    p_analyze.add_argument(
+        "--period",
+        default=None,
+        help="restrict the roster to this period's block (e.g. '2' or '02'); inferred from --pdf's "
+        "filename (e.g. 'PD2') if omitted",
+    )
+    p_analyze.set_defaults(func=_cmd_analyze)
 
     p_verify = sub.add_parser("verify", help="re-check files already in --out for leaked roster names")
     p_verify.add_argument("--roster", required=True, help="consent roster CSV (every period, unscoped)")

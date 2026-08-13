@@ -1849,6 +1849,230 @@ untouched at their old path, since nothing safely regenerated them this
 session — deleting a still-current, still-valid file just because its
 path shape predates a later feature would be actively wrong.
 
+## Round-scoped claiming, a --round pilot flag, a deletion safety switch, and read-only redaction analysis (2026-08-13)
+
+**Motivated by the same real file the round segment above was built for:
+`data/PRT/010406_PD1_PRT.pdf`, 92 pages / 46 packets, three concatenated
+PRT administrations of the same ~14 students (October 2025, February
+2026, March 2026) — see "Teacher 010406 roster reissue" and "A round
+segment" above.** Round grouping gives each administration its own output
+path, but two problems remained before this file could actually be
+processed for real, safely, for the first time:
+
+**Problem one: `match.assign_all`'s claim-and-remove was whole-file, and
+whole-file claiming is wrong once one file can hold more than one round.**
+Within a single collection session, claim-and-remove is real safety, not
+an arbitrary restriction — a file routinely has more packets than roster
+entries (non-consented students also have worksheets), so an eager
+matcher could hand a consented student's SID to a different, merely-
+similar packet's worksheet if nothing stopped it once a roster entry was
+already claimed. But a student legitimately has *one packet per
+administration* — the same real student appears once in each of the three
+round groups in `010406_PD1_PRT.pdf`. Whole-file claiming would let the
+March packet claim that student's SID and then silently force the
+October and February packets for the *same, correctly-matched* student to
+abstain to human review, not because anything was ambiguous, but purely
+because an unrelated packet in a different round happened to be processed
+first. That's a false abstention, not protection against anything — the
+risk claim-and-remove exists to prevent (a decoy stealing an already-
+claimed SID) doesn't cross round boundaries, since the two packets
+competing for the same SID across rounds are, correctly, the *same*
+student's own two worksheets.
+
+**Fix: `assign_all(proposals, round_labels=None)`** (`melredact/match.py`)
+takes an optional `packet_tag -> round label` mapping (the exact shape
+`blocks.round_labels_by_tag` already produces) and scopes the `claimed`
+set to *within* each round label rather than one set for the whole file.
+Left as `None` (the default), every packet is treated as one single group
+— byte-identical to the old whole-file behavior, so every caller that
+hasn't been updated for round-scoping (there were none besides
+`review_app.py`, now updated) keeps its exact existing behavior with zero
+code change required. `round_labels` is computed entirely outside
+`match.py` (by `blocks.py`, from OCR'd dates) and passed in as plain
+data — match.py stays free of any date/round logic of its own, matching
+the existing separation of concerns between the two modules. Tests:
+`test_same_student_matched_in_three_round_groups_auto_assigns_in_all_
+three`, `test_two_packets_in_the_same_round_group_matching_same_student_
+second_abstains` (`tests/test_match.py`). `review_app.py`'s own
+`assign_all(proposals, round_labels=round_labels)` call was updated to
+pass the round labels it already computes for the round-grouping report —
+one line, since the round labels were already sitting right there.
+
+**Problem two: there was no safe way to pilot a small slice of a
+46-packet, three-round file that had never been through this code
+before, and no way to guarantee a later round's run couldn't disturb an
+earlier round's already-shipped output.** Two additions:
+
+- **`--round <label>`** (both `cli.py run` and `review_app.py`, e.g.
+  `--round 2025-10`) restricts a run/session to one round group's
+  packets, via `pipeline.filter_packets_by_round(pdf_path, segmented,
+  round_labels, round_label)` — filters the already-segmented,
+  already-round-grouped `SegmentResult` down to just the packets whose
+  own tag maps to the chosen round label. Round grouping itself is always
+  computed over the *whole* file first (grouping is inherently file-level
+  — see blocks.py's own module docstring on why a contiguous run, not a
+  single packet's own date, is what's trusted), so this filters *after*
+  segmentation and grouping, never by trying to segment only part of the
+  file. Every caller downstream of the filtered `SegmentResult`
+  (`propose_all`, `assign_all`, `run_dispositions`,
+  `analyze_redaction_holds` below) only ever iterates
+  `segmented.packets`, so a packet outside the chosen round is not
+  segmented for matching, not shown (`review_app.py` restricts its whole
+  packet selector, sidebar counts, and "All packets" list to the filtered
+  set), not redacted, not written, and — the actual safety property —
+  never looked up in the ledger at all, since `run_dispositions` only
+  ever consults the ledger for a `packet_tag` it's currently iterating.
+  This is what makes "a later round's run can never delete or disturb an
+  earlier round's output" true by construction rather than by a separate
+  check: an excluded tag is never visited, full stop, so nothing about
+  processing round B can read, write, or delete anything belonging to
+  round A's own tags, even if round A's tags are sitting in the very same
+  `decisions` file. Test:
+  `test_round_scoped_run_never_touches_another_rounds_ledger`
+  (`tests/test_pipeline.py`) proves this directly: a round-B-scoped run
+  is handed an explicit non-consent decision for a round-A tag, and the
+  round-A file it had already written survives completely untouched,
+  because the round-B-filtered `SegmentResult` never contains that tag to
+  begin with.
+
+- **`allow_delete: bool = True`** on `run_dispositions` (and `--no-delete`
+  on `cli.py run`, and a "Disable deletion (safety)" sidebar checkbox in
+  `review_app.py`, both defaulting to deletion enabled — unchanged
+  behavior unless explicitly opted out of) is a blanket switch,
+  independent of `--round`: when `False`, every deletion the run would
+  otherwise perform — a confirmed non-consent packet's prior output, or a
+  correction superseding an old SID — is skipped entirely, with the
+  ledger entry for that tag left exactly as it was and the skipped
+  deletion surfaced via `DispositionResult.reason` ("deletion disabled
+  for this run — `<path>` left in place"), never silently dropped.
+  Matching, redaction, and writing new output all proceed completely
+  normally; only deletion is suppressed. This exists for exactly the
+  situation this session's own pilot was in: a real file that has never
+  been through this code before, where the safest way to do a first pass
+  is to make the one truly irreversible step (deletion) categorically
+  impossible for that run, regardless of what any individual decision
+  says. Tests: `test_allow_delete_false_leaves_confirmed_non_consent_
+  output_in_place`, `test_allow_delete_false_leaves_stale_correction_
+  file_in_place` (`tests/test_pipeline.py`).
+
+**A new read-only diagnostic: `python -m melredact.cli analyze --pdf ...
+--roster ...`, backed by `pipeline.analyze_redaction_holds`.** Before this
+session, there was no way to size up how many packets in a real file
+would hit CLAUDE.md's already-documented bug #7 uncovered-ink trade-off
+(see "Two rectangles are redacted per header page"'s "Correction,
+2026-07-21" and "Seven regression-tested bugs" #7) without actually
+running the pipeline for real. `analyze_redaction_holds` drafts every
+header packet's redaction to a scratch file inside a `TemporaryDirectory`
+removed the instant the function returns — the same pattern
+`_draft_consent_hold_redaction` already uses for a consent hold, for the
+same reason: prove the real geometry/leak checks actually ran, without
+ever leaving a file on disk — and classifies each packet using
+`run_dispositions`' own exact hold precedence (detection confidence
+first, then uncovered-ink, then a full `verify_no_leaked_names` pass,
+each gating the next the same way `run_dispositions`'s own `continue`s
+do), so a packet reported here as "held for detection confidence" is the
+same packet a real run would actually hold for that reason, not a looser
+union of every check that happens to fire on it. `format_hold_analysis_
+report` prints per-round-group counts (clean / detection-confidence hold
+/ uncovered-ink hold / leak hold). `analyze` never writes to `--out`,
+never touches `decisions` or the ledger, and never deletes anything —
+it's pure sizing-up before committing to a real run. Tests:
+`test_analyze_redaction_holds_never_writes_anything`, `test_analyze_
+redaction_holds_agrees_with_a_real_run_for_a_clean_packet`, `test_format_
+hold_analysis_report_groups_by_round` (`tests/test_pipeline.py`).
+
+**Real diagnostic, this session, against the real, never-before-processed
+`data/PRT/010406_PD1_PRT.pdf` (92 pages, 46 packets) — `cli.py analyze`,
+read-only, nothing written, redacted to disk, or deleted:**
+
+```
+Round grouping report:
+  2026-03: 20 packet(s), pages 1-40, 0 disagreeing
+  2026-02: 19 packet(s), pages 41-78, 0 disagreeing
+  2025-10: 7 packet(s), pages 79-92, 0 disagreeing
+
+Redaction hold analysis (read-only):
+  2025-10: 6 packet(s) -- 5 clean, 0 detection-confidence, 1 uncovered-ink, 0 leak
+  2026-02: 18 packet(s) -- 18 clean, 0 detection-confidence, 0 uncovered-ink, 0 leak
+  2026-03: 20 packet(s) -- 11 clean, 0 detection-confidence, 8 uncovered-ink, 1 leak
+```
+
+(Each round's hold-analysis count is one lower than its round-grouping
+count because `analyze_redaction_holds` skips orphan packets with no
+header page — one of the two orphans this teacher's file was already
+known to have, at physical page 84, falls inside the October range.) Total
+wall time: 67 minutes (`1:07:08`, cold OCR cache) — longer than the
+~29s/page figure this file's own size would predict from the 44-page/
+22-packet measurement in "Speed finding" above, since that measurement's
+per-packet cost was for a *single* full-page redaction pass per approved
+packet, while `analyze` drafts one for *every* header packet in the file
+(all 46, not just ones with a decision) specifically so it can report a
+real hold count before anything is decided. Confirms bug #7 (see "Seven
+regression-tested bugs" #7) is real and broad on this file too, not just
+020415's: 9 of 44 scored packets (20%) held for uncovered-ink and 1 for a
+text-layer leak — consistent with, and not worse than, the already-
+documented 020415 finding under "Teacher 010406 roster reissue" above.
+This is sizing information only; clearing it is the same already-accepted
+manual-queue-or-recalibration work, not something this session did.
+
+**October 2025 round pilot — matching + dry redaction only, `--no-delete`
+posture (no decisions exist yet, so nothing would have written or deleted
+regardless; see below), nothing written to `out/`, `decisions/`, or the
+ledger:**
+
+```
+010406_PD1_PRT_p078  Jordan white          -> Jordan White        score=100.0 margin=40.0  auto-assign  HELD (uncovered-ink)
+010406_PD1_PRT_p080  Logan Mack            -> Logan Mack          score=100.0 margin=40.0  auto-assign  clean
+010406_PD1_PRT_p082  John Colatruslio      -> John Colatruglio    score=93.8  margin=39.8   auto-assign  clean
+010406_PD1_PRT_p084  (orphan, no header page -- not scored, not redacted)
+010406_PD1_PRT_p086  Elsilia Ring          -> Elsilia Ring        score=100.0 margin=32.5   auto-assign  clean
+010406_PD1_PRT_p088  cristelyAuil          -> Ella Curro          score=67.5  margin=7.5    falls to review (below MIN_SCORE)
+010406_PD1_PRT_p090  Liliana Gingerell     -> Liliana Gingerelli-Leone score=90.0 margin=12.9  auto-assign  clean
+```
+
+5 of 6 scored packets auto-assign cleanly; the sixth (`p088`, OCR'd
+`"cristelyAuil"`) correctly abstains to human review — its best candidate
+scores 67.5, well under `MIN_SCORE = 82` — exactly the abstain-by-default
+behavior this codebase is built around, not a bug. `p078` (Jordan White)
+is the one hold, for the same bug #7 uncovered-ink false-positive class:
+`{'text': 'Plausibilit', ...}` at `top=180.72`, a fragment of the printed
+worksheet title, not real handwriting.
+
+**"Gio Bariciano" (the name asked about) is not on the class period 1
+roster.** It's the *first physical packet in the file*
+(`010406_PD1_PRT_p000`) — but that packet round-groups into **2026-03**
+(March), not October; the file's physical page order is March, then
+February, then October (see the round report above), so "first in the
+file" and "in the October round" are different packets. OCR'd
+`name_text` is `'GioBarisciano'`. Scored against all 14 class-period-1
+roster entries, the top candidate is Brian Lu at score 60.0 — well under
+`MIN_SCORE = 82` — and no roster row has "gio" in the first name or
+"baric-" in the last name anywhere in the block. This packet would
+correctly never auto-assign and needs a human decision (most likely
+non-consent, pending an actual look at the scan, since no plausible
+roster candidate exists).
+
+**Confirmed a way to disable deletion exists for a run, per this
+session's own `allow_delete`/`--no-delete` addition above** (this
+teacher's data has never been through this code before, so no prior
+output exists to accidentally delete yet regardless — but the mechanism
+itself is real and tested, not just asserted): `run_dispositions(...,
+allow_delete=False)`, `cli.py run --no-delete`, and `review_app.py`'s
+"Disable deletion (safety)" sidebar checkbox. Tests: `test_allow_delete_
+false_leaves_confirmed_non_consent_output_in_place`, `test_allow_delete_
+false_leaves_stale_correction_file_in_place` (`tests/test_pipeline.py`),
+`test_run_no_delete_flag_leaves_prior_output_in_place` (`tests/
+test_cli.py`).
+
+**Nothing was written, redacted to disk, or deleted for 010406 as part of
+this session** — both diagnostics above are read-only by construction
+(`analyze_redaction_holds` drafts to a `TemporaryDirectory` removed
+immediately after inspection). A real run for this teacher — even just
+the October pilot — still needs an actual human review pass through
+`review_app.py` (or hand-authored `decisions/*.json` entries) before
+`cli.py run` would write anything; this session only sized up what that
+run would look like.
+
 ## Working preferences
 
 - Calibrate against real measured data, not assumptions — when a

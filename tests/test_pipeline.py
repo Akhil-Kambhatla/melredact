@@ -4,7 +4,10 @@ from melredact.blocks import round_label
 from melredact.config import RENDER_DPI_PREVIEW
 from melredact.pipeline import (
     DispositionResult,
+    analyze_redaction_holds,
     decisions_path,
+    filter_packets_by_round,
+    format_hold_analysis_report,
     load_decisions,
     load_detection_overrides,
     output_path,
@@ -236,6 +239,148 @@ def test_corrected_decision_writes_new_sid_and_removes_old(main_fixture, segment
 
     remaining = sorted(out_dir.rglob("*.pdf"))
     assert remaining == [tag_result.out_path]
+
+
+# --- allow_delete: a blanket safety switch for a pilot or a file that
+# hasn't been through this code before (2026-08-13) ---
+
+
+def test_allow_delete_false_leaves_confirmed_non_consent_output_in_place(main_fixture, segmented, roster, tmp_path):
+    packet = segmented.packets[0]  # clean_match
+    tag = packet_tag(main_fixture.pdf_path, packet)
+    sid = _sid_for(roster, "Jordan Ames")
+    out_dir = tmp_path / "out"
+
+    first = run_dispositions(main_fixture.pdf_path, segmented, {tag: sid}, roster, out_dir=out_dir, dpi=DPI)
+    out_path = next(r for r in first if r.packet_tag == tag).out_path
+    assert out_path.exists()
+
+    second = run_dispositions(
+        main_fixture.pdf_path, segmented, {tag: None}, roster, out_dir=out_dir, dpi=DPI, allow_delete=False
+    )
+    tag_result = next(r for r in second if r.packet_tag == tag)
+    assert tag_result.sid is None
+    assert not tag_result.pending
+    assert tag_result.out_path is None
+    assert "deletion disabled" in (tag_result.reason or "")
+    assert tag_result.deletion_skipped
+    assert not any(r.deleted_path for r in second)
+    assert out_path.exists()
+
+
+def test_allow_delete_false_leaves_stale_correction_file_in_place(main_fixture, segmented, roster, tmp_path):
+    packet = segmented.packets[0]  # clean_match
+    tag = packet_tag(main_fixture.pdf_path, packet)
+    old_sid = _sid_for(roster, "Jordan Ames")
+    new_entry = next(e for e in roster if e.sid != old_sid)
+    out_dir = tmp_path / "out"
+
+    first = run_dispositions(main_fixture.pdf_path, segmented, {tag: old_sid}, roster, out_dir=out_dir, dpi=DPI)
+    old_path = next(r for r in first if r.packet_tag == tag).out_path
+    assert old_path.exists()
+
+    second = run_dispositions(
+        main_fixture.pdf_path,
+        segmented,
+        {tag: new_entry.sid},
+        roster,
+        out_dir=out_dir,
+        dpi=DPI,
+        allow_delete=False,
+    )
+    tag_result = next(r for r in second if r.packet_tag == tag)
+    assert tag_result.sid == new_entry.sid
+    assert tag_result.out_path.exists()
+    assert "deletion disabled" in (tag_result.reason or "")
+    assert tag_result.deletion_skipped
+    assert not any(r.deleted_path for r in second)
+    assert old_path.exists()  # stale file left in place, never removed
+
+
+# --- round-scoped processing: --round restricts a run to one round group's
+# packets, and that restriction must be enough on its own to protect every
+# other round's already-shipped output (2026-08-13) ---
+
+
+def test_filter_packets_by_round_keeps_only_matching_tags(main_fixture, segmented):
+    tags = [packet_tag(main_fixture.pdf_path, p) for p in segmented.packets]
+    round_labels = {t: ("2025-10" if i % 2 == 0 else "2026-03") for i, t in enumerate(tags)}
+    filtered = filter_packets_by_round(main_fixture.pdf_path, segmented, round_labels, "2025-10")
+    filtered_tags = {packet_tag(main_fixture.pdf_path, p) for p in filtered.packets}
+    assert filtered_tags == {t for t, label in round_labels.items() if label == "2025-10"}
+    assert filtered.page_count == segmented.page_count
+
+
+def test_round_scoped_run_never_touches_another_rounds_ledger(main_fixture, segmented, roster, tmp_path):
+    """The actual safety property --round exists for: a run filtered to one
+    round group must never delete, disturb, or even look up another round's
+    already-shipped output, because a packet outside the chosen round is
+    never iterated by run_dispositions at all."""
+    tags = [packet_tag(main_fixture.pdf_path, p) for p in segmented.packets]
+    assert len(tags) >= 2
+    round_labels = {tags[0]: "round_a", **{t: "round_b" for t in tags[1:]}}
+    out_dir = tmp_path / "out"
+
+    sid_a = _sid_for(roster, "Jordan Ames")
+    first = run_dispositions(main_fixture.pdf_path, segmented, {tags[0]: sid_a}, roster, out_dir=out_dir, dpi=DPI)
+    path_a = next(r for r in first if r.packet_tag == tags[0]).out_path
+    assert path_a.exists()
+
+    # A later "round_b" invocation rejects round_a's own tag (as if a
+    # reviewer had confirmed non-consent for it) -- but this run is scoped
+    # to round_b only, so tags[0] is filtered out and never iterated at
+    # all, and its already-shipped output must survive completely
+    # untouched, exactly as if this run had never seen its tag.
+    round_b_segmented = filter_packets_by_round(main_fixture.pdf_path, segmented, round_labels, "round_b")
+    assert tags[0] not in {packet_tag(main_fixture.pdf_path, p) for p in round_b_segmented.packets}
+    second = run_dispositions(
+        main_fixture.pdf_path, round_b_segmented, {tags[0]: None}, roster, out_dir=out_dir, dpi=DPI
+    )
+    assert not any(r.packet_tag == tags[0] for r in second)
+    assert not any(r.deleted_path for r in second)
+    assert path_a.exists()
+
+
+# --- analyze_redaction_holds: read-only hold-volume reporting, never
+# writes/redacts to disk or deletes anything (2026-08-13) ---
+
+
+def test_analyze_redaction_holds_never_writes_anything(main_fixture, segmented, roster, tmp_path):
+    out_dir = tmp_path / "out"
+    results = analyze_redaction_holds(main_fixture.pdf_path, segmented, roster, dpi=DPI)
+    assert not out_dir.exists()
+
+    tags_with_header = {
+        packet_tag(main_fixture.pdf_path, p) for p in segmented.packets if p.header_page_index is not None
+    }
+    assert {r.packet_tag for r in results} == tags_with_header
+
+
+def test_analyze_redaction_holds_agrees_with_a_real_run_for_a_clean_packet(main_fixture, segmented, roster, tmp_path):
+    clean_match_packet = segmented.packets[0]
+    tag = packet_tag(main_fixture.pdf_path, clean_match_packet)
+
+    results = analyze_redaction_holds(main_fixture.pdf_path, segmented, roster, dpi=DPI)
+    analysis = next(r for r in results if r.packet_tag == tag)
+    assert analysis.clean
+    assert not analysis.detection_hold
+    assert not analysis.uncovered_ink_hold
+    assert not analysis.leak_hold
+
+    sid = _sid_for(roster, "Jordan Ames")
+    out_dir = tmp_path / "out"
+    real = run_dispositions(main_fixture.pdf_path, segmented, {tag: sid}, roster, out_dir=out_dir, dpi=DPI)
+    real_result = next(r for r in real if r.packet_tag == tag)
+    assert not real_result.held_back
+    assert real_result.out_path is not None
+
+
+def test_format_hold_analysis_report_groups_by_round(main_fixture, segmented, roster):
+    round_labels = {packet_tag(main_fixture.pdf_path, p): FIXTURE_ROUND for p in segmented.packets}
+    results = analyze_redaction_holds(main_fixture.pdf_path, segmented, roster, round_labels, dpi=DPI)
+    report = format_hold_analysis_report(results)
+    assert FIXTURE_ROUND in report
+    assert "clean" in report
 
 
 def test_pending_packet_in_a_different_pdf_never_deletes_another_pdfs_approved_output(tmp_path):

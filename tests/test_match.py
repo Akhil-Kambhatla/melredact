@@ -2,7 +2,7 @@ import pdfplumber
 import pytest
 
 from melredact.config import MIN_SCORE
-from melredact.match import assign_all, propose, propose_held, score_pair
+from melredact.match import Candidate, MatchProposal, assign_all, propose, propose_held, score_pair
 from melredact.roster import HeldName, Roster, RosterEntry, load_roster
 from melredact.segment import extract_header_fields, segment_pdf
 from tests.make_fixture import (
@@ -188,6 +188,35 @@ def test_proposal_is_not_held_match_with_no_holds_file(main_fixture):
     assert roster.held_names == []
     for proposal in proposals:
         assert not proposal.is_held_match
+
+
+# --- round-scoped claiming: a student legitimately has one packet per
+# collection round (see blocks.py's round grouping), so claim-and-remove
+# must be scoped *within* a round group, never across the whole file.
+
+
+def test_same_student_matched_in_three_round_groups_auto_assigns_in_all_three():
+    proposals = [
+        MatchProposal(packet_tag="p1", candidates=[Candidate(sid="S1", score=95.0)]),
+        MatchProposal(packet_tag="p2", candidates=[Candidate(sid="S1", score=95.0)]),
+        MatchProposal(packet_tag="p3", candidates=[Candidate(sid="S1", score=95.0)]),
+    ]
+    round_labels = {"p1": "2025-10", "p2": "2026-02", "p3": "2026-03"}
+    assignments = assign_all(proposals, round_labels=round_labels)
+    assert assignments["p1"] == "S1"
+    assert assignments["p2"] == "S1"
+    assert assignments["p3"] == "S1"
+
+
+def test_two_packets_in_the_same_round_group_matching_same_student_second_abstains():
+    proposals = [
+        MatchProposal(packet_tag="p1", candidates=[Candidate(sid="S1", score=97.0)]),
+        MatchProposal(packet_tag="p2", candidates=[Candidate(sid="S1", score=90.0)]),
+    ]
+    round_labels = {"p1": "2026-03", "p2": "2026-03"}
+    assignments = assign_all(proposals, round_labels=round_labels)
+    assert assignments["p1"] == "S1"
+    assert assignments["p2"] is None
 
 
 def test_assign_all_never_assigns_a_sid_when_the_best_match_is_a_held_name():
