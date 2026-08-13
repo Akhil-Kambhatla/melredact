@@ -151,7 +151,7 @@ def test_output_path_is_teacher_period_sid_not_packet_tag(main_fixture, segmente
     result = next(r for r in results if r.packet_tag == tag)
     assert (
         result.out_path
-        == out_dir / entry.teacher_code / entry.period_display / packet.worksheet_type / f"{sid}.pdf"
+        == out_dir / entry.teacher_code / entry.period_display / packet.worksheet_type / "NA" / f"{sid}.pdf"
     )
     assert result.out_path == output_path(out_dir, entry, packet.worksheet_type)
 
@@ -289,6 +289,103 @@ def test_two_worksheet_types_for_same_student_do_not_collide_in_out(tmp_path, mo
 
     assert mpr_out != prt_out
     assert mpr_out.exists()  # writing PRT's output must not have clobbered MPR's
+
+
+# --- topic path segment, and the no-silent-overwrite backstop ---
+
+
+def test_topic_from_filename_extracts_the_trailing_segment():
+    from melredact.pipeline import topic_from_filename
+
+    assert topic_from_filename("010406_PD1_PRT_EW.pdf") == "EW"
+    assert topic_from_filename("010406_PD1_PRT_fo.pdf") == "FO"
+
+
+def test_topic_from_filename_defaults_to_NA_with_constant_path_depth(tmp_path, roster):
+    """No topic in the filename (the overwhelmingly common case, e.g. every
+    non-010406 teacher, or 010406's own filenames before a topic session)
+    must resolve to the stable NO_TOPIC literal, not an omitted segment --
+    otherwise output path depth would vary per teacher."""
+    from melredact.pipeline import NO_TOPIC, output_path, topic_from_filename
+
+    assert topic_from_filename("010406_PD1_PRT.pdf") == NO_TOPIC
+    assert topic_from_filename("Hannel MPR PD2.pdf") == NO_TOPIC
+
+    entry = next(iter(roster))
+    no_topic_path = output_path(tmp_path, entry, "PRT")
+    with_topic_path = output_path(tmp_path, entry, "PRT", "EW")
+    assert len(no_topic_path.relative_to(tmp_path).parts) == len(with_topic_path.relative_to(tmp_path).parts)
+    assert no_topic_path.parent.name == NO_TOPIC
+
+
+def test_different_topics_in_the_source_filename_do_not_collide(tmp_path, roster):
+    """Two scan files for the same teacher/period/worksheet_type but
+    different topics (the real motivating scenario: a teacher whose
+    students complete several PRT sessions, one per topic) must land at
+    distinct output paths purely from the topic segment, before the
+    no-silent-overwrite backstop is ever needed."""
+    from melredact.pipeline import output_path, topic_from_filename
+
+    entry = next(iter(roster))
+    ew_topic = topic_from_filename("010406_PD1_PRT_EW.pdf")
+    fr_topic = topic_from_filename("010406_PD1_PRT_FR.pdf")
+    ew_path = output_path(tmp_path, entry, "PRT", ew_topic)
+    fr_path = output_path(tmp_path, entry, "PRT", fr_topic)
+    assert ew_path != fr_path
+    assert ew_path.parent.name == "EW"
+    assert fr_path.parent.name == "FR"
+
+
+def test_second_packet_claiming_an_owned_path_gets_suffixed_not_overwritten(main_fixture, segmented, roster, tmp_path):
+    """The no-silent-overwrite backstop: two distinct packets in the same
+    scan file, both decided to the same student and worksheet type (the
+    within-file version of the multi-PRT-per-student scenario topic alone
+    doesn't disambiguate), must never let the second write clobber the
+    first -- it gets a numbered-suffix path instead, reported prominently."""
+    tag0 = packet_tag(main_fixture.pdf_path, segmented.packets[0])
+    tag1 = packet_tag(main_fixture.pdf_path, segmented.packets[1])
+    sid = _sid_for(roster, "Jordan Ames")
+    out_dir = tmp_path / "out"
+
+    results = run_dispositions(main_fixture.pdf_path, segmented, {tag0: sid, tag1: sid}, roster, out_dir=out_dir, dpi=DPI)
+    r0 = next(r for r in results if r.packet_tag == tag0)
+    r1 = next(r for r in results if r.packet_tag == tag1)
+
+    assert r0.out_path.name == f"{sid}.pdf"
+    assert r0.collision_note is None
+    assert r1.out_path.name == f"{sid}_2.pdf"
+    assert r1.collision_note is not None
+    assert tag0 in r1.collision_note
+    assert r0.out_path.exists()
+    assert r1.out_path.exists()
+    assert r0.out_path != r1.out_path
+
+
+def test_deleting_a_tags_output_removes_the_exact_suffixed_file_it_wrote(main_fixture, segmented, roster, tmp_path):
+    """The ledger stores the literal path each tag wrote (not just its SID),
+    specifically so a rejection or correction deletes the exact -- possibly
+    suffixed -- file that tag produced, never a path recomputed from the
+    SID (which would guess the un-suffixed path and delete nothing, or
+    worse, the *other* packet's file)."""
+    tag0 = packet_tag(main_fixture.pdf_path, segmented.packets[0])
+    tag1 = packet_tag(main_fixture.pdf_path, segmented.packets[1])
+    sid = _sid_for(roster, "Jordan Ames")
+    out_dir = tmp_path / "out"
+
+    first = run_dispositions(main_fixture.pdf_path, segmented, {tag0: sid, tag1: sid}, roster, out_dir=out_dir, dpi=DPI)
+    r0 = next(r for r in first if r.packet_tag == tag0)
+    r1 = next(r for r in first if r.packet_tag == tag1)
+    assert r0.out_path.exists()
+    assert r1.out_path.exists()
+
+    second = run_dispositions(
+        main_fixture.pdf_path, segmented, {tag0: sid, tag1: None}, roster, out_dir=out_dir, dpi=DPI
+    )
+    assert r0.out_path.exists(), "an unrelated tag's own output must survive another tag's rejection"
+    assert not r1.out_path.exists(), "the exact suffixed file this tag wrote must be removed"
+    deleted = [r for r in second if r.deleted_path == r1.out_path]
+    assert len(deleted) == 1
+    assert deleted[0].sid == sid
 
 
 def test_unknown_sid_in_decisions_is_held_back_not_raised(main_fixture, segmented, roster, tmp_path):

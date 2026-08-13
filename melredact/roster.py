@@ -219,6 +219,32 @@ def _load_held_names(roster_path: str | Path) -> list[HeldName]:
     return _parse_holds_csv(path) if path.exists() else []
 
 
+def _name_key(last: str, first: str) -> tuple[str, str]:
+    return (last.strip().lower(), first.strip().lower())
+
+
+def _check_no_roster_holds_overlap(entries: list[RosterEntry], held_names: list[HeldName]) -> None:
+    """A name that appears in both the roster and its holds sidecar is a
+    contradiction, not something to resolve by picking one silently: the
+    roster says this SID is trustworthy, the sidecar says this same student's
+    SID is not -- see the module docstring's "third state" section. Whoever
+    maintains these two files made a mistake (the roster was fixed and the
+    stale hold was never removed, or a hold was added for a student who
+    already has a valid roster row), and only a human looking at both files
+    can say which one is right; guessing here risks exactly the kind of
+    silent mislabeling `held_names` exists to prevent."""
+    roster_keys = {_name_key(e.last_name, e.first_name): e for e in entries}
+    for held in held_names:
+        key = _name_key(held.last_name, held.first_name)
+        if key in roster_keys:
+            entry = roster_keys[key]
+            raise RosterError(
+                f"{held.full_name!r} appears in both the roster (SID {entry.sid}) and its holds "
+                f"sidecar -- a name cannot be both a trustworthy roster entry and a held, "
+                "SID-unresolvable one; fix whichever file is stale before loading either"
+            )
+
+
 def _parse_roster_csv(path: str | Path) -> Roster:
     """Parse and validate the full roster CSV -- every period, every
     block -- with no narrowing. This is the one thing `load_roster` (scoped,
@@ -280,6 +306,7 @@ def _parse_roster_csv(path: str | Path) -> Roster:
 
             entries.append(entry)
 
+    _check_no_roster_holds_overlap(entries, held_names)
     return Roster(entries=entries, by_sid={e.sid: e for e in entries}, held_names=held_names)
 
 

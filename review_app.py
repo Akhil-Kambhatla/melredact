@@ -22,12 +22,24 @@ import argparse
 import sys
 from pathlib import Path
 
-import pdfplumber
 import streamlit as st
 from PIL import Image
 
+from melredact.blocks import (
+    BlockMeaning,
+    BlockResolution,
+    collect_packet_dates,
+    decisions_scope_mismatches,
+    disagreeing_packets,
+    format_resolution_report,
+    load_block_metadata,
+    normalize_block,
+    resolve_block,
+    save_resolved_block_record,
+)
 from melredact.config import CACHE_DIR, HEADER_BAND_FALLBACK, MIN_MARGIN, MIN_SCORE, RENDER_DPI_PREVIEW
 from melredact.match import assign_all
+from melredact.pdfio import open_pdf
 from melredact.pipeline import (
     list_manual_queue,
     load_decisions,
@@ -41,7 +53,7 @@ from melredact.pipeline import (
     save_detection_overrides,
 )
 from melredact.redact import HeaderBand, render_redaction_preview
-from melredact.roster import Roster, RosterError, load_roster
+from melredact.roster import Roster, RosterError, infer_period_from_filename, load_roster
 from melredact.segment import Packet, SegmentResult, extract_header_fields, segment_pdf
 
 DPI = RENDER_DPI_PREVIEW
@@ -57,7 +69,25 @@ def _parse_args() -> argparse.Namespace:
         "--period",
         default=None,
         help="restrict matching to this period's block of the roster (e.g. '2' or '02'); "
-        "inferred from the scan filename (e.g. 'PD2') if omitted",
+        "inferred from the scan filename (e.g. 'PD2') if omitted. Ignored when the roster has a "
+        "<roster_stem>_blocks.json sidecar -- see --class-period below.",
+    )
+    parser.add_argument(
+        "--class-period",
+        type=int,
+        default=None,
+        dest="class_period",
+        help="class period this scan belongs to, ONLY meaningful when the roster has a "
+        "<roster_stem>_blocks.json sidecar (see melredact/blocks.py) -- in that case the scan "
+        "filename's 'PDn' means class period, never roster block, and this overrides that "
+        "inference. Ignored entirely when no block metadata sidecar exists.",
+    )
+    parser.add_argument(
+        "--block",
+        default=None,
+        help="explicit block override, ONLY meaningful when block metadata exists -- for when "
+        "packet dates can't be resolved automatically. Still requires ticking the on-screen "
+        "confirmation before any packet is shown.",
     )
     return parser.parse_args(sys.argv[1:])
 
@@ -65,6 +95,23 @@ def _parse_args() -> argparse.Namespace:
 @st.cache_data(show_spinner="Segmenting PDF into packets...")
 def _segment(pdf_path: str) -> SegmentResult:
     return segment_pdf(pdf_path)
+
+
+def _block_metadata(roster_path: str):
+    # Not cache_data: cheap (one small JSON read), and load_block_metadata
+    # returns None for the overwhelmingly common case -- no reason to pay
+    # cache bookkeeping for that.
+    return load_block_metadata(roster_path)
+
+
+@st.cache_data(show_spinner="Reading packet dates for block resolution...")
+def _block_resolution(pdf_path: str, class_period: int, roster_path: str) -> BlockResolution:
+    # roster_path is only here to key the cache correctly if the sidecar
+    # ever changes between reruns -- resolve_block itself only reads
+    # `metadata`, recomputed fresh by the caller (cheap, see _block_metadata).
+    metadata = load_block_metadata(roster_path)
+    dates = collect_packet_dates(pdf_path)
+    return resolve_block(dates, class_period, metadata)
 
 
 @st.cache_data(show_spinner="Loading roster...")
@@ -88,7 +135,7 @@ def _header_fields(pdf_path: str, page_index: int):
     disk cache in place that call is now cheap even on a cold cache, but
     there's no reason to repeat even the in-memory anchor-location work
     on every rerun within one session."""
-    with pdfplumber.open(pdf_path) as pdf:
+    with open_pdf(pdf_path) as pdf:
         return extract_header_fields(pdf.pages[page_index])
 
 
@@ -98,7 +145,7 @@ def _page_image(pdf_path: str, page_index: int, dpi: int) -> Image.Image:
     if cache_file.exists():
         return Image.open(cache_file).convert("RGB")
     cache_file.parent.mkdir(parents=True, exist_ok=True)
-    with pdfplumber.open(pdf_path) as pdf:
+    with open_pdf(pdf_path) as pdf:
         image = pdf.pages[page_index].to_image(resolution=dpi).original.convert("RGB")
     image.save(cache_file)
     return image
@@ -154,7 +201,9 @@ def _set_detection_override(pdf_path: str, decisions_dir: str, tag: str, approve
     save_detection_overrides(pdf_path, st.session_state.detection_overrides, decisions_dir=Path(decisions_dir))
 
 
-def _render_sidebar(args: argparse.Namespace, segmented: SegmentResult, roster: Roster) -> None:
+def _render_sidebar(
+    args: argparse.Namespace, segmented: SegmentResult, roster: Roster, resolved_block: BlockMeaning | None = None
+) -> None:
     decisions = st.session_state.decisions
     n_pending = sum(1 for p in segmented.packets if packet_tag(args.pdf_path, p) not in decisions)
     n_consented = sum(1 for sid in decisions.values() if sid is not None)
@@ -164,6 +213,8 @@ def _render_sidebar(args: argparse.Namespace, segmented: SegmentResult, roster: 
     st.sidebar.text(f"Scan: {Path(args.pdf_path).name}")
     period_note = f", period {roster.entries[0].period_display}" if roster.entries else ""
     st.sidebar.text(f"Roster: {len(roster)} students{period_note}")
+    if resolved_block is not None:
+        st.sidebar.text(f"Block: {resolved_block.describe()}")
     st.sidebar.metric("Packets", len(segmented.packets))
     st.sidebar.write(f"⏳ Pending: {n_pending}  ✅ Approved: {n_consented}  🚫 Rejected: {n_rejected}")
 
@@ -186,10 +237,20 @@ def _render_sidebar(args: argparse.Namespace, segmented: SegmentResult, roster: 
             held_back = [r for r in results if r.held_back]
             consent_held = [r for r in results if r.consent_hold]
             overridden = [r for r in written if r.reason]
+            collided = [r for r in written if r.collision_note]
             st.sidebar.success(
-                f"{len(written)} written, {deleted} deleted, {len(held_back)} held back for review, "
-                f"{len(consent_held)} consent-held (no SID), {pending} still pending review"
+                f"{len(written)} written ({len(collided)} collision(s) avoided), {deleted} deleted, "
+                f"{len(held_back)} held back for review, {len(consent_held)} consent-held (no SID), "
+                f"{pending} still pending review"
             )
+            for r in collided:
+                # A different packet's output already claimed this packet's
+                # natural path this run -- see pipeline.py's
+                # _claim_output_path. Written to a numbered-suffix path
+                # instead of silently overwriting; surfaced prominently so
+                # a reviewer notices and doesn't assume the natural path is
+                # this packet's file.
+                st.sidebar.warning(f"Collision avoided: {r.packet_tag}: {r.collision_note}")
             for r in consent_held:
                 # Never a "needs fixing" item like held_back -- a permanent
                 # structural state (see pipeline.py's consent_hold), shown
@@ -281,7 +342,7 @@ def _render_manual_queue(args: argparse.Namespace, roster: Roster, packet_by_tag
 
             draft_path = manual_queue_draft_path(args.out_dir, args.pdf_path, tag)
             if draft_path.exists():
-                with pdfplumber.open(draft_path) as pdf:
+                with open_pdf(draft_path) as pdf:
                     draft_image = pdf.pages[0].to_image(resolution=DPI).original.convert("RGB")
                 st.image(draft_image, caption="Drafted redaction attempt that was held back -- not safe to ship as is")
 
@@ -315,8 +376,19 @@ def _render_manual_queue(args: argparse.Namespace, roster: Roster, packet_by_tag
 
 
 def _render_packet(
-    args: argparse.Namespace, packet: Packet, tag: str, roster: Roster, proposal, auto_assignments, tags: list[str]
+    args: argparse.Namespace,
+    packet: Packet,
+    tag: str,
+    roster: Roster,
+    proposal,
+    auto_assignments,
+    tags: list[str],
+    resolved_block: BlockMeaning | None = None,
+    disagreeing_tags: frozenset[str] = frozenset(),
 ) -> None:
+    if resolved_block is not None:
+        st.caption(f"Approving into: {resolved_block.describe()}")
+
     if packet.issues:
         st.warning(
             "This packet has unresolved segmentation issues and cannot be assigned a SID "
@@ -386,6 +458,13 @@ def _render_packet(
         col2.image(preview_image, caption=preview_caption)
 
         _render_field_table(fields)
+        if tag in disagreeing_tags:
+            st.warning(
+                f"This packet's own date ({fields.date_text!r}) disagrees with the file's resolved "
+                "collection round -- shown for awareness, not held or blocked (see the block "
+                "resolution banner above; students get their own written date wrong often enough "
+                "that a single packet's date is a flag, not a signal to act on)."
+            )
         _render_candidates(proposal, top5, roster, auto_assignments, tag)
 
     with st.expander("Search the full roster"):
@@ -444,6 +523,96 @@ def _render_packet(
         st.caption("Recorded: pending (not yet reviewed)")
 
 
+def _resolve_class_period(args: argparse.Namespace) -> int | None:
+    if args.class_period is not None:
+        return args.class_period
+    inferred = infer_period_from_filename(args.pdf_path)
+    return int(inferred) if inferred is not None else None
+
+
+def _render_block_gate(args: argparse.Namespace) -> tuple[BlockMeaning, frozenset[str]] | None:
+    """Shows the block-resolution banner and, once resolved, a mandatory
+    confirmation checkbox -- returns (chosen_block, disagreeing_packet_tags)
+    only once a human has ticked it for this exact block; returns None
+    otherwise, telling `main` to stop rendering anything else (sidebar,
+    packet selector, packets) below this point. Only ever called when
+    `_block_metadata` found a sidecar -- see main()'s own gate on that.
+
+    This mirrors cli.py's own --confirm-block gate, just as an on-screen
+    checkbox instead of a flag: no automated check can ever tell a packet
+    correctly assigned to one block from the same packet wrongly assigned
+    to another block with the same student names (see blocks.py's module
+    docstring), so a human reading the report and explicitly confirming it
+    is the only defense available, on either surface.
+    """
+    metadata = _block_metadata(args.roster_path)
+    class_period = _resolve_class_period(args)
+    if class_period is None:
+        st.error(
+            "Block metadata exists for this roster, but no --class-period was given and none "
+            "could be inferred from the scan filename (expected something like 'PD1') -- restart "
+            "with --class-period passed explicitly."
+        )
+        return None
+
+    resolution = _block_resolution(args.pdf_path, class_period, args.roster_path)
+
+    st.header("Block resolution")
+    st.code(format_resolution_report(resolution), language=None)
+
+    chosen_block: BlockMeaning | None = None
+    if args.block is not None:
+        block_code = normalize_block(args.block)
+        if block_code not in metadata.blocks:
+            st.error(
+                f"--block {args.block!r} is not defined in this roster's block metadata "
+                f"(known blocks: {sorted(metadata.blocks)})."
+            )
+            return None
+        chosen_block = metadata.blocks[block_code]
+        st.info(f"Explicit --block override in use: {chosen_block.describe()}")
+    elif resolution.resolved:
+        chosen_block = resolution.chosen_block
+
+    if chosen_block is None:
+        st.error(
+            "Could not resolve a block from packet dates and no --block override was given -- "
+            "restart with --block <NN> passed explicitly to proceed."
+        )
+        return None
+
+    confirm_key = f"block_confirmed_{Path(args.pdf_path).stem}_{chosen_block.block}"
+    confirmed = st.checkbox(
+        f"I have read the resolution report above and confirm this review session should use "
+        f"**{chosen_block.describe()}**.",
+        key=confirm_key,
+    )
+    if not confirmed:
+        st.info("Tick the box above to continue -- no packets are shown until the block is confirmed.")
+        return None
+
+    decisions = load_decisions(args.pdf_path, decisions_dir=Path(args.decisions_dir))
+    mismatches = decisions_scope_mismatches(decisions, chosen_block.block)
+    if mismatches:
+        offending = ", ".join(f"{t} (sid {sid})" for t, sid in mismatches)
+        st.error(
+            f"Decisions already recorded for this scan are scoped to a different block than "
+            f"{chosen_block.describe()}: {offending}. Either this session's block is wrong, or "
+            "these decisions were recorded under a different block -- resolve the discrepancy "
+            "before continuing."
+        )
+        return None
+
+    save_resolved_block_record(args.pdf_path, chosen_block, decisions_dir=Path(args.decisions_dir))
+    disagreeing = frozenset(disagreeing_packets(resolution))
+    if disagreeing:
+        st.warning(
+            f"{len(disagreeing)} packet(s) have their own date disagreeing with the file's resolved "
+            f"majority (flagged next to each affected packet's date, not blocked): {sorted(disagreeing)}"
+        )
+    return chosen_block, disagreeing
+
+
 def main() -> None:
     st.set_page_config(page_title="MEL MPR+ADR review", layout="wide")
     args = _parse_args()
@@ -456,17 +625,28 @@ def main() -> None:
         return
 
     segmented = _segment(args.pdf_path)
+
+    resolved_block: BlockMeaning | None = None
+    disagreeing_tags: frozenset[str] = frozenset()
+    period_for_roster = args.period
+    if _block_metadata(args.roster_path) is not None:
+        gate = _render_block_gate(args)
+        if gate is None:
+            return
+        resolved_block, disagreeing_tags = gate
+        period_for_roster = resolved_block.block
+
     try:
-        roster = _roster(args.roster_path, args.pdf_path, args.period)
+        roster = _roster(args.roster_path, args.pdf_path, period_for_roster)
     except RosterError as exc:
         st.error(f"Roster error: {exc}")
         return
-    proposals = _proposals(args.pdf_path, args.roster_path, args.period)
+    proposals = _proposals(args.pdf_path, args.roster_path, period_for_roster)
     auto_assignments = assign_all(proposals)
     proposals_by_tag = {p.packet_tag: p for p in proposals}
 
     _init_state(args.pdf_path, args.decisions_dir)
-    _render_sidebar(args, segmented, roster)
+    _render_sidebar(args, segmented, roster, resolved_block)
 
     tags = [packet_tag(args.pdf_path, p) for p in segmented.packets]
     packet_by_tag = dict(zip(tags, segmented.packets))
@@ -500,7 +680,7 @@ def main() -> None:
     packet = packet_by_tag[tag]
     status = _status_icon(tag, packet, st.session_state.decisions, proposals_by_tag.get(tag))
     st.subheader(f"{status} Packet {tag} ({packet.n_pages} page{'s' if packet.n_pages != 1 else ''})")
-    _render_packet(args, packet, tag, roster, proposals_by_tag[tag], auto_assignments, tags)
+    _render_packet(args, packet, tag, roster, proposals_by_tag[tag], auto_assignments, tags, resolved_block, disagreeing_tags)
 
 
 if __name__ == "__main__":

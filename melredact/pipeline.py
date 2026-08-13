@@ -163,15 +163,15 @@ might belong to an entirely different pdf.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import pdfplumber
-
 from melredact.config import RENDER_DPI_FINAL
 from melredact.match import HeldCandidate, MatchProposal, propose
+from melredact.pdfio import open_pdf
 from melredact.redact import HeaderBand, verify_no_leaked_names
 from melredact.redact import redact_packet as _redact_packet
 from melredact.roster import Roster, RosterEntry
@@ -181,45 +181,110 @@ DECISIONS_DIR = Path("decisions")
 OUT_DIR = Path("out")
 MANUAL_QUEUE_DIRNAME = ".manual_queue"
 
+# A worksheet-type collision can still happen *within* one worksheet type,
+# once one teacher's students legitimately complete the same worksheet type
+# more than once (teacher 010406: several PRT sessions, one per topic). Each
+# session is its own scan file named <teacher>_PD<n>_<TYPE>[_<TOPIC>].pdf, so
+# the topic -- read from the *filename*, not the footer, since a topic isn't
+# part of the worksheet's own printed content -- disambiguates sessions the
+# same way worksheet_type already disambiguates worksheet types. NO_TOPIC is
+# a stable literal, not an omitted segment, so every teacher's output sits at
+# the same path depth regardless of whether their filenames carry a topic.
+NO_TOPIC = "NA"
+_TOPIC_FROM_FILENAME = re.compile(r"^[^_]+_PD\d+_[^_]+_([A-Za-z0-9]+)$", re.IGNORECASE)
+
 
 def packet_tag(pdf_path: str | Path, packet: Packet) -> str:
     return f"{Path(pdf_path).stem}_p{packet.page_indices[0]:03d}"
 
 
-def output_path(out_dir: str | Path, entry: RosterEntry, worksheet_type: str) -> Path:
+def topic_from_filename(pdf_path: str | Path) -> str:
+    """Best-effort topic code from a source scan's own filename, e.g.
+    "010406_PD1_PRT_EW.pdf" -> "EW". Returns NO_TOPIC, never raises, when the
+    filename doesn't carry a fourth underscore-separated segment (every
+    teacher except the ones with per-topic worksheets) or doesn't match the
+    expected <teacher>_PD<n>_<TYPE>[_<TOPIC>] shape at all (e.g. the older
+    "Hannel MPR PD2.pdf" naming) -- a missing topic is the overwhelmingly
+    common case, not a data problem to fail loudly over."""
+    m = _TOPIC_FROM_FILENAME.match(Path(pdf_path).stem)
+    return m.group(1).upper() if m else NO_TOPIC
+
+
+def output_path(out_dir: str | Path, entry: RosterEntry, worksheet_type: str, topic: str = NO_TOPIC) -> Path:
     """Where a confirmed packet for this roster entry lands:
-    out/<teacher_code>/<period>/<worksheet_type>/<SID>.pdf. `entry.
+    out/<teacher_code>/<period>/<worksheet_type>/<topic>/<SID>.pdf. `entry.
     teacher_code` and `entry.period_display` are the SID's own digits
     (positions 0:6 and 6:8), not anything read off the packet, so those two
     segments are stable and derivable from the SID alone. `worksheet_type`
     is *not* derivable from the SID -- a student has one SID but multiple
     worksheet types (MPR, PRT, ...) -- so it must come from the packet's own
     footer (see Packet.worksheet_type); omitting it is exactly the bug that
-    let an MPR and a PRT packet for the same student collide on one path."""
-    return Path(out_dir) / entry.teacher_code / entry.period_display / worksheet_type / f"{entry.sid}.pdf"
+    let an MPR and a PRT packet for the same student collide on one path.
+    `topic` (see topic_from_filename) defaults to NO_TOPIC so every caller
+    that hasn't been updated for per-topic worksheets keeps computing the
+    exact same path as before this segment existed."""
+    return Path(out_dir) / entry.teacher_code / entry.period_display / worksheet_type / topic / f"{entry.sid}.pdf"
 
 
 def ledger_path(out_dir: str | Path, pdf_path: str | Path) -> Path:
     """Where run_dispositions persists, for this (out_dir, source pdf) pair,
-    which SID it last wrote output for under each packet_tag -- see the
-    module docstring's "Deletion is ledger-based" section. Colocated under
-    out_dir itself (a hidden `.ledger` subdirectory), not decisions_dir:
-    this is bookkeeping about what's actually sitting in *this* output
-    tree, derived, not a human-editable decision."""
+    which SID and exact path it last wrote output to under each packet_tag
+    -- see the module docstring's "Deletion is ledger-based" section.
+    Colocated under out_dir itself (a hidden `.ledger` subdirectory), not
+    decisions_dir: this is bookkeeping about what's actually sitting in
+    *this* output tree, derived, not a human-editable decision."""
     return Path(out_dir) / ".ledger" / f"{Path(pdf_path).stem}.json"
 
 
-def _load_ledger(out_dir: str | Path, pdf_path: str | Path) -> dict[str, str]:
+def _load_ledger(out_dir: str | Path, pdf_path: str | Path) -> dict[str, dict]:
+    """Each entry is {"sid": ..., "path": ...} -- the literal path this tag
+    last wrote to, not just the SID. Storing the path (not recomputing it
+    from the SID at delete time) is what lets deletion correctly target a
+    suffixed file (see _claim_output_path) rather than the un-suffixed path
+    a fresh recomputation would guess."""
     path = ledger_path(out_dir, pdf_path)
     if not path.exists():
         return {}
     return json.loads(path.read_text())
 
 
-def _save_ledger(out_dir: str | Path, pdf_path: str | Path, ledger: dict[str, str]) -> None:
+def _save_ledger(out_dir: str | Path, pdf_path: str | Path, ledger: dict[str, dict]) -> None:
     path = ledger_path(out_dir, pdf_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(ledger, indent=2, sort_keys=True))
+
+
+def _claim_output_path(
+    ledger: dict[str, dict], tag: str, out_dir: str | Path, entry: RosterEntry, worksheet_type: str, topic: str
+) -> tuple[Path, str | None]:
+    """The natural output path for this packet, unless that exact path
+    already exists on disk *and* this run's own ledger attributes it to a
+    different packet_tag -- in which case a numbered-suffix alternative
+    (`<SID>_2.pdf`, `_3.pdf`, ...) is returned instead, so one packet's
+    output can never silently replace another's. This is a backstop for the
+    case the topic path segment (see output_path) doesn't fully disambiguate
+    on its own: two distinct packets in the *same* scan file, decided to the
+    same student and worksheet type (a teacher whose students genuinely
+    complete the same worksheet+topic more than once). Re-running the same
+    tag against its own previously-claimed path is not a collision -- the
+    ledger lookup excludes `tag` itself, so a packet re-processed after a
+    decision change keeps overwriting its own prior file exactly as before.
+    """
+    base_path = output_path(out_dir, entry, worksheet_type, topic)
+    owner_tag = next((t for t, e in ledger.items() if t != tag and e.get("path") == str(base_path)), None)
+    if owner_tag is None or not base_path.exists():
+        return base_path, None
+
+    n = 2
+    while True:
+        candidate = base_path.with_name(f"{base_path.stem}_{n}{base_path.suffix}")
+        if not candidate.exists():
+            note = (
+                f"{base_path} is already this run's output for packet {owner_tag!r} -- "
+                f"wrote {candidate.name} instead of silently overwriting it"
+            )
+            return candidate, note
+        n += 1
 
 
 def manual_queue_dir(out_dir: str | Path, pdf_path: str | Path) -> Path:
@@ -320,11 +385,18 @@ def release_from_manual_queue(
     either check with the human's own corrected geometry stays queued, with
     no file written anywhere -- the automated checks always have the final
     say, regardless of who supplied the geometry.
+
+    Goes through the same `_claim_output_path` collision check as an
+    ordinary write in `run_dispositions` -- a manually-released packet is
+    just as capable of colliding with another packet's already-claimed
+    output path as an automatic one.
     """
     if sid not in roster:
         return ManualReleaseResult(packet_tag=tag, sid=sid, released=False, reason=f"sid {sid!r} not on roster")
     entry = roster.by_sid[sid]
-    out_path = output_path(out_dir, entry, packet.worksheet_type)
+    topic = topic_from_filename(pdf_path)
+    ledger = _load_ledger(out_dir, pdf_path)
+    out_path, collision_note = _claim_output_path(ledger, tag, out_dir, entry, packet.worksheet_type, topic)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     stamp_lines = [f"SID: {entry.sid}", f"PD: {entry.period_display}"]
     redact_result = _redact_packet(
@@ -346,10 +418,9 @@ def release_from_manual_queue(
         )
 
     _clear_manual_queue_entry(out_dir, pdf_path, tag)
-    ledger = _load_ledger(out_dir, pdf_path)
-    ledger[tag] = sid
+    ledger[tag] = {"sid": sid, "path": str(out_path)}
     _save_ledger(out_dir, pdf_path, ledger)
-    return ManualReleaseResult(packet_tag=tag, sid=sid, released=True, out_path=out_path)
+    return ManualReleaseResult(packet_tag=tag, sid=sid, released=True, out_path=out_path, reason=collision_note)
 
 
 def decisions_path(pdf_path: str | Path, decisions_dir: Path = DECISIONS_DIR) -> Path:
@@ -406,7 +477,7 @@ def propose_all(pdf_path: str | Path, segmented: SegmentResult, roster: Roster) 
     Name field to score at all, so they always abstain with an empty
     candidate list rather than being skipped."""
     proposals = []
-    with pdfplumber.open(pdf_path) as pdf:
+    with open_pdf(pdf_path) as pdf:
         for packet in segmented.packets:
             tag = packet_tag(pdf_path, packet)
             if packet.header_page_index is None:
@@ -428,7 +499,7 @@ def _held_match_for_packet(pdf_path: str | Path, packet: Packet, roster: Roster)
     "OCR is disk-cached" section) -- this isn't a second expensive pass."""
     if packet.header_page_index is None:
         return None
-    with pdfplumber.open(pdf_path) as pdf:
+    with open_pdf(pdf_path) as pdf:
         fields = extract_header_fields(pdf.pages[packet.header_page_index])
     proposal = propose(packet_tag(pdf_path, packet), fields.name_text, roster)
     return proposal.top_held if proposal.is_held_match else None
@@ -477,6 +548,13 @@ class DispositionResult:
     # bucket. `reason` is set together with this, same convention as
     # held_back.
     consent_hold: bool = False
+    # Set only when this packet's natural output path was already claimed
+    # (per this run's own ledger) by a different packet_tag -- see
+    # _claim_output_path. The write still happened, just to a numbered-
+    # suffix path instead of the natural one, and this must be surfaced
+    # prominently (cli.py's run summary, review_app.py's sidebar) rather
+    # than looking like an ordinary clean write.
+    collision_note: str | None = None
 
 
 def run_dispositions(
@@ -524,15 +602,15 @@ def run_dispositions(
     ledger = _load_ledger(out_dir, pdf_path)
     ledger_dirty = False
     results: list[DispositionResult] = []
+    topic = topic_from_filename(pdf_path)
 
-    def _delete_stale_output(stale_sid: str, worksheet_type: str) -> None:
+    def _delete_stale_output(stale_path: Path, stale_sid: str) -> None:
         # Deliberately doesn't touch `ledger` -- callers own that, since
         # what the ledger entry should become afterward differs (removed
         # entirely for a rejection, replaced with the new SID for a
-        # correction).
-        if stale_sid not in roster:
-            return
-        stale_path = output_path(out_dir, roster.by_sid[stale_sid], worksheet_type)
+        # correction). Deletes the *literal* path this tag's ledger entry
+        # recorded, not a path recomputed from the SID -- a recomputed path
+        # would miss a suffixed file written by _claim_output_path.
         if stale_path.exists():
             stale_path.unlink()
             results.append(DispositionResult(packet_tag=None, sid=stale_sid, pending=False, deleted_path=stale_path))
@@ -556,15 +634,16 @@ def run_dispositions(
             continue
 
         sid = decisions[tag]
-        prior_sid = ledger.get(tag)
+        prior_entry = ledger.get(tag)
+        prior_sid = prior_entry["sid"] if prior_entry else None
 
         if sid is None:
             # Confirmed non-consent. Delete only the file *this exact tag*
-            # previously wrote (per the ledger), never anything else in
-            # out_dir -- this is the whole point of the ledger over a
-            # directory sweep.
-            if prior_sid is not None and packet.worksheet_type is not None:
-                _delete_stale_output(prior_sid, packet.worksheet_type)
+            # previously wrote (per the ledger's own recorded path), never
+            # anything else in out_dir -- this is the whole point of the
+            # ledger over a directory sweep.
+            if prior_entry is not None:
+                _delete_stale_output(Path(prior_entry["path"]), prior_sid)
                 ledger.pop(tag, None)
                 ledger_dirty = True
             results.append(DispositionResult(packet_tag=tag, sid=None, pending=False))
@@ -598,7 +677,7 @@ def run_dispositions(
             continue
 
         entry = roster.by_sid[sid]
-        out_path = output_path(out_dir, entry, packet.worksheet_type)
+        out_path, collision_note = _claim_output_path(ledger, tag, out_dir, entry, packet.worksheet_type, topic)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         stamp_lines = [f"SID: {entry.sid}", f"PD: {entry.period_display}"]
         redact_result = _redact_packet(pdf_path, packet, out_path, dpi=dpi, flatten=flatten, stamp_lines=stamp_lines)
@@ -656,16 +735,25 @@ def run_dispositions(
             continue
 
         results.append(
-            DispositionResult(packet_tag=tag, sid=sid, pending=False, out_path=out_path, reason=detection_note)
+            DispositionResult(
+                packet_tag=tag,
+                sid=sid,
+                pending=False,
+                out_path=out_path,
+                reason=detection_note,
+                collision_note=collision_note,
+            )
         )
 
         # A correction (this tag's approved SID changed from a previously
         # written one) supersedes the old file -- delete it as a direct
         # consequence of *this* explicit new decision, once the new file is
-        # confirmed written and clean, not as a background sweep.
-        if prior_sid is not None and prior_sid != sid:
-            _delete_stale_output(prior_sid, packet.worksheet_type)
-        ledger[tag] = sid
+        # confirmed written and clean, not as a background sweep. Deletes
+        # the ledger's own recorded path, not a recomputed one, same as the
+        # non-consent case above.
+        if prior_entry is not None and prior_sid != sid:
+            _delete_stale_output(Path(prior_entry["path"]), prior_sid)
+        ledger[tag] = {"sid": sid, "path": str(out_path)}
         ledger_dirty = True
 
     if ledger_dirty:

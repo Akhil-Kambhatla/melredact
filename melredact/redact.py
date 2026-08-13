@@ -52,7 +52,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
-import pdfplumber
 import pikepdf
 from rapidfuzz import fuzz
 from PIL import Image, ImageDraw, ImageFont
@@ -83,6 +82,7 @@ from melredact.config import (
     STAMP_LINE_SPACING_PT,
     STAMP_PADDING_PT,
 )
+from melredact.pdfio import open_pdf
 from melredact.roster import Roster
 from melredact.segment import (
     HeaderAnchors,
@@ -683,7 +683,7 @@ def redact_packet(
     treat a non-empty `RedactResult.uncovered_group_words` as a failure,
     the same way they already do verify_no_leaked_names findings.
     """
-    with pdfplumber.open(pdf_path) as pdf:
+    with open_pdf(pdf_path) as pdf:
         band: HeaderBand | None = None
         left_bbox: Bbox | None = None
         right_bbox: Bbox | None = None
@@ -788,7 +788,7 @@ def verify_no_leaked_names(pdf_path: str | Path, roster: Roster) -> list[LeakFin
             roster_tokens[entry.sid] = toks
 
     findings: list[LeakFinding] = []
-    with pdfplumber.open(pdf_path) as pdf:
+    with open_pdf(pdf_path) as pdf:
         for page_index, page in enumerate(pdf.pages):
             page_tokens = {t for t in _tokenize(page.extract_text() or "") if len(t) >= MIN_NAME_CHARS}
             if not page_tokens:

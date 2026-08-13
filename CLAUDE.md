@@ -230,6 +230,19 @@ worth surfacing, neither worth silently picking a winner between.
 
 ## Held names: a third state, for a consented student with no trustworthy SID
 
+**Superseded for 010406 specifically, 2026-08-13 (same day, later): the
+supervisor reissued `data/teacher_codes/010406.csv` as a clean two-block
+roster** (block 01/02 = plain class periods 1/2, unique SIDs, no gaps, no
+repeated names) — see "Teacher 010406 roster reissue" near the end of this
+file. `010406_holds.csv` (the sidecar the corrupted export below motivated)
+and `010406_blocks.json` (see "Date-driven block resolution" below) were
+both retired: the new roster has nothing to hold and its blocks are plain
+periods, not period+round pairs. The held-names *feature* stays fully
+intact in the codebase for any other teacher whose roster arrives
+corrupted the same way — only this specific teacher's sidecar is gone.
+The original incident is kept below verbatim, since it's still the
+motivating case for why this feature exists at all.
+
 **Added 2026-08-13, motivated by a real corrupted export: `data/
 teacher_codes/010406.csv`.** Block 04 of that roster had two SIDs each
 claimed by two different students (`0104060410`: Matheuir/Ailer *and*
@@ -336,6 +349,222 @@ scan — so it was added to `data/teacher_codes/010406_holds.csv` by hand,
 and removed from the main roster CSV (an SID flagged as untrustworthy
 can't also sit in the roster as if it were a normal, trustworthy entry —
 that would defeat the entire point of holding it).
+
+## Date-driven block resolution: a block can encode more than period
+
+**Superseded for 010406 specifically, 2026-08-13 (same day, later): the
+reissued roster's two blocks are plain class periods, not period+round
+pairs, so `010406_blocks.json` was retired and this feature no longer
+applies to this teacher at all** — see "Teacher 010406 roster reissue" near
+the end of this file, which also downgrades date-driven resolution to a
+purely informational month histogram (never gating) for any teacher with
+no `_blocks.json` sidecar. The feature itself, and everything below, stays
+exactly as built for the next teacher whose roster blocks really do encode
+more than period.
+
+**Added 2026-08-13, motivated by a real teacher, 010406, whose four roster
+blocks encode class period *and* collection round together, not class
+period alone:** block 01 = class period 1/February, 02 = class period
+1/March, 03 = class period 2/February, 04 = class period 2/March. Blocks
+01 and 02 — and separately, 03 and 04 — contain the **identical 14
+students**, since the same class was scanned twice, once per collection
+round. A scan named `010406_PD1_PRT.pdf` is unambiguous about class period
+(1) but says nothing about which round — the old filename-only inference
+(`roster.infer_period_from_filename`, "PD1" → block "01") would resolve
+straight to block 01, silently wrong for a March scan. This is severe in a
+way ordinary abstain-and-flag can't catch: because the two blocks share
+names, a wrong block still produces perfect-looking high-confidence
+matches, a review UI showing correct names, human approval, and every SID
+in the file wrong by exactly 100 — and `verify` only ever checks for a
+*leaked* name, never for "assigned to the correct one of two identically-
+named students," so nothing downstream would ever object.
+
+**Block metadata sidecar, entirely additive.** A roster CSV may have an
+optional `data/teacher_codes/<teacher_code>_blocks.json`
+(`melredact/blocks.py`'s `load_block_metadata`/`blocks_path`, mirroring
+`roster.py`'s `_holds.csv` sidecar pattern) mapping each block code to
+what it actually means: `{"teacher_code": "010406", "blocks": {"01":
+{"class_period": 1, "month": 2}, "02": {"class_period": 1, "month": 3},
+...}}`. When this file doesn't exist for a teacher (every teacher except
+010406, as of this writing), `load_block_metadata` returns `None` and
+every caller (`cli.py run`, `review_app.py`) checks that first and falls
+straight through to the existing `--period`/filename-inference path with
+*zero* change to behavior, output, or command line — this was a hard
+requirement, verified by a dedicated regression test
+(`test_no_block_metadata_sidecar_behaves_exactly_as_before`,
+`tests/test_blocks.py`) that runs `cli.py run` against the ordinary
+synthetic fixture with no `--confirm-block`/`--class-period`/`--block`
+flags at all and asserts `rc == 0`, exactly as before this feature
+existed.
+
+**Resolution is file-level, never per-packet — this is the actual safety
+property, not an implementation detail.** One scanned PDF is one
+collection session: a teacher scans a whole class's worksheets from a
+single sitting, so the file has exactly one round, and every packet in it
+belongs to the same block. `blocks.resolve_block` takes the **majority**
+parsed month across *every* packet in the file (`blocks.
+collect_packet_dates`, which segments the PDF and OCR's each header page's
+already-extracted `date_text` field — the same `extract_header_fields`
+call `propose_all` already makes, no new OCR bbox) and only resolves a
+block when both hold: at least `MIN_DATED_PACKETS = 3` packets had a
+parseable date, and the majority month holds at least `MAJORITY_FRACTION =
+60%` of the parsed dates. Either threshold failing means "resolve
+nothing" (`BlockResolution.resolved = False`, with a human-readable
+`reason`) — a human must then pass `--block <NN>` explicitly rather than
+the pipeline silently picking a weakly-supported guess.
+
+A **per-packet** resolution scheme was deliberately rejected, not just not
+implemented: a single misread handwritten date would silently route that
+one packet into whichever block its own (possibly wrong) date pointed at,
+and because the two class-period blocks share identical names, a
+wrongly-routed packet would find its own name waiting for it in the wrong
+block and match with perfect, silent confidence — the exact failure mode
+this feature exists to prevent, just moved from "whole file" to "one
+unlucky packet." A packet whose own parsed month disagrees with the
+file's resolved majority is still surfaced
+(`blocks.disagreeing_packets`) — flagged in `cli.py run`'s output and, in
+`review_app.py`, as an `st.warning` next to that specific packet's own
+date field — but never used to move that one packet to a different block,
+or to hold it back. Students get their own written date wrong often
+enough (see `verify_no_leaked_names`'s existing `LEAK_FUZZY_MIN_TOKEN_LEN`
+false-positive story for the same general lesson: real handwritten/OCR'd
+input is noisy) that a single packet's date is a flag for a reviewer to
+notice, not a signal the pipeline should act on.
+
+`parse_month` (`blocks.py`) is deliberately conservative: handles
+`M/D/YYYY`, `M/D/YY`, `M-D-YYYY`, and written month names (full or
+abbreviated, e.g. "March 31, 2026" or "Mar. 1, 2025"), and returns `None`
+— never a best-effort guess — for an out-of-range month/day, a numeric
+string that doesn't fully match the expected shape, or plain unparseable
+text. This feeds a decision (which of two identically-named blocks a
+student's data lands in) with no downstream signal that could ever catch
+a wrong guess, so it returns `None` far more readily than most parsing
+code would.
+
+**The confirmation gate is the only real defense available, and it is
+deliberately not skippable.** No match-quality signal can ever
+distinguish a packet correctly assigned to block 02 from the same packet
+wrongly assigned to block 01, because the two blocks' students have the
+same names — a wrong resolution looks exactly as confident as a right
+one. `cli.py run`, whenever block metadata exists for the roster, resolves
+first and *always* prints the report (month histogram, packets
+parsed/total, class period used, resolved block, and what that block
+means in words, e.g. "block 02, class period 1, March") before touching
+anything else — then requires an explicit `--confirm-block <NN>` matching
+the resolved (or `--block`-overridden) block. Absent `--confirm-block`,
+or given one that disagrees with the resolution, `run` prints the report,
+explains the disagreement, and exits 1 **before** loading the roster,
+segmenting, or touching `out_dir`/`decisions_dir` in any way — verified by
+`test_run_without_confirm_block_exits_nonzero_and_writes_nothing` and
+`test_run_with_wrong_confirm_block_refuses` (`tests/test_blocks.py`), both
+asserting `out_dir` was never even created. `--block <NN>` is the override
+for when dates can't be resolved automatically (too few readable dates, no
+clear majority) — it still requires `--confirm-block` to match it, so a
+human can't accidentally skip confirming just because they supplied the
+block directly. `--class-period` (or the scan's own filename `PDn`, same
+inference `roster.infer_period_from_filename` already provided) supplies
+the *class period* input to resolution — when block metadata exists, the
+filename's `PDn` means class period, **never** roster block, and is never
+allowed to flow into the block value the way it silently did before this
+feature existed.
+
+`review_app.py` mirrors this exactly, as a UI gate rather than a flag: a
+"Block resolution" banner (the identical report text `format_
+resolution_report` produces for the CLI) followed by a mandatory
+confirmation checkbox, shown *before* the sidebar, packet selector, or any
+packet is rendered — `_render_block_gate` returns `None` (telling `main()`
+to stop rendering anything else) until the box is ticked, keyed per
+(pdf stem, resolved block) so a different resolved block gets its own
+fresh confirmation rather than silently inheriting a stale tick.  Once
+confirmed, every packet's page shows a caption naming the resolved block
+in words ("Approving into: block 02, class period 1, March"), so a
+reviewer approving a name can see which round they're approving it into,
+and a disagreeing packet's own date field carries its own inline warning.
+
+**Stored-decision scope guard.** Both `cli.py run` and `review_app.py`'s
+gate check every SID already recorded in `decisions/<pdf-stem>.json`
+against the run's resolved block by reading the SID's own period digits
+(positions 6:8 — the same slice as `roster.RosterEntry.period_display`,
+since a block code *is* the SID period digits it filters the roster to;
+see `blocks.decisions_scope_mismatches`) and abort, naming every offending
+packet tag and SID, on any mismatch — before any processing happens. This
+needs no migration of any existing `decisions/*.json` file: the check
+reads straight off the SID string every decisions file already has, not a
+new field. Once a run passes the confirmation gate, the resolved block
+(not the full decision) is separately recorded to
+`decisions/<pdf-stem>.block.json` (`blocks.save_resolved_block_record`) —
+a small provenance record, not a decision, kept out of `decisions/
+<pdf-stem>.json` itself for the same reason `detection_overrides` lives in
+its own file (see "One of those five holds is human-overridable" below):
+`decisions`' `sid | None | absent` three-state contract is depended on by
+every existing decisions file and every test that reads one, and this
+feature doesn't need to put that at risk to add provenance.
+
+## Real scans can arrive in a PDF encoding one of our two readers
+mis-parses (`melredact/pdfio.py`)
+
+**Found and fixed 2026-08-13, while attempting to demonstrate the
+block-resolution feature above against the real `data/PRT/
+010406_PD1_PRT.pdf`.** `segment_pdf` (and every other call site that used
+to call `pdfplumber.open` directly on a source scan) silently returned
+zero packets for this real, 92-page file — `pdfplumber.open(path).pages`
+came back `[]`, no exception raised. Confirmed pre-existing and unrelated
+to the block-resolution feature itself: `git stash`-ing every change from
+this session and re-running `segment_pdf` against the same file on
+unmodified `main` reproduced the identical `0 packets, 0 page_count` —
+this would have blocked `cli.py run` on this file regardless, the very
+first time anyone tried to process it end to end.
+
+Root cause, confirmed by direct inspection (not assumed): `pikepdf` (a
+different, qpdf-based library) opens the same file without complaint —
+92 pages, a completely ordinary page tree (`/Root` → `/Pages` → 92
+`/Kids`, each a normal `/Type /Page` dict). The file's own xref table and
+trailer use bare `\r` (old-Mac-style) line endings instead of `\n`/
+`\r\n` — a valid PDF EOL convention, just an unusual one — and
+`pdfminer.six` (what `pdfplumber` wraps) mis-tokenizes the `\r`-delimited
+xref subsection: its own parsed offsets dict came back keyed `2..280` for
+a 280-object file (should be `0..279`), so `trailer`'s `/Root 278 0 R`
+resolves to whatever object 278's *shifted* slot actually points at, not
+the real catalog — `doc.catalog` (and therefore `PDFPage.create_pages`)
+comes back empty, silently, with nothing raised to signal a failure. This
+is a library compatibility gap, not a data-integrity problem this
+codebase's usual "fail loudly, abstain, never guess" posture applies to
+(see "Working preferences" below) — the PDF itself is well-formed, just
+written with a valid-but-unusual EOL choice one of our two readers doesn't
+handle; there is nothing ambiguous about the file's actual content to
+guess about, only a parser bug to route around.
+
+**Fix: `melredact/pdfio.py`'s `open_pdf` is a drop-in replacement for
+`pdfplumber.open`,** used at every call site across the codebase that
+opens a caller-supplied *source* PDF (`segment.py`, `redact.py`,
+`pipeline.py`, `blocks.py`, `review_app.py` — never on this codebase's
+own already-pikepdf-written output in `out/` or a manual-queue draft,
+which never has this problem in the first place, since we write those
+files ourselves). It checks whether `pdfplumber.open(path).pages` comes
+back empty and, only then, falls back to a `pikepdf`-resaved copy of the
+same file — `pikepdf` already reads the file correctly, and re-saving
+through it normalizes the xref/trailer into a form `pdfminer.six` handles,
+with no change to any page's content, image data, or metadata. The
+repaired copy is disk-cached by the *source* file's own content hash
+(`CACHE_DIR/normalized/<hash>.pdf`, gitignored the same as the rest of
+`CACHE_DIR` — a repaired copy of a real scan is exactly as identifiable as
+the scan itself), the same pattern `melredact.ocr` already uses for the
+same reason: pay the one-time resave cost once per distinct input file,
+not once per call. Confirmed directly against the real file: `open_pdf`
+recovers all 92 pages; cost of the repair itself (one `pikepdf` resave of
+a 77MB file) is a few seconds, paid once.
+
+Reproducing the exact `\r`-xref parser bug byte-for-byte in a small
+synthetic fixture turned out not to be practical (a minimal pikepdf-
+written file with every `\n` swapped for `\r` did not reproduce it — the
+real file's own export tool triggers a more specific pdfminer.six code
+path this session didn't fully chase down). `tests/test_pdfio.py`
+instead tests `open_pdf`'s actual, observable contract by simulating the
+symptom directly (monkeypatching `pdfplumber.open` to return zero pages
+for a specific path, the same observable behavior the real bug produced)
+and asserting the repair mechanism recovers real pages from a
+pikepdf-resaved cached copy, plus that an ordinary, unaffected file never
+touches `pikepdf` or the cache at all.
 
 ## Non-negotiable design decisions
 
@@ -1178,6 +1407,162 @@ pages (US Letter, 612×792pt, origin top-left):
   it documents the specific near-miss cases (a hyphenated name at 81.8, a
   genuine roster surname collision caught by the margin) that pin these
   values.
+
+## Teacher 010406 roster reissue, multi-topic PRT worksheets, and output path collisions (2026-08-13)
+
+**The supervisor reissued `data/teacher_codes/010406.csv` as a completely
+different shape.** The earlier corrupted-export/dual-round roster (see
+"Held names" and "Date-driven block resolution" above) is dead for this
+teacher: the new file has exactly two blocks (01/02 = plain class periods
+1/2, nothing else encoded), every SID unique, no gaps, no repeated names
+across blocks. Loaded and verified directly (`load_roster`/
+`load_full_roster` against the real file): 14 entries in block 01, 16 in
+block 02, no SID or (first, last) name pair repeats across either block,
+loads without raising. `010406_blocks.json` and `010406_holds.csv` do not
+exist on disk for this teacher any more (confirmed absent, not just
+unreferenced) — `load_block_metadata`/held-names loading both fall
+through to their "no sidecar" path for 010406 now, exactly like every
+other teacher.
+
+**New guard: a name cannot appear in both a roster and its own holds
+sidecar.** `roster._check_no_roster_holds_overlap` (wired into
+`_parse_roster_csv`, so both `load_roster` and `load_full_roster` get it
+for free) raises `RosterError` if any held name's (first, last) pair
+--- compared case-insensitively, since a spreadsheet re-export is exactly
+the kind of place casing drifts --- also appears as a roster entry. This
+wasn't reachable before today (010406 was the only teacher with a holds
+sidecar, and its roster and holds files were built from the same
+duplicate-SID scan, so they were disjoint by construction), but it's a
+real risk going forward: a roster CSV can be fixed/reissued without its
+now-stale holds sidecar being cleaned up at the same time, and a name
+sitting in both files is a contradiction — trustworthy enough for a
+roster row, but also SID-unresolvable — that only a human can resolve.
+Guessing which file is right (e.g. preferring the roster silently) risks
+exactly the kind of mislabeling `held_names` exists to prevent in the
+first place.
+
+**The real motivating problem: one student, one SID, several legitimate
+PRT worksheets.** Diagnostic run (segmentation and header-field
+extraction only — no matching, no redaction, no writes, no deletes — 
+against the real `data/PRT/010406_PD1_PRT.pdf`, per this session's own
+request) found **92 pages, 46 packets**, and the packets are not one
+round: the OCR'd Date field groups cleanly into three blocks by
+packet_index — packets 1–13 read as March 2026 ("3 30 26", "3-30-26",
+...), 14–28 as February 2026 ("2 20 26", "2-20-26", ...), 29/30–46 as
+October 2025 ("10 24 25", "10-24-25", ...) — and the OCR'd Name field
+shows the *same* roughly-14 students recurring once per block (e.g. a
+name OCR'd as "Andew Ferrucio" in the March block, "tndrew Ferrueio" in
+the February block, "Andrew Ferrusio" in the October block — three
+independent OCR reads of the same real student's handwriting on three
+separate worksheets). Two packets (index 29, first_page=56; index 43,
+first_page=84) are orphans with no header page (`worksheet_type=None`,
+flagged `issues`) and one more (index 44) has an unreadable-footer
+`issues` entry mid-sequence — none of that blocks segmentation itself,
+each is just its own flagged packet per the usual "abstain and flag,
+never guess" rule. **This settles the question this diagnostic was run
+to answer: the repeated-PRT problem lives *within* this one file, not
+just across separate scan files** — three collection rounds concatenated
+into a single PDF, all under one filename with no topic segment in it at
+all (`010406_PD1_PRT.pdf`, not `..._PRT_EW.pdf`), so every one of a given
+student's three packets computes the exact same `topic_from_filename`
+result (`NA`) and therefore the exact same natural `output_path`. The
+topic path segment below does nothing to disambiguate *this specific
+file* — it's the no-silent-overwrite ledger backstop (also below) that
+actually protects it.
+
+**Fix, part one: a `topic` path segment, read from the *source filename*,
+not the footer.** Real per-topic scans follow
+`<teacher>_PD<n>_<TYPE>[_<TOPIC>].pdf` (e.g. `010406_PD1_PRT_EW.pdf`),
+where `TOPIC` is a short code (`EW`, `FR`, `FO`, `WL`, ...) naming which
+worksheet session this file is. `pipeline.topic_from_filename` extracts
+the trailing underscore-separated segment when the filename matches that
+shape and returns the stable literal `NO_TOPIC = "NA"` otherwise — never
+guessed, and deliberately a literal rather than an omitted segment, so
+`output_path`'s depth (`out/<teacher>/<period>/<worksheet_type>/<topic>/
+<SID>.pdf`, one level deeper than before today) stays constant across
+every teacher regardless of whether their filenames carry a topic. Topic
+comes from the filename and not the footer because it isn't part of the
+worksheet's own printed content (unlike `worksheet_type`, which — see
+"Packet identity and the decisions store" below — is read off the footer
+specifically because it *is* printed, on every page, and must never be
+guessed from the source filename the way an earlier design guessed
+`--period` from `PDn`). `output_path` gained `topic` as an optional
+fourth parameter defaulting to `NO_TOPIC`, so every existing caller that
+hasn't been touched (including every existing test) keeps computing the
+exact path it always did.
+
+**Fix, part two: writing refuses to overwrite silently, backstopping the
+case above where the topic segment alone doesn't help.**
+`pipeline._claim_output_path(ledger, tag, out_dir, entry, worksheet_type,
+topic)` computes the natural `output_path` and checks this run's own
+ledger: if that exact path already exists on disk *and* the ledger
+attributes it to a *different* packet_tag, it returns a numbered-suffix
+alternative (`<SID>_2.pdf`, `_3.pdf`, ...) instead and a human-readable
+collision note; re-processing the *same* tag against its own
+previously-claimed path is excluded from the check (not a collision) so
+a packet re-run after a decision change keeps overwriting its own prior
+file exactly as before. `run_dispositions` and `release_from_manual_
+queue` (the two places that ever write to `out_dir`) both go through
+this before writing. `DispositionResult` gained `collision_note: str |
+None`, surfaced prominently and separately from an ordinary "written"
+count: `cli.py run`'s summary line now reads "N written (K collision(s)
+avoided), ..." with one `COLLISION AVOIDED for <tag>: ...` line per
+occurrence, and `review_app.py`'s sidebar shows one `st.sidebar.warning`
+per occurrence the same way it already does for `held_back`.
+
+**The ledger itself changed shape to make this possible.** Deletion has
+to remove the *exact* file a tag wrote — including a suffixed one — not a
+path recomputed from the SID (recomputing would always land on the
+un-suffixed path, deleting nothing for a suffixed file, or silently
+"succeeding" against a path that was never the one this tag actually
+wrote). `out/.ledger/<pdf-stem>.json` entries are now `{"sid": ...,
+"path": ...}` instead of a bare SID string; every deletion (confirmed
+non-consent, and a correction superseding an old SID) now unlinks the
+literal `ledger[tag]["path"]`, never a freshly-called `output_path`.
+
+**Matching is deliberately unchanged: greedy claim-and-remove stays
+exactly as it is.** `match.assign_all` still processes proposals in
+descending top-score order and marks a roster entry claimed the instant
+one packet auto-assigns to it (see "Non-negotiable design decisions"
+above); a second packet in the same file that best-matches an
+already-claimed student still abstains to human review rather than being
+auto-assigned anywhere else. For a teacher whose students genuinely have
+several worksheets each — the exact real shape confirmed above — this is
+the *correct* outcome, not a gap to loosen: review_app.py's roster search
+lets a human explicitly confirm the same SID against each of that
+student's several packets, same as any other decision, and the ledger/
+collision-avoidance fix above is what makes it safe to write more than
+one packet to the same student without any of them clobbering another.
+Loosening claim-and-remove to auto-assign a second, third, ... packet to
+an already-claimed SID would reintroduce exactly the risk it exists to
+prevent (a merely-similar decoy for an already-claimed entry getting
+auto-assigned) for every other teacher, to save a few clicks for one
+teacher whose repeated worksheets a human already has to review the
+group/date fields of anyway.
+
+**Date-driven block resolution is downgraded to informational for any
+teacher with no `_blocks.json` sidecar** (010406 included, now that its
+own sidecar is retired). `blocks.format_month_histogram(dates)` prints
+the same per-month count `format_resolution_report` would, purely as a
+sanity signal in `cli.py run`'s own output — it never calls
+`resolve_block` and never gates or alters anything; only a teacher with
+an actual `_blocks.json` sidecar goes through the load-bearing
+`--confirm-block` gate described above. Wired into `cli.py`'s `_cmd_run`
+only (the "run report" this was actually asked for); `review_app.py`'s
+sidebar was deliberately left untouched for this — the underlying
+`collect_packet_dates` call is a real OCR pass over the whole file, and
+`cli.py run` already pays a comparable cost when block metadata exists,
+but adding it unconditionally to every Streamlit rerun for every teacher
+without metadata risked a real, easy-to-miss perf regression for no
+correctness benefit (the checked-in histogram is purely a sanity print,
+not something a reviewer is blocked on). Confirmed against the real
+010406 PRT file's own dates (via the diagnostic above): only 5 of 46
+packets have a numeric date OCR'd cleanly enough for `parse_month` to
+accept (e.g. "3 3112026", "3021", "3130126" all fail the strict
+`M/D/YYYY`-family regex — real handwriting OCR noise, not a bug) — a
+concrete demonstration of why this stays informational-only rather than
+becoming a second, weaker gate: a signal this noisy has no business
+blocking a run.
 
 ## Working preferences
 

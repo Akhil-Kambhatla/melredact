@@ -340,3 +340,23 @@ def test_holds_csv_tolerates_a_trailing_blank_line(tmp_path):
         f.write("Last Name,First Name\nOsman,Jad\n,\n")
     roster = load_roster(path)
     assert roster.held_names == [HeldName(last_name="Osman", first_name="Jad")]
+
+
+def test_name_in_both_roster_and_holds_sidecar_raises(tmp_path):
+    """A name cannot simultaneously be a trustworthy roster entry and a
+    known-consented-but-SID-unresolvable held name -- whichever file is
+    stale, only a human can say which, so this must fail loudly rather than
+    silently preferring one (see roster.py's _check_no_roster_holds_overlap)."""
+    path = tmp_path / "010406.csv"
+    _write_csv(path, [("0104060101", "Osman", "Jad")])
+    _write_holds_csv(holds_path(path), [("Osman", "Jad")])
+    with pytest.raises(RosterError, match="Jad Osman"):
+        load_roster(path)
+
+
+def test_name_in_both_roster_and_holds_sidecar_raises_case_insensitively(tmp_path):
+    path = tmp_path / "010406.csv"
+    _write_csv(path, [("0104060101", "osman", "JAD")])
+    _write_holds_csv(holds_path(path), [("Osman", "Jad")])
+    with pytest.raises(RosterError, match="appears in both the roster"):
+        load_roster(path)

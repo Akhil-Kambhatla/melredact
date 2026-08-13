@@ -92,6 +92,43 @@ def test_verify_fails_loudly_on_a_directory_with_no_matching_output(tmp_path, ca
     assert str(empty_out) in err
 
 
+def test_verify_recursive_glob_finds_files_under_the_topic_segment(main_fixture, tmp_path, capsys):
+    """Output now lands at out/<teacher>/<period>/<worksheet_type>/<topic>/
+    <SID>.pdf -- one level deeper than verify's old fixed four-level glob.
+    verify must walk recursively and still report a nonzero checked count,
+    not silently find nothing at the old fixed depth."""
+    segmented = segment_pdf(main_fixture.pdf_path)
+    decisions_dir = tmp_path / "decisions"
+    tag = packet_tag(main_fixture.pdf_path, segmented.packets[0])
+    consented_sid = main_fixture.expected_final_sid["clean_match"]
+    save_decisions(main_fixture.pdf_path, {tag: consented_sid}, decisions_dir=decisions_dir)
+
+    out = tmp_path / "out"
+    rc = main(
+        [
+            "run",
+            "--pdf",
+            str(main_fixture.pdf_path),
+            "--roster",
+            str(main_fixture.roster_path),
+            "--out",
+            str(out),
+            "--decisions",
+            str(decisions_dir),
+        ]
+    )
+    assert rc == 0
+
+    written = list(out.rglob("*.pdf"))
+    assert written
+    assert any(p.parent.name == "NA" for p in written), "fixture filename carries no topic -- must fall to NA"
+
+    rc = main(["verify", "--roster", str(main_fixture.roster_path), "--out", str(out)])
+    assert rc == 0
+    out_text = capsys.readouterr().out
+    assert "1 file(s) checked, 0 failed" in out_text
+
+
 def test_verify_succeeds_against_a_roster_spanning_multiple_periods(main_fixture, tmp_path, capsys):
     """Regression: verify used to call the *scoped* loader, which raises
     RosterError the moment the roster spans more than one period and no

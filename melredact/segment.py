@@ -51,6 +51,7 @@ from melredact.config import (
     TEACHER_LABEL_WORDS,
     WORKSHEET_TYPE_PATTERN,
 )
+from melredact.pdfio import open_pdf
 
 Word = dict
 
@@ -352,7 +353,7 @@ def segment_pdf(pdf_path: str | Path) -> SegmentResult:
     open packet (missing page 1) becomes its own flagged, orphaned packet
     rather than being silently merged into whatever came before or dropped.
     Nothing here infers a page count that isn't printed on the page."""
-    with pdfplumber.open(pdf_path) as pdf:
+    with open_pdf(pdf_path) as pdf:
         pages_info = [(idx, is_header_page(page), read_footer(page)) for idx, page in enumerate(pdf.pages)]
 
     packets: list[Packet] = []
