@@ -943,6 +943,232 @@ def test_manual_queue_release_with_a_still_insufficient_band_stays_queued(tmp_pa
     assert len(list_manual_queue(out_dir)) == 1
 
 
+def _build_two_page_page2_name_fixture(tmp_path):
+    """A clean, auto-detectable header page (page 1) plus a second page
+    carrying its own extra handwritten name -- the real shape this fixture
+    exists to reproduce: a PRT packet's page 2 can carry its own name (see
+    CLAUDE.md's manual-redaction-editor section), which redact_packet's
+    header-page-only geometry has no way to reach on its own. Fictional
+    names throughout, never real student PII (see CLAUDE.md/data/
+    README.md)."""
+    from melredact.config import FOOTER_WORKSHEET_TYPE, GROUP_ANCHOR
+    from tests.make_fixture import InvisibleText, PdfBuilder, _write_roster_csv, render_continuation_image, render_header_image
+
+    page1_img = render_header_image(
+        name_text="Jamie Chen",
+        teacher_text="Hannel",
+        group_text="",
+        date_text="10/03/2025",
+        period_text="02",
+        worksheet_type="PRT (01/2024)",
+        page_marker="Page 1 of 2",
+        shade_blank_rows=False,
+    )
+    page2_extra_name = "Morgan Lee"
+    page2_extra_top = 120.0
+    page2_extra_x = 100.0
+    page2_img = render_continuation_image(worksheet_type="PRT (01/2024)", page_marker="Page 2 of 2", body="(continued)")
+
+    page1_items = [
+        InvisibleText("Name:", GROUP_ANCHOR["x0"], 68, 9),
+        InvisibleText("Jamie Chen", 150, 68),
+        InvisibleText("Group members, if any:", GROUP_ANCHOR["x0"], GROUP_ANCHOR["top"], 9),
+        InvisibleText("10/03/2025", 450, 68),
+        InvisibleText("02", 450, 87),
+        InvisibleText("PRT 01 2024", FOOTER_WORKSHEET_TYPE["x0"], FOOTER_WORKSHEET_TYPE["top"], 9),
+        InvisibleText("Page 1 of 2", 513, 747, 9),
+    ]
+    page2_items = [
+        InvisibleText("(continued)", 45, 40),
+        InvisibleText(page2_extra_name, page2_extra_x, page2_extra_top),
+        InvisibleText("PRT 01 2024", FOOTER_WORKSHEET_TYPE["x0"], FOOTER_WORKSHEET_TYPE["top"], 9),
+        InvisibleText("Page 2 of 2", 513, 747, 9),
+    ]
+    builder = PdfBuilder()
+    builder.add_page(page1_img, page1_items)
+    builder.add_page(page2_img, page2_items)
+    pdf_path = tmp_path / "page2name.pdf"
+    builder.save(pdf_path)
+
+    sid = "0204159902"
+    roster_path = tmp_path / "roster.csv"
+    _write_roster_csv(roster_path, [(sid, "Chen", "Jamie"), ("0204159903", "Lee", "Morgan")])
+    roster = load_roster(roster_path)
+    seg = segment_pdf(pdf_path)
+    tag = packet_tag(pdf_path, seg.packets[0])
+    return pdf_path, roster, seg, tag, sid, page2_extra_name, page2_extra_top, page2_extra_x
+
+
+def test_manual_header_region_releases_the_packet_with_the_same_output_shape_as_automatic(tmp_path):
+    """The editor's `header_bbox_override` path (two independently-dragged
+    rectangles, not a single HeaderBand) must produce a release that's
+    indistinguishable in shape from what the automatic path would have
+    produced had detection succeeded cleanly: a single-page PDF, a clean
+    verify_no_leaked_names pass, and a real file at the natural output
+    path."""
+    from melredact.config import GROUP_ANCHOR
+    from melredact.pipeline import release_from_manual_queue
+    from melredact.redact import HeaderBand, redact_bboxes_for_band, verify_no_leaked_names
+    from melredact.pdfio import open_pdf as _open_pdf
+
+    pdf_path, roster, seg, tag, sid, overflow_top_pt = _build_packet14_style_fixture(tmp_path)
+    out_dir = tmp_path / "out"
+    corrected_band = HeaderBand(left=38, top=58, right=574, bottom=overflow_top_pt + 20, detected=True)
+    header_bbox_override = redact_bboxes_for_band(corrected_band, GROUP_ANCHOR["top"])
+
+    release = release_from_manual_queue(
+        pdf_path, seg.packets[0], tag, sid, roster, None,
+        out_dir=out_dir, dpi=DPI, header_bbox_override=header_bbox_override,
+    )
+    assert release.released, release.reason
+    entry = roster.by_sid[sid]
+    expected_path = output_path(out_dir, entry, seg.packets[0].worksheet_type, round_label=FIXTURE_ROUND)
+    assert release.out_path == expected_path
+    with _open_pdf(expected_path) as pdf:
+        assert len(pdf.pages) == seg.packets[0].n_pages == 1
+    assert verify_no_leaked_names(expected_path, roster) == []
+
+
+def test_manual_header_region_that_leaves_ink_uncovered_keeps_packet_held(tmp_path):
+    """A manually-drawn region that still doesn't reach the real overflow
+    ink must be refused exactly like a bad band correction -- the editor
+    supplies geometry, it never gets to skip the coverage check just
+    because a human drew it."""
+    from melredact.config import GROUP_ANCHOR
+    from melredact.pipeline import list_manual_queue, release_from_manual_queue
+    from melredact.redact import HeaderBand, redact_bboxes_for_band
+
+    pdf_path, roster, seg, tag, sid, overflow_top_pt = _build_packet14_style_fixture(tmp_path)
+    out_dir = tmp_path / "out"
+    run_dispositions(pdf_path, seg, {tag: sid}, roster, out_dir=out_dir, dpi=DPI)
+    assert len(list_manual_queue(out_dir)) == 1
+
+    still_short_band = HeaderBand(left=38, top=58, right=574, bottom=overflow_top_pt - 5, detected=True)
+    header_bbox_override = redact_bboxes_for_band(still_short_band, GROUP_ANCHOR["top"])
+
+    release = release_from_manual_queue(
+        pdf_path, seg.packets[0], tag, sid, roster, None,
+        out_dir=out_dir, dpi=DPI, header_bbox_override=header_bbox_override,
+    )
+    assert not release.released
+    assert "uncovered group-row ink" in release.reason
+    entry = roster.by_sid[sid]
+    assert not output_path(out_dir, entry, seg.packets[0].worksheet_type, round_label=FIXTURE_ROUND).exists()
+    assert len(list_manual_queue(out_dir)) == 1
+
+
+def test_page_2_region_redacts_page_2_and_leaves_page_1_unchanged(tmp_path):
+    """extra_page_regions must reach a page redact_packet's own header-page
+    geometry has no way to touch -- redacting a name on page 2 must not
+    perturb page 1's own output at all."""
+    from melredact.redact import redact_packet
+
+    pdf_path, roster, seg, tag, sid, extra_name, extra_top, extra_x = _build_two_page_page2_name_fixture(tmp_path)
+    packet = seg.packets[0]
+    assert packet.n_pages == 2
+
+    baseline_path = tmp_path / "baseline.pdf"
+    redact_packet(pdf_path, packet, baseline_path, dpi=DPI)
+    import pdfplumber
+
+    with pdfplumber.open(baseline_path) as pdf:
+        baseline_page1_text = pdf.pages[0].extract_text() or ""
+        baseline_page2_text = pdf.pages[1].extract_text() or ""
+    assert "lee" in baseline_page2_text.lower(), "fixture sanity: the extra name must survive when no page-2 region is given"
+
+    page2_bbox = (extra_x - 10, extra_top - 5, extra_x + 200, extra_top + 15)
+    edited_path = tmp_path / "edited.pdf"
+    result = redact_packet(pdf_path, packet, edited_path, dpi=DPI, extra_page_regions={1: [page2_bbox]})
+    assert result.uncovered_group_words == []
+
+    with pdfplumber.open(edited_path) as pdf:
+        edited_page1_text = pdf.pages[0].extract_text() or ""
+        edited_page2_text = pdf.pages[1].extract_text() or ""
+
+    assert edited_page1_text == baseline_page1_text, "page 1 must be byte-identical to the automatic path's own output"
+    assert "morgan" not in edited_page2_text.lower()
+    assert "lee" not in edited_page2_text.lower()
+
+
+def test_reviewer_cannot_supply_a_sid_directly_only_a_name_resolved_through_roster(main_fixture, roster):
+    """filter_roster_by_name is the ONLY function review_app.py's manual
+    editor (and its pre-existing roster-search expander) uses to turn a
+    reviewer's typed text into a SID -- typing a real SID string must not
+    resolve to anything, since no roster entry's full_name contains a SID,
+    while typing the actual name resolves to exactly that student."""
+    from melredact.roster import filter_roster_by_name
+
+    target = next(iter(roster))
+    by_name = filter_roster_by_name(roster, target.full_name)
+    assert [e.sid for e in by_name] == [target.sid]
+
+    by_sid_text = filter_roster_by_name(roster, target.sid)
+    assert by_sid_text == [], "typing a SID string must never resolve to a roster entry"
+
+
+def test_stored_manual_geometry_reproduces_on_rerun(tmp_path):
+    """A packet a human has already corrected once must reproduce the same
+    clean write on a later run without being re-queued or redrawn -- see
+    pipeline.py's `manual_geometry` parameter and `save_manual_geometry`."""
+    from melredact.config import GROUP_ANCHOR
+    from melredact.pipeline import list_manual_queue, load_manual_geometry, release_from_manual_queue
+    from melredact.redact import HeaderBand, redact_bboxes_for_band
+
+    pdf_path, roster, seg, tag, sid, overflow_top_pt = _build_packet14_style_fixture(tmp_path)
+    out_dir = tmp_path / "out"
+    decisions_dir = tmp_path / "decisions"
+    run_dispositions(pdf_path, seg, {tag: sid}, roster, out_dir=out_dir, dpi=DPI)
+    assert len(list_manual_queue(out_dir)) == 1
+
+    corrected_band = HeaderBand(left=38, top=58, right=574, bottom=overflow_top_pt + 20, detected=True)
+    header_bbox_override = redact_bboxes_for_band(corrected_band, GROUP_ANCHOR["top"])
+    release = release_from_manual_queue(
+        pdf_path, seg.packets[0], tag, sid, roster, None,
+        out_dir=out_dir, dpi=DPI, decisions_dir=decisions_dir, header_bbox_override=header_bbox_override,
+    )
+    assert release.released, release.reason
+
+    geometry = load_manual_geometry(pdf_path, decisions_dir=decisions_dir)
+    assert tag in geometry
+    assert geometry[tag]["header_bbox_override"] == header_bbox_override
+
+    entry = roster.by_sid[sid]
+    expected_path = output_path(out_dir, entry, seg.packets[0].worksheet_type, round_label=FIXTURE_ROUND)
+    expected_path.unlink()
+    (out_dir / ".ledger" / f"{pdf_path.stem}.json").unlink()
+
+    results = run_dispositions(
+        pdf_path, seg, {tag: sid}, roster, out_dir=out_dir, dpi=DPI, manual_geometry=geometry,
+    )
+    result = next(r for r in results if r.packet_tag == tag)
+    assert not result.held_back, result.reason
+    assert result.out_path == expected_path
+    assert expected_path.exists()
+    assert list_manual_queue(out_dir) == []
+
+
+def test_no_manual_geometry_follows_the_existing_automatic_path_unchanged(main_fixture, roster, segmented, tmp_path):
+    """A packet with no stored manual geometry must produce byte-identical
+    output whether or not `manual_geometry` is passed at all -- the new
+    parameter must be strictly additive, never change behavior for the
+    overwhelming majority of packets that never needed a manual
+    correction."""
+    tag = packet_tag(main_fixture.pdf_path, segmented.packets[0])
+    sid = _sid_for(roster, "Jordan Ames")
+
+    out_a = tmp_path / "out_a"
+    out_b = tmp_path / "out_b"
+    results_a = run_dispositions(main_fixture.pdf_path, segmented, {tag: sid}, roster, out_dir=out_a, dpi=DPI)
+    results_b = run_dispositions(
+        main_fixture.pdf_path, segmented, {tag: sid}, roster, out_dir=out_b, dpi=DPI, manual_geometry={}
+    )
+
+    result_a = next(r for r in results_a if r.packet_tag == tag)
+    result_b = next(r for r in results_b if r.packet_tag == tag)
+    assert not result_a.held_back and not result_b.held_back
+    assert result_a.out_path.read_bytes() == result_b.out_path.read_bytes()
+
+
 # --- consent hold: a packet whose best match is a held name (see
 # roster.py's Roster.held_names) is a known-consented student with an
 # unresolvable SID -- must never be written or deleted, see

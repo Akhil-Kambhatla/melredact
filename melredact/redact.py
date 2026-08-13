@@ -366,6 +366,7 @@ def render_redaction_preview(
     group_top: float | None = None,
     stamp_lines: list[str] | None = None,
     band_override: HeaderBand | None = None,
+    header_bbox_override: tuple[Bbox, Bbox] | None = None,
 ) -> tuple[Image.Image, HeaderBand]:
     """Non-destructive preview of what redact_packet would do to this
     header page: same detection + box-drawing (including the same
@@ -390,17 +391,49 @@ def render_redaction_preview(
     actually cover *before* calling `pipeline.release_from_manual_queue`,
     the same way the ordinary decision preview lets a reviewer see a
     candidate match before confirming it.
+
+    `header_bbox_override`, when given, takes precedence over both of the
+    above and previews that exact (left_bbox, right_bbox) pair directly --
+    the drag-corner manual editor's own geometry (see redact_packet's
+    identically-named parameter), so a reviewer sees precisely the two
+    rectangles they just dragged, not a band reconstructed from them.
     """
     preview = header_page_image.copy()
-    row_height = header_row_height(anchors) if anchors is not None else None
-    band = band_override if band_override is not None else detect_header_band(preview, dpi=dpi, anchors=anchors, row_height=row_height)
-    effective_group_top = group_top
-    if effective_group_top is None:
-        effective_group_top = anchors.group_top if anchors is not None else GROUP_ANCHOR["top"]
-    left_bbox, right_bbox = redact_bboxes_for_band(band, effective_group_top)
+    if header_bbox_override is not None:
+        left_bbox, right_bbox = header_bbox_override
+        lefts = [b[0] for b in header_bbox_override]
+        tops = [b[1] for b in header_bbox_override]
+        rights = [b[2] for b in header_bbox_override]
+        bottoms = [b[3] for b in header_bbox_override]
+        band = HeaderBand(left=min(lefts), top=min(tops), right=max(rights), bottom=max(bottoms), detected=True)
+    else:
+        row_height = header_row_height(anchors) if anchors is not None else None
+        band = (
+            band_override
+            if band_override is not None
+            else detect_header_band(preview, dpi=dpi, anchors=anchors, row_height=row_height)
+        )
+        effective_group_top = group_top
+        if effective_group_top is None:
+            effective_group_top = anchors.group_top if anchors is not None else GROUP_ANCHOR["top"]
+        left_bbox, right_bbox = redact_bboxes_for_band(band, effective_group_top)
     _draw_redaction_box(preview, left_bbox, dpi, stamp_lines)
     _draw_redaction_box(preview, right_bbox, dpi, draw_stamp=False)
     return preview, band
+
+
+def render_region_preview(image: Image.Image, *, dpi: int, bboxes: list[Bbox]) -> Image.Image:
+    """Non-destructive preview of arbitrary redaction regions on a page with
+    no header structure to anchor to -- e.g. a PRT packet's page 2, which
+    can carry its own handwritten name (see CLAUDE.md). Same `_draw_
+    redaction_box` mechanism `render_redaction_preview` uses for the header
+    page, generalized to a plain list of rectangles rather than a band; no
+    stamp, since a stamp is the packet's header-page re-identification key
+    and meaningless on an arbitrary extra region."""
+    preview = image.copy()
+    for bbox in bboxes:
+        _draw_redaction_box(preview, bbox, dpi, draw_stamp=False)
+    return preview
 
 
 def _font_size_for_word(word: Word) -> float:
@@ -650,6 +683,8 @@ def redact_packet(
     flatten: bool = False,
     stamp_lines: list[str] | None = None,
     band_override: HeaderBand | None = None,
+    header_bbox_override: tuple[Bbox, Bbox] | None = None,
+    extra_page_regions: dict[int, list[Bbox]] | None = None,
 ) -> RedactResult:
     """Produce a redacted single-packet PDF.
 
@@ -660,7 +695,7 @@ def redact_packet(
     see `_draw_redaction_box`. Unless `flatten` is set, every word from
     `page_words` (the same native/OCR dispatch segment.py uses) is
     re-emitted as an invisible text token on its own page -- except words
-    overlapping either redacted region, which are dropped before they ever
+    overlapping a redacted region, which are dropped before they ever
     reach the writer, not merely hidden visually. `flatten=True` reproduces
     the pre-reversal all-image behavior with no text layer at all, for any
     packet in the batch.
@@ -676,6 +711,35 @@ def redact_packet(
     it, since the coverage check must still have the final say (see
     CLAUDE.md's "the manual-redaction queue is a backstop" section).
 
+    `header_bbox_override` is a sibling to `band_override`, for the manual
+    queue's drag-corner editor (review_app.py): instead of one HeaderBand
+    that `redact_bboxes_for_band` expands into the left column + overflow
+    strip pair, the editor lets a human independently drag each of those
+    two rectangles' own corners, so this takes the (left_bbox, right_bbox)
+    pair directly and skips `redact_bboxes_for_band` entirely. It is still
+    exactly two rectangles passed straight into the SAME, unmodified
+    `find_uncovered_group_words` call every other path uses -- the editor
+    seeds its two draggable boxes from `redact_bboxes_for_band`'s own
+    automatic output (see review_app.py), so the common case is nudging an
+    existing pair of boxes, not drawing from nothing. Takes precedence over
+    `band_override` when both are given.
+
+    `extra_page_regions` (packet page offset -- 0-based index into
+    `packet.page_indices`, so 0 is always this packet's first physical
+    page -- to a list of Bbox rectangles) redacts arbitrary regions on any
+    page of the packet, not just the header page: a PRT packet's page 2
+    can carry its own handwritten name (see CLAUDE.md), and there is no
+    detected border or Group-row structure on a continuation page to
+    anchor a check to the way the header page's own checks do. Each region
+    is drawn as an opaque box (see `_draw_redaction_box`, undstamped) and
+    every word overlapping it is dropped from the kept text layer, exactly
+    the same mechanism the header page's own two rectangles already use --
+    `verify_no_leaked_names`' whole-document text scan is what backstops
+    these regions, the same way it backstops everything else, since no
+    per-region "was this fully covered" proof exists off the header page.
+    An offset that also happens to be the header page's own offset is
+    additive with the header rectangles, not a replacement for them.
+
     Packets missing a header page (`is_orphan`) have nothing to redact --
     `band`/`redact_bbox`/`redact_strip_bbox` come back None. This function
     is purely mechanical; callers must gate on `packet.issues` themselves
@@ -683,6 +747,7 @@ def redact_packet(
     treat a non-empty `RedactResult.uncovered_group_words` as a failure,
     the same way they already do verify_no_leaked_names findings.
     """
+    extra_page_regions = extra_page_regions or {}
     with open_pdf(pdf_path) as pdf:
         band: HeaderBand | None = None
         left_bbox: Bbox | None = None
@@ -694,29 +759,44 @@ def redact_packet(
             header_words = page_words(header_page, (0, 0, header_page.width, HEADER_SEARCH_MAX_TOP))
             anchors = locate_header_anchors(header_words)
             row_height = header_row_height(anchors)
-            if band_override is not None:
-                band = band_override
+            if header_bbox_override is not None:
+                left_bbox, right_bbox = header_bbox_override
+                lefts = [b[0] for b in header_bbox_override]
+                tops = [b[1] for b in header_bbox_override]
+                rights = [b[2] for b in header_bbox_override]
+                bottoms = [b[3] for b in header_bbox_override]
+                band = HeaderBand(
+                    left=min(lefts), top=min(tops), right=max(rights), bottom=max(bottoms), detected=True
+                )
             else:
-                band = detect_header_band(header_image, dpi=dpi, anchors=anchors, row_height=row_height)
-            left_bbox, right_bbox = redact_bboxes_for_band(band, anchors.group_top)
+                if band_override is not None:
+                    band = band_override
+                else:
+                    band = detect_header_band(header_image, dpi=dpi, anchors=anchors, row_height=row_height)
+                left_bbox, right_bbox = redact_bboxes_for_band(band, anchors.group_top)
             uncovered = find_uncovered_group_words(header_words, anchors, left_bbox, right_bbox)
 
         writer = _PdfWriter()
-        for idx in packet.page_indices:
+        for offset, idx in enumerate(packet.page_indices):
             page = pdf.pages[idx]
             image = page.to_image(resolution=dpi).original.convert("RGB")
             is_header = idx == packet.header_page_index
+            page_bboxes: list[Bbox] = []
             if is_header and left_bbox is not None:
-                _draw_redaction_box(image, left_bbox, dpi, stamp_lines)
-                _draw_redaction_box(image, right_bbox, dpi, draw_stamp=False)
+                page_bboxes.extend([left_bbox, right_bbox])
+            page_bboxes.extend(extra_page_regions.get(offset, []))
+
+            for i, bbox in enumerate(page_bboxes):
+                draw_stamp = is_header and i == 0
+                _draw_redaction_box(image, bbox, dpi, stamp_lines, draw_stamp=draw_stamp)
 
             if flatten:
                 writer.add_page(image, [], page.width, page.height)
                 continue
 
             words = page_words(page, (0, 0, page.width, page.height))
-            if is_header and left_bbox is not None:
-                words = [w for w in words if not (_overlaps_bbox(w, left_bbox) or _overlaps_bbox(w, right_bbox))]
+            if page_bboxes:
+                words = [w for w in words if not any(_overlaps_bbox(w, b) for b in page_bboxes)]
             writer.add_page(image, words, page.width, page.height)
 
     writer.save(out_path)

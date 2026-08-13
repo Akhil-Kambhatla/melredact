@@ -167,6 +167,22 @@ def infer_period_from_filename(path: str | Path) -> str | None:
     return _normalize_period(m.group(1)) if m else None
 
 
+def filter_roster_by_name(roster: Roster, query: str) -> list[RosterEntry]:
+    """Substring, case-insensitive match of `query` against every entry's
+    full_name -- the one and only way review_app.py's roster-search UI (the
+    existing "Search the full roster" expander, and the manual-redaction
+    editor's name field, see CLAUDE.md) turns a reviewer's typed text into
+    a SID: a human always picks a specific entry from the returned list, so
+    a typed SID (which won't appear inside any real full_name) simply
+    returns no matches rather than resolving to anything, and a mistyped
+    digit can never silently become a different, wrong student's SID the
+    way a directly-typed SID could."""
+    q = query.strip().lower()
+    if not q:
+        return list(roster)
+    return [e for e in roster if q in e.full_name.lower()]
+
+
 def filter_by_period(roster: Roster, period: str | int) -> Roster:
     code = _normalize_period(period)
     entries = [e for e in roster if e.period_display == code]

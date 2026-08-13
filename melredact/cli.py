@@ -102,6 +102,7 @@ from melredact.pipeline import (
     format_hold_analysis_report,
     load_decisions,
     load_detection_overrides,
+    load_manual_geometry,
     packet_tag,
     run_dispositions,
 )
@@ -257,6 +258,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return 1
     decisions = load_decisions(pdf_path, decisions_dir=Path(args.decisions))
     detection_overrides = load_detection_overrides(pdf_path, decisions_dir=Path(args.decisions))
+    manual_geometry = load_manual_geometry(pdf_path, decisions_dir=Path(args.decisions))
 
     if resolved_block is not None:
         mismatches = decisions_scope_mismatches(decisions, resolved_block.block)
@@ -289,6 +291,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         detection_overrides=detection_overrides,
         round_labels=round_labels,
         allow_delete=not args.no_delete,
+        manual_geometry=manual_geometry,
     )
 
     written = [r for r in results if r.out_path is not None]

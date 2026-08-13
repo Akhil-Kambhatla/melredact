@@ -2073,6 +2073,183 @@ the October pilot — still needs an actual human review pass through
 `cli.py run` would write anything; this session only sized up what that
 run would look like.
 
+## A drag-corner editor for the manual-redaction queue (2026-08-13)
+
+**Added a real editor to the manual-redaction queue, replacing the old
+four-number-input band correction.** The manual queue itself is unchanged
+in scope: it is still a fallback for exactly the two hold reasons that are
+genuinely a *geometry* problem a human can correct (a detection-confidence
+hold and an uncovered-group-row-ink hold — see "The manual-redaction queue
+is a backstop, not a substitute" above), never a substitute for the
+automatic path, which stays the primary route for every packet that passes
+cleanly. The old editor asked a reviewer to type four raw numbers (left/
+top/right/bottom points) with no visual feedback beyond a static preview
+image; the new one is a real side-by-side editor in `review_app.py`
+(`_render_manual_editor`): the original scan page on the left, the live
+redacted result on the right, both at `review_app.py`'s existing preview
+DPI. A reviewer drags the corners of pre-seeded rectangles — or draws new
+ones — directly on the image, using
+[`streamlit-drawable-canvas`](https://pypi.org/project/streamlit-drawable-canvas/)
+(added to `requirements.txt`; chosen over hand-built drag handles per this
+session's own instruction to use an existing canvas/cropper component)
+rather than typing coordinates blind.
+
+**Compatibility shim, found while wiring the dependency in:**
+`streamlit-drawable-canvas==0.9.3`'s own `st_canvas()` calls
+`streamlit.elements.image.image_to_url(image, width, clamp, channels,
+output_format, image_id)` — a function this project's installed Streamlit
+(1.59) moved to `streamlit.elements.lib.image_utils.image_to_url` and
+rewrote to take a `LayoutConfig` object instead of a bare pixel width as
+its second argument, so the unmodified package raises `AttributeError` the
+first time `st_canvas()` is actually called. Confirmed this is a real
+upstream compatibility gap (the package is pinned to an older Streamlit
+internal API, not a bug in this codebase's own usage), the same class of
+issue `melredact/pdfio.py`'s `open_pdf` already routes around for a
+pdfplumber/pdfminer.six parsing gap. Fixed the same way: `review_app.py`
+shims `streamlit.elements.image.image_to_url` at import time, before
+importing `streamlit_drawable_canvas`, to a small wrapper that adapts the
+old five-positional-plus-width call shape to the new `LayoutConfig`-based
+one — guarded on `hasattr`, so it becomes a no-op the moment the package
+(or a future Streamlit version) restores the old attribute or ships its
+own fix. This is an environment-compatibility shim, not a data-integrity
+concern this codebase's "abstain and flag" posture applies to (see
+"Working preferences" below) — there's nothing ambiguous to guess about,
+only a moved function to route around.
+
+**Two rectangles are the header page's fixed shape; other pages take an
+arbitrary list.** `redact.redact_packet` gained two new, purely additive
+parameters (existing `band_override` callers are byte-for-byte unchanged):
+
+- `header_bbox_override: tuple[Bbox, Bbox] | None` — the header page's own
+  left-column and full-width-strip rectangles, supplied directly rather
+  than derived from a single `HeaderBand` via `redact_bboxes_for_band`.
+  The editor seeds the canvas with exactly those two rectangles (the
+  automatic `detect_header_band` + `redact_bboxes_for_band` output for
+  that page), then a reviewer drags each one's corners independently — the
+  common case is nudging an existing pair of boxes, not drawing from
+  nothing. These two boxes are passed straight into the *same, unmodified*
+  `find_uncovered_group_words(header_words, anchors, left_bbox,
+  right_bbox)` call every other path already uses — this session
+  deliberately left `find_uncovered_group_words`, `redact.py`'s detection
+  geometry, and `match.py` untouched, exactly as instructed. The editor
+  supplies geometry; it never gets a different, weaker check.
+- `extra_page_regions: dict[int, list[Bbox]] | None` — packet page offset
+  (0-based index into `packet.page_indices`) to an arbitrary list of
+  rectangles, for a page with no header structure to anchor a check to at
+  all. This is what actually reaches page 2: a PRT packet's second page
+  can carry its own handwritten name (see the 010406 diagnostics above,
+  and CLAUDE.md's general "abstain and flag" posture toward anything a
+  check can't prove), and `redact_packet` previously had no mechanism to
+  redact anything outside the header page whatsoever. Each region is drawn
+  as an opaque box and every word overlapping it is dropped from the kept
+  text layer — the exact same draw-and-strip mechanism the header page's
+  own two rectangles already use (`_draw_redaction_box`/`_overlaps_bbox`,
+  both unchanged). There is no per-region "was this covered" geometric
+  proof off the header page the way `find_uncovered_group_words` provides
+  for the Group row — `verify_no_leaked_names`'s whole-document text scan
+  is what backstops these regions, the same way it backstops everything
+  else a per-region check can't reach.
+
+`render_redaction_preview` gained the matching `header_bbox_override`
+parameter (same precedence order as `redact_packet`), and a new sibling,
+`render_region_preview(image, dpi, bboxes)`, previews an arbitrary region
+list on a page with no header structure — both share the exact
+`_draw_redaction_box` drawing path the real output uses, so the editor's
+live preview and what `release_from_manual_queue` would actually write
+can't drift apart, the same guarantee the original preview mechanism
+already gave the header page alone (see "The review UI's preview and the
+real output share one drawing path" above).
+
+**Field entry never accepts a SID.** The editor resolves the student by
+name, not by SID, per this session's own explicit instruction: a mistyped
+digit in a directly-typed SID is a silently wrong assignment nothing
+downstream could catch, since a typo'd SID that happens to collide with a
+different real roster entry looks identical to a correct one. `roster.
+filter_roster_by_name(roster, query)` — a substring, case-insensitive
+match against `full_name`, factored out of and now shared with the
+pre-existing "Search the full roster" expander in `_render_packet` — is
+the *only* function anywhere in `review_app.py` that turns typed text into
+a SID; a reviewer always picks a specific entry from the filtered results,
+never types one directly. `test_reviewer_cannot_supply_a_sid_directly_
+only_a_name_resolved_through_roster` (`tests/test_pipeline.py`) proves the
+structural guarantee this depends on: querying with a real SID string
+returns no matches at all (no roster entry's `full_name` ever contains a
+SID), while querying with the actual name resolves to exactly that
+student. Period and worksheet type are shown pre-filled from existing
+detection (the resolved SID's own `period_display`, and the packet's own
+footer-read `worksheet_type`) and worksheet type is editable — a
+correction flows into the real write via a `dataclasses.replace`'d copy of
+the `Packet` passed to `release_from_manual_queue`, never by mutating the
+segmented packet in place. Group members are never a field here at all —
+they are only ever something a reviewer draws a redaction region over, per
+this session's own instruction; there is nothing to type.
+
+**Applying always goes through `release_from_manual_queue`, which still
+runs both unconditional checks against exactly the supplied geometry.** No
+new code path skips `find_uncovered_group_words` or `verify_no_leaked_
+names` — a manually drawn region that still leaves ink uncovered keeps the
+packet held and queued, exactly like a bad four-number band correction
+already did. `release_from_manual_queue` gained `header_bbox_override`/
+`extra_page_regions` parameters (passed straight through to the real
+`redact_packet` call) and a `decisions_dir` parameter (previously implicit
+via the module-level default) so the editor can point it at the same
+`--decisions-dir` the rest of the session already uses.
+
+**Manual geometry is recorded so a re-run reproduces it without redrawing.**
+Once a release actually succeeds with `header_bbox_override`/`extra_page_
+regions` set, `pipeline.save_manual_geometry` persists it to `decisions/
+<pdf-stem>.manual_geometry.json`, keyed by `packet_tag` — a sibling to
+`overrides_path`'s detection-override file, kept out of `decisions/
+<pdf-stem>.json` itself for the same reason: that file's `sid | None |
+absent` three-state contract is depended on by every existing decisions
+file and every test that reads one. `run_dispositions` gained a
+`manual_geometry: dict[str, dict] | None` parameter (both `cli.py run` and
+`review_app.py`'s "Run redaction pipeline" button load it via `pipeline.
+load_manual_geometry` and pass it through, mirroring how both already load
+and pass `detection_overrides`) — a packet whose tag has a stored
+correction gets that geometry applied on this run's *first* redaction
+attempt, not only on a second manual-queue pass, so a packet a human
+already corrected once keeps writing cleanly on every later run without
+being re-queued or redrawn. This never weakens either unconditional
+check: a stored geometry that no longer covers the ink (e.g. after the
+source file changed) is held back and re-queued exactly like any other
+failing geometry would be. Left unset (`None`, the default) or with no
+entry for a given tag, a packet's redaction is byte-for-byte identical to
+before this feature existed — proven directly by `test_no_manual_
+geometry_follows_the_existing_automatic_path_unchanged`, which runs the
+same decided packet through `run_dispositions` with and without an empty
+`manual_geometry` dict and asserts the two output files are byte-identical.
+
+**Tests, all against the synthetic fixture, never real data** (`tests/
+test_pipeline.py`, `tests/test_review_app.py`):
+`test_manual_header_region_releases_the_packet_with_the_same_output_
+shape_as_automatic` (a two-rectangle manual header region that covers the
+real overflow ink releases the packet and produces a clean, single-page
+file — the same shape the automatic path would have produced),
+`test_manual_header_region_that_leaves_ink_uncovered_keeps_packet_held`
+(a region that still falls short of the ink stays held and queued, same
+as a bad band correction always has),
+`test_page_2_region_redacts_page_2_and_leaves_page_1_unchanged` (a fresh
+two-page fixture with its own extra handwritten name on page 2 — proves
+`extra_page_regions` reaches a page `redact_packet` previously had no way
+to touch, and that page 1's own output is untouched, byte-for-byte, by a
+page-2-only edit),
+`test_reviewer_cannot_supply_a_sid_directly_only_a_name_resolved_through_
+roster` (the `filter_roster_by_name` structural guarantee above),
+`test_stored_manual_geometry_reproduces_on_rerun` (a released packet's
+geometry is persisted and, on a later `run_dispositions` call with the
+output and ledger entry removed, reproduces the identical clean write with
+no queueing and no redrawing), and `test_no_manual_geometry_follows_the_
+existing_automatic_path_unchanged` (the byte-identical-output proof
+above). `test_manual_queue_panel_lists_a_queued_packet_and_can_release_it`
+(`tests/test_review_app.py`) was rewritten for the new UI: AppTest drives
+real Streamlit widgets (the name-search text input/selectbox, the Apply
+button) but not `streamlit-drawable-canvas`'s own drag interaction — a
+third-party iframe component, not something AppTest can simulate — so
+that test seeds `st.session_state`'s region dict the same way a reviewer's
+drag would have populated it before the first run, then drives the real
+name-resolution and Apply widgets exactly as a human would click them.
+
 ## Working preferences
 
 - Calibrate against real measured data, not assumptions — when a

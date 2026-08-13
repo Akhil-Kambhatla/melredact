@@ -173,7 +173,7 @@ from melredact.blocks import UNDATED_ROUND, collect_packet_rounds, round_labels_
 from melredact.config import RENDER_DPI_FINAL
 from melredact.match import HeldCandidate, MatchProposal, propose
 from melredact.pdfio import open_pdf
-from melredact.redact import HeaderBand, verify_no_leaked_names
+from melredact.redact import Bbox, HeaderBand, verify_no_leaked_names
 from melredact.redact import redact_packet as _redact_packet
 from melredact.roster import Roster, RosterEntry
 from melredact.segment import Packet, SegmentResult, extract_header_fields
@@ -427,12 +427,15 @@ def release_from_manual_queue(
     tag: str,
     sid: str,
     roster: Roster,
-    band_override: HeaderBand,
+    band_override: HeaderBand | None = None,
     *,
     out_dir: str | Path = OUT_DIR,
     dpi: int = RENDER_DPI_FINAL,
     flatten: bool = False,
     round_label: str | None = None,
+    header_bbox_override: tuple[Bbox, Bbox] | None = None,
+    extra_page_regions: dict[int, list[Bbox]] | None = None,
+    decisions_dir: str | Path = DECISIONS_DIR,
 ) -> ManualReleaseResult:
     """The human side of the manual-redaction queue: re-redacts `packet`
     using a human-supplied, corrected `band_override` instead of whatever
@@ -463,6 +466,17 @@ def release_from_manual_queue(
     cheap regardless -- is the simpler choice over threading the whole
     file's round groups through the manual-queue call chain. A caller that
     already has it (none currently do) can still pass it directly.
+
+    `header_bbox_override`/`extra_page_regions` are the drag-corner
+    editor's geometry (see redact_packet's own docstring for what each
+    means) -- passed straight through to the real `redact_packet` call
+    below, which still runs both unconditional checks against them
+    unconditionally, same as `band_override`. Once a release actually
+    succeeds with either of them set, the geometry is persisted via
+    `save_manual_geometry` so a later run hitting the same hold for the
+    same packet_tag can reproduce this exact result without a human
+    drawing the same boxes again (see run_dispositions' `manual_geometry`
+    parameter).
     """
     if sid not in roster:
         return ManualReleaseResult(packet_tag=tag, sid=sid, released=False, reason=f"sid {sid!r} not on roster")
@@ -475,7 +489,15 @@ def release_from_manual_queue(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     stamp_lines = [f"SID: {entry.sid}", f"PD: {entry.period_display}"]
     redact_result = _redact_packet(
-        pdf_path, packet, out_path, dpi=dpi, flatten=flatten, stamp_lines=stamp_lines, band_override=band_override
+        pdf_path,
+        packet,
+        out_path,
+        dpi=dpi,
+        flatten=flatten,
+        stamp_lines=stamp_lines,
+        band_override=band_override,
+        header_bbox_override=header_bbox_override,
+        extra_page_regions=extra_page_regions,
     )
     if redact_result.uncovered_group_words:
         out_path.unlink()
@@ -495,6 +517,15 @@ def release_from_manual_queue(
     _clear_manual_queue_entry(out_dir, pdf_path, tag)
     ledger[tag] = {"sid": sid, "path": str(out_path)}
     _save_ledger(out_dir, pdf_path, ledger)
+    if header_bbox_override is not None or extra_page_regions:
+        save_manual_geometry(
+            pdf_path,
+            tag,
+            band_override=band_override,
+            header_bbox_override=header_bbox_override,
+            extra_page_regions=extra_page_regions,
+            decisions_dir=decisions_dir,
+        )
     return ManualReleaseResult(packet_tag=tag, sid=sid, released=True, out_path=out_path, reason=collision_note)
 
 
@@ -542,6 +573,89 @@ def save_detection_overrides(
     path = overrides_path(pdf_path, decisions_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(sorted(overrides), indent=2))
+
+
+def manual_geometry_path(pdf_path: str | Path, decisions_dir: Path = DECISIONS_DIR) -> Path:
+    """Where a human's manually-drawn redaction geometry (see review_app.py's
+    manual-queue editor and `release_from_manual_queue`'s `header_bbox_
+    override`/`extra_page_regions` parameters) is persisted per packet_tag,
+    once it has actually released a packet -- so a later run of the same
+    pdf that hits the same hold for the same packet can reproduce the exact
+    same redaction without a human drawing the same boxes again. A separate
+    file from decisions_path, same reasoning as overrides_path: decisions'
+    sid|None|absent contract shouldn't also carry this."""
+    return Path(decisions_dir) / f"{Path(pdf_path).stem}.manual_geometry.json"
+
+
+def _serialize_geometry_entry(
+    band_override: HeaderBand | None,
+    header_bbox_override: tuple[Bbox, Bbox] | None,
+    extra_page_regions: dict[int, list[Bbox]] | None,
+) -> dict:
+    return {
+        "band_override": (
+            {"left": band_override.left, "top": band_override.top, "right": band_override.right, "bottom": band_override.bottom}
+            if band_override is not None
+            else None
+        ),
+        "header_bbox_override": [list(b) for b in header_bbox_override] if header_bbox_override else None,
+        "extra_page_regions": (
+            {str(offset): [list(b) for b in boxes] for offset, boxes in extra_page_regions.items()}
+            if extra_page_regions
+            else None
+        ),
+    }
+
+
+def _deserialize_geometry_entry(entry: dict) -> dict:
+    band = entry.get("band_override")
+    header_bboxes = entry.get("header_bbox_override")
+    extra = entry.get("extra_page_regions")
+    kwargs: dict = {}
+    if band:
+        kwargs["band_override"] = HeaderBand(
+            left=band["left"], top=band["top"], right=band["right"], bottom=band["bottom"], detected=True
+        )
+    if header_bboxes:
+        kwargs["header_bbox_override"] = tuple(tuple(b) for b in header_bboxes)
+    if extra:
+        kwargs["extra_page_regions"] = {int(offset): [tuple(b) for b in boxes] for offset, boxes in extra.items()}
+    return kwargs
+
+
+def load_manual_geometry(pdf_path: str | Path, decisions_dir: Path = DECISIONS_DIR) -> dict[str, dict]:
+    """packet_tag -> kwargs ready to splat into redact_packet (band_override/
+    header_bbox_override/extra_page_regions, whichever were actually
+    recorded) -- already deserialized from JSON's lists back into the
+    tuples redact_packet expects. An absent file (the overwhelmingly common
+    case: no packet in this pdf has ever needed a manual correction) returns
+    an empty dict, same convention as load_detection_overrides."""
+    path = manual_geometry_path(pdf_path, decisions_dir)
+    if not path.exists():
+        return {}
+    raw = json.loads(path.read_text())
+    return {tag: _deserialize_geometry_entry(entry) for tag, entry in raw.items()}
+
+
+def save_manual_geometry(
+    pdf_path: str | Path,
+    tag: str,
+    *,
+    band_override: HeaderBand | None = None,
+    header_bbox_override: tuple[Bbox, Bbox] | None = None,
+    extra_page_regions: dict[int, list[Bbox]] | None = None,
+    decisions_dir: Path = DECISIONS_DIR,
+) -> None:
+    """Records this tag's manually-supplied geometry, merged into whatever
+    was already recorded for other tags in this pdf -- called by
+    `release_from_manual_queue` only once a release actually succeeds
+    (there is nothing worth reproducing about geometry that still failed
+    both unconditional checks)."""
+    path = manual_geometry_path(pdf_path, decisions_dir)
+    all_geometry = json.loads(path.read_text()) if path.exists() else {}
+    all_geometry[tag] = _serialize_geometry_entry(band_override, header_bbox_override, extra_page_regions)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(all_geometry, indent=2, sort_keys=True))
 
 
 def propose_all(pdf_path: str | Path, segmented: SegmentResult, roster: Roster) -> list[MatchProposal]:
@@ -757,6 +871,7 @@ def run_dispositions(
     detection_overrides: set[str] = frozenset(),
     round_labels: dict[str, str] | None = None,
     allow_delete: bool = True,
+    manual_geometry: dict[str, dict] | None = None,
 ) -> list[DispositionResult]:
     """Apply final per-packet decisions. See module docstring for the
     three-state `decisions` contract -- this is where "confirmed
@@ -812,6 +927,20 @@ def run_dispositions(
     individual decision says. The skipped deletion is still surfaced (a
     `DispositionResult.reason` noting the file that was left in place),
     never silently dropped.
+
+    `manual_geometry` (packet_tag -> kwargs, see `load_manual_geometry`) is
+    a human's previously-successful manual-queue correction for this exact
+    packet_tag (see `release_from_manual_queue`'s own persistence of it) --
+    applied to this run's *first* redaction attempt for that tag, not only
+    on a second manual-queue pass, so a packet a human already corrected
+    once reproduces the same clean write on every later run without being
+    re-queued or redrawn. It never weakens either unconditional check: a
+    stored geometry that no longer covers the ink (e.g. after a source
+    file changed) is held back and re-queued exactly like any other
+    failing geometry, with the drafted attempt available for the queue
+    editor same as always. Left as None (the default), no packet in this
+    run gets any geometry override beyond band_override/header_bbox_
+    override/extra_page_regions this function never itself constructs.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -913,7 +1042,10 @@ def run_dispositions(
         )
         out_path.parent.mkdir(parents=True, exist_ok=True)
         stamp_lines = [f"SID: {entry.sid}", f"PD: {entry.period_display}"]
-        redact_result = _redact_packet(pdf_path, packet, out_path, dpi=dpi, flatten=flatten, stamp_lines=stamp_lines)
+        geometry_kwargs = (manual_geometry or {}).get(tag, {})
+        redact_result = _redact_packet(
+            pdf_path, packet, out_path, dpi=dpi, flatten=flatten, stamp_lines=stamp_lines, **geometry_kwargs
+        )
         detection_note: str | None = None
         if redact_result.band is not None and not redact_result.band.detected:
             # detect_header_band couldn't confidently locate this page's

@@ -27,11 +27,35 @@ data/README.md) -- identifiable scanned data, gitignored, never sync it.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import sys
 from pathlib import Path
 
 import streamlit as st
+import streamlit.elements.image as _st_image_module
 from PIL import Image
+
+if not hasattr(_st_image_module, "image_to_url"):
+    # streamlit-drawable-canvas 0.9.3's own st_canvas() calls
+    # streamlit.elements.image.image_to_url(image, width, clamp, channels,
+    # output_format, image_id) -- a function this streamlit version moved
+    # to streamlit.elements.lib.image_utils and rewrote to take a
+    # LayoutConfig instead of a bare pixel width as its second argument.
+    # Shimmed here (module-level, before importing st_canvas) rather than
+    # patched in the installed package, the same "route around an upstream
+    # parser gap without touching our own data" posture pdfio.py's open_pdf
+    # already takes for a pdfplumber/pdfminer.six incompatibility -- see
+    # CLAUDE.md. Guarded on hasattr so this becomes a no-op the moment
+    # streamlit-drawable-canvas ships its own fix for a newer Streamlit.
+    from streamlit.elements.lib.image_utils import image_to_url as _image_to_url
+    from streamlit.elements.lib.layout_utils import LayoutConfig as _LayoutConfig
+
+    def _image_to_url_compat(image, width, clamp, channels, output_format, image_id):
+        return _image_to_url(image, _LayoutConfig(width=width), clamp, channels, output_format, image_id)
+
+    _st_image_module.image_to_url = _image_to_url_compat
+
+from streamlit_drawable_canvas import st_canvas
 
 from melredact.blocks import (
     BlockMeaning,
@@ -50,7 +74,7 @@ from melredact.blocks import (
     round_labels_by_tag,
     save_resolved_block_record,
 )
-from melredact.config import CACHE_DIR, HEADER_BAND_FALLBACK, MIN_MARGIN, MIN_SCORE, RENDER_DPI_PREVIEW
+from melredact.config import CACHE_DIR, MIN_MARGIN, MIN_SCORE, RENDER_DPI_PREVIEW
 from melredact.match import assign_all
 from melredact.pdfio import open_pdf
 from melredact.pipeline import (
@@ -58,6 +82,7 @@ from melredact.pipeline import (
     list_manual_queue,
     load_decisions,
     load_detection_overrides,
+    load_manual_geometry,
     manual_queue_draft_path,
     packet_tag,
     propose_all,
@@ -66,9 +91,15 @@ from melredact.pipeline import (
     save_decisions,
     save_detection_overrides,
 )
-from melredact.redact import HeaderBand, render_redaction_preview
-from melredact.roster import Roster, RosterError, infer_period_from_filename, load_roster
-from melredact.segment import Packet, SegmentResult, extract_header_fields, segment_pdf
+from melredact.redact import (
+    Bbox,
+    detect_header_band,
+    redact_bboxes_for_band,
+    render_redaction_preview,
+    render_region_preview,
+)
+from melredact.roster import Roster, RosterError, filter_roster_by_name, infer_period_from_filename, load_roster
+from melredact.segment import Packet, SegmentResult, extract_header_fields, header_row_height, segment_pdf
 
 DPI = RENDER_DPI_PREVIEW
 
@@ -274,6 +305,7 @@ def _render_sidebar(
         with st.spinner("Redacting approved packets..."):
             fresh_decisions = load_decisions(args.pdf_path, decisions_dir=Path(args.decisions_dir))
             fresh_overrides = load_detection_overrides(args.pdf_path, decisions_dir=Path(args.decisions_dir))
+            fresh_manual_geometry = load_manual_geometry(args.pdf_path, decisions_dir=Path(args.decisions_dir))
             results = run_dispositions(
                 args.pdf_path,
                 segmented,
@@ -283,6 +315,7 @@ def _render_sidebar(
                 detection_overrides=fresh_overrides,
                 round_labels=round_labels,
                 allow_delete=not disable_deletion,
+                manual_geometry=fresh_manual_geometry,
             )
             written = [r for r in results if r.out_path is not None]
             deleted = sum(1 for r in results if r.deleted_path is not None)
@@ -379,18 +412,218 @@ def _stamp_lines_for(sid: str | None, roster: Roster) -> list[str] | None:
     return [f"SID: {entry.sid}", f"PD: {entry.period_display}"]
 
 
+def _bbox_to_canvas_rect(bbox: Bbox, dpi: int) -> dict:
+    """Page-point Bbox -> a fabric.js rect object at canvas (image) pixel
+    scale, for `st_canvas`'s `initial_drawing` -- seeds the canvas with
+    whatever geometry (automatic detection, or a previously-drawn region)
+    already exists for this page, so the common case is nudging an
+    existing box rather than drawing from nothing."""
+    scale = dpi / 72.0
+    left, top, right, bottom = bbox
+    return {
+        "type": "rect",
+        "left": left * scale,
+        "top": top * scale,
+        "width": max(1.0, (right - left) * scale),
+        "height": max(1.0, (bottom - top) * scale),
+        "scaleX": 1,
+        "scaleY": 1,
+        "angle": 0,
+        "fill": "rgba(255, 0, 0, 0.25)",
+        "stroke": "red",
+        "strokeWidth": 2,
+    }
+
+
+def _canvas_rect_to_bbox(obj: dict, dpi: int) -> Bbox:
+    """Inverse of `_bbox_to_canvas_rect`: a fabric.js rect object (after a
+    reviewer has dragged/resized it, or drawn a new one) back to a
+    page-point Bbox. `scaleX`/`scaleY` are fabric.js's own resize factors
+    applied on top of the object's original width/height -- both must be
+    folded in, not just width/height alone, or a corner-dragged resize
+    would silently be ignored."""
+    scale = dpi / 72.0
+    left = float(obj.get("left", 0.0))
+    top = float(obj.get("top", 0.0))
+    width = float(obj.get("width", 0.0)) * float(obj.get("scaleX", 1.0))
+    height = float(obj.get("height", 0.0)) * float(obj.get("scaleY", 1.0))
+    return (left / scale, top / scale, (left + width) / scale, (top + height) / scale)
+
+
+def _seed_manual_regions(args: argparse.Namespace, packet: Packet) -> dict[int, list[Bbox]]:
+    """Initial regions for a freshly-opened editor session: the header
+    page's own automatically-detected two rectangles (see redact_bboxes_
+    for_band), so a reviewer starts from what detection already proposed
+    and only has to nudge it -- never from a blank page. Other pages start
+    with no regions; a reviewer adds them by hand (e.g. a PRT packet's
+    page 2 name)."""
+    regions: dict[int, list[Bbox]] = {}
+    if packet.header_page_index is not None:
+        header_offset = packet.page_indices.index(packet.header_page_index)
+        raw_image = _page_image(args.pdf_path, packet.header_page_index, DPI)
+        fields = _header_fields(args.pdf_path, packet.header_page_index)
+        band = detect_header_band(
+            raw_image, dpi=DPI, anchors=fields.anchors, row_height=header_row_height(fields.anchors)
+        )
+        regions[header_offset] = list(redact_bboxes_for_band(band, fields.anchors.group_top))
+    return regions
+
+
+def _render_manual_editor(args: argparse.Namespace, roster: Roster, packet: Packet, tag: str, sid: str) -> None:
+    """One queued packet's editor: original page on the left, live redacted
+    result on the right, both at DPI (see review_app.py's own DPI
+    constant). A reviewer drags the corners of the seeded rectangles (see
+    `_seed_manual_regions`) or draws new ones on any page of the packet --
+    a header and a page-2 name are separate regions, so the page selector
+    defaults to page 1 but nothing stops a reviewer from switching to page
+    2 and adding a region there too.
+
+    Applying goes through `pipeline.release_from_manual_queue`, which
+    re-runs the real redaction and both unconditional checks
+    (find_uncovered_group_words, verify_no_leaked_names) against exactly
+    this geometry -- a region that still leaves ink uncovered keeps the
+    packet held, the editor supplies geometry, it never bypasses either
+    check. A reviewer resolves the student by typing their NAME (see
+    `filter_roster_by_name`) -- there is no field anywhere in this editor
+    that accepts a SID directly, since a mistyped digit would be a
+    silently wrong assignment nothing downstream could catch."""
+    regions_key = f"mq_regions_{tag}"
+    if regions_key not in st.session_state:
+        st.session_state[regions_key] = _seed_manual_regions(args, packet)
+    regions: dict[int, list[Bbox]] = st.session_state[regions_key]
+
+    header_offset = packet.page_indices.index(packet.header_page_index) if packet.header_page_index is not None else None
+    page_options = list(range(packet.n_pages))
+    default_page = header_offset if header_offset is not None else 0
+    page_offset = st.selectbox(
+        "Editing page",
+        options=page_options,
+        format_func=lambda i: f"Page {i + 1} of {packet.n_pages}",
+        index=default_page,
+        key=f"mq_pageselect_{tag}",
+    )
+
+    current_boxes = regions.get(page_offset, [])
+    page_idx = packet.page_indices[page_offset]
+    raw_image = _page_image(args.pdf_path, page_idx, DPI)
+
+    mode_label = st.radio(
+        "Tool",
+        ["Move / resize existing boxes", "Draw a new box"],
+        key=f"mq_mode_{tag}_{page_offset}",
+        horizontal=True,
+    )
+    if st.button("Clear boxes on this page", key=f"mq_clear_{tag}_{page_offset}"):
+        regions[page_offset] = []
+        current_boxes = []
+
+    col_canvas, col_preview = st.columns(2)
+    with col_canvas:
+        st.caption(f"Original — page {page_offset + 1}")
+        canvas_result = st_canvas(
+            fill_color="rgba(255, 0, 0, 0.25)",
+            stroke_width=2,
+            stroke_color="red",
+            background_image=raw_image,
+            update_streamlit=True,
+            height=raw_image.height,
+            width=raw_image.width,
+            drawing_mode="transform" if mode_label.startswith("Move") else "rect",
+            initial_drawing={"version": "4.4.0", "objects": [_bbox_to_canvas_rect(b, DPI) for b in current_boxes]},
+            key=f"mq_canvas_{tag}_{page_offset}",
+        )
+    if canvas_result.json_data is not None:
+        objs = [o for o in canvas_result.json_data.get("objects", []) if o.get("type") == "rect"]
+        current_boxes = [_canvas_rect_to_bbox(o, DPI) for o in objs]
+        regions[page_offset] = current_boxes
+
+    with col_preview:
+        st.caption("Redacted result (live preview)")
+        stamp_lines = _stamp_lines_for(sid, roster) if sid in roster else None
+        if page_offset == header_offset:
+            if len(current_boxes) == 0:
+                st.image(raw_image, caption="No regions drawn yet on the header page")
+            else:
+                header_bbox_override = (
+                    (current_boxes[0], current_boxes[1]) if len(current_boxes) >= 2 else (current_boxes[0], current_boxes[0])
+                )
+                preview_image, _ = render_redaction_preview(
+                    raw_image, dpi=DPI, stamp_lines=stamp_lines, header_bbox_override=header_bbox_override
+                )
+                st.image(preview_image, caption="Preview with your drawn regions")
+        else:
+            preview_image = render_region_preview(raw_image, dpi=DPI, bboxes=current_boxes)
+            st.image(preview_image, caption="Preview with your drawn regions" if current_boxes else "No regions drawn on this page")
+
+    st.write("Resolve the student by name — never by typing a SID directly:")
+    default_query = roster.by_sid[sid].full_name if sid in roster else ""
+    name_query = st.text_input("Student name", value=default_query, key=f"mq_name_{tag}")
+    matches = filter_roster_by_name(roster, name_query)
+    resolved_sid: str | None = None
+    if not name_query.strip():
+        st.info("Type a student name to search the roster.")
+    elif not matches:
+        st.warning("No roster entry matches this name.")
+    else:
+        resolved_sid = st.selectbox(
+            "Matching roster entries",
+            options=[e.sid for e in matches],
+            format_func=lambda s: _decision_label(s, roster),
+            key=f"mq_sidselect_{tag}",
+        )
+
+    st.write("Worksheet details (pre-filled from detection, editable):")
+    c1, c2 = st.columns(2)
+    worksheet_type_value = c1.text_input("Worksheet type", value=packet.worksheet_type or "", key=f"mq_wtype_{tag}")
+    period_value = roster.by_sid[resolved_sid].period_display if resolved_sid in roster else ""
+    c2.text_input("Period (derived from resolved SID)", value=period_value, disabled=True, key=f"mq_period_{tag}")
+
+    apply_disabled = resolved_sid is None or not worksheet_type_value.strip()
+    if st.button("Apply manual redaction", type="primary", key=f"mq_apply_{tag}", disabled=apply_disabled):
+        header_bbox_override: tuple[Bbox, Bbox] | None = None
+        extra_page_regions: dict[int, list[Bbox]] = {}
+        for offset, boxes in regions.items():
+            if not boxes:
+                continue
+            if offset == header_offset:
+                header_bbox_override = (boxes[0], boxes[1]) if len(boxes) >= 2 else (boxes[0], boxes[0])
+            else:
+                extra_page_regions[offset] = boxes
+
+        packet_for_release = packet
+        if worksheet_type_value.strip() != (packet.worksheet_type or ""):
+            packet_for_release = dataclasses.replace(packet, worksheet_type=worksheet_type_value.strip())
+
+        result = release_from_manual_queue(
+            args.pdf_path,
+            packet_for_release,
+            tag,
+            resolved_sid,
+            roster,
+            None,
+            out_dir=Path(args.out_dir),
+            decisions_dir=Path(args.decisions_dir),
+            header_bbox_override=header_bbox_override,
+            extra_page_regions=extra_page_regions or None,
+        )
+        if result.released:
+            st.success(f"Released {tag} -> {result.out_path}")
+            del st.session_state[regions_key]
+            st.rerun()
+        else:
+            st.error(f"Still not safe to release with these regions: {result.reason}")
+
+
 def _render_manual_queue(args: argparse.Namespace, roster: Roster, packet_by_tag: dict[str, Packet]) -> None:
     """The backstop for a genuine detection-confidence or coverage-check
     miss (see CLAUDE.md's "the manual-redaction queue is a backstop"
     section) -- never a substitute for the automated checks catching it in
     the first place. Each queued entry shows the drafted (not-safe-to-ship)
-    attempt exactly as it was held back, lets a human propose a corrected
-    band, previews that correction through the same render_redaction_
-    preview mechanism the ordinary decision preview uses, and only writes
-    to out/ if release_from_manual_queue's own re-check of both automated
-    checks (uncovered_group_words, verify_no_leaked_names) still passes
-    with that geometry -- a wrong correction stays queued, nothing is
-    written."""
+    attempt exactly as it was held back, then opens `_render_manual_editor`
+    for drawing a corrected region directly -- applying always goes through
+    `release_from_manual_queue`'s own re-check of both automated checks
+    (uncovered_group_words, verify_no_leaked_names); a wrong correction
+    stays queued, nothing is written."""
     entries = [e for e in list_manual_queue(args.out_dir) if e["pdf_path"] == str(Path(args.pdf_path))]
     if not entries:
         st.info("Manual redaction queue is empty for this scan.")
@@ -412,33 +645,7 @@ def _render_manual_queue(args: argparse.Namespace, roster: Roster, packet_by_tag
                     draft_image = pdf.pages[0].to_image(resolution=DPI).original.convert("RGB")
                 st.image(draft_image, caption="Drafted redaction attempt that was held back -- not safe to ship as is")
 
-            st.write("Propose a corrected header band (points, page-top-down):")
-            c1, c2, c3, c4 = st.columns(4)
-            left = c1.number_input("left", value=float(HEADER_BAND_FALLBACK["left"]), key=f"mq_left_{tag}")
-            top = c2.number_input("top", value=float(HEADER_BAND_FALLBACK["top"]), key=f"mq_top_{tag}")
-            right = c3.number_input("right", value=float(HEADER_BAND_FALLBACK["right"]), key=f"mq_right_{tag}")
-            bottom = c4.number_input(
-                "bottom", value=float(HEADER_BAND_FALLBACK["bottom"] + 20), key=f"mq_bottom_{tag}"
-            )
-            candidate_band = HeaderBand(left=left, top=top, right=right, bottom=bottom, detected=True)
-
-            if packet.header_page_index is not None:
-                raw_image = _page_image(args.pdf_path, packet.header_page_index, DPI)
-                stamp_lines = _stamp_lines_for(sid, roster) if sid in roster else None
-                preview_image, _ = render_redaction_preview(
-                    raw_image, dpi=DPI, stamp_lines=stamp_lines, band_override=candidate_band
-                )
-                st.image(preview_image, caption="Preview with your proposed corrected band")
-
-            if st.button("Release to out/", type="primary", key=f"mq_release_{tag}"):
-                result = release_from_manual_queue(
-                    args.pdf_path, packet, tag, sid, roster, candidate_band, out_dir=Path(args.out_dir)
-                )
-                if result.released:
-                    st.success(f"Released {tag} -> {result.out_path}")
-                    st.rerun()
-                else:
-                    st.error(f"Still not safe to release with this band: {result.reason}")
+            _render_manual_editor(args, roster, packet, tag, sid)
 
 
 def _render_packet(
@@ -545,7 +752,7 @@ def _render_packet(
 
     with st.expander("Search the full roster"):
         query = st.text_input("Filter by name", key=f"search_{tag}")
-        matches = [e for e in roster if not query or query.lower() in e.full_name.lower()]
+        matches = filter_roster_by_name(roster, query)
         if matches:
             chosen = st.selectbox(
                 "Roster entry",

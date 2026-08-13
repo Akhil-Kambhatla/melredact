@@ -214,11 +214,25 @@ def test_manual_queue_panel_lists_a_queued_packet_and_can_release_it(tmp_path):
     """End-to-end through the review UI: a packet 14-style vertical
     overflow gets auto-held (see pipeline.py/test_pipeline.py), lands in
     the manual-redaction queue, and shows up in review_app.py's own queue
-    panel with a working release path -- releasing with a corrected band
-    that actually covers the overflow ink must write the file and clear
-    the queue; the panel must not be a dead end."""
+    editor with a working release path -- releasing with a corrected
+    region that actually covers the overflow ink must write the file and
+    clear the queue; the panel must not be a dead end.
+
+    AppTest drives real Streamlit widgets but not the drawable-canvas
+    component's own drag interaction (a third-party iframe, not something
+    AppTest can simulate) -- so this seeds `st.session_state`'s region
+    dict the same way a reviewer's drag would have populated it (see
+    `_render_manual_editor`'s `regions_key`) before the first run, then
+    drives the real name-search and Apply widgets exactly as a human would
+    click them. This is the same corrected geometry
+    test_manual_queue_release_with_a_corrected_band_writes_and_clears_the_
+    queue already proves at the pipeline.py level -- this test's own job is
+    proving the *UI* actually reaches release_from_manual_queue with it,
+    not re-proving the redaction geometry itself."""
     from melredact.blocks import round_label
+    from melredact.config import GROUP_ANCHOR, HEADER_BAND_FALLBACK
     from melredact.pipeline import list_manual_queue, output_path, run_dispositions
+    from melredact.redact import HeaderBand, redact_bboxes_for_band
     from melredact.roster import load_roster
     from melredact.segment import segment_pdf as _segment_pdf
 
@@ -232,16 +246,43 @@ def test_manual_queue_panel_lists_a_queued_packet_and_can_release_it(tmp_path):
     run_dispositions(pdf_path, seg, {tag: sid}, roster, out_dir=out_dir)
     assert len(list_manual_queue(out_dir)) == 1
 
-    at = _launch(pdf_path, roster_path, out_dir, decisions_dir)
-    assert "🛠️ Manual-redaction queue: 1" in [w.value for w in at.sidebar.markdown]
-    show_queue_checkbox = next(c for c in at.sidebar.checkbox if c.key == "show_manual_queue")
-    show_queue_checkbox.set_value(True).run()
+    corrected_band = HeaderBand(
+        left=HEADER_BAND_FALLBACK["left"],
+        top=HEADER_BAND_FALLBACK["top"],
+        right=HEADER_BAND_FALLBACK["right"],
+        bottom=overflow_top_pt + 20,
+        detected=True,
+    )
+    left_bbox, right_bbox = redact_bboxes_for_band(corrected_band, GROUP_ANCHOR["top"])
+
+    sys.argv = [
+        "review_app.py",
+        str(pdf_path),
+        str(roster_path),
+        "--out-dir",
+        str(out_dir),
+        "--decisions-dir",
+        str(decisions_dir),
+    ]
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.session_state["show_manual_queue"] = True
+    at.session_state[f"mq_regions_{tag}"] = {0: [left_bbox, right_bbox]}
+    at.run()
     assert not at.exception
     assert any(tag in expander.label for expander in at.expander)
 
-    at.number_input(key=f"mq_bottom_{tag}").set_value(overflow_top_pt + 20).run()
-    release_btn = next(b for b in at.button if b.key == f"mq_release_{tag}")
-    release_btn.click().run()
+    name_input = at.text_input(key=f"mq_name_{tag}")
+    assert name_input.value == "Alex Rivera"  # pre-filled from the packet's already-decided sid
+    assert not any(w.key == f"mq_sid_{tag}" for w in at.text_input)  # no widget ever accepts a raw sid
+    name_input.set_value("Alex Rivera").run()
+
+    sid_select = at.selectbox(key=f"mq_sidselect_{tag}")
+    assert sid_select.options == [f"{sid} — Alex Rivera"]
+    sid_select.set_value(f"{sid} — Alex Rivera").run()
+
+    apply_btn = next(b for b in at.button if b.key == f"mq_apply_{tag}")
+    assert not apply_btn.disabled
+    apply_btn.click().run()
     assert not at.exception
 
     entry = roster.by_sid[sid]
