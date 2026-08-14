@@ -73,6 +73,23 @@ def file_content_hash(path: str | Path) -> str:
     return _file_content_hash(path)
 
 
+def _stable_page_identity(pdf_path: str | Path, page_index: int) -> str:
+    """Cache-directory identity for one page's OCR results -- see
+    orientation.stable_ocr_identity's own docstring for the bug this
+    exists to avoid: `pdf_path` here is `page.pdf.path`, which is a
+    *whole-file* resave the instant any page in the file has an
+    orientation override applied, so hashing it directly (this module's
+    prior behavior) invalidated every page's OCR cache the moment a
+    single, unrelated page's rotation changed -- confirmed the dominant
+    cost of the review UI's rotate control (a cold re-OCR of the entire
+    file on every click). Deferred import: orientation.py already imports
+    from this module (file_content_hash), so importing it back here has to
+    stay inside the function to avoid a circular import at module load."""
+    from melredact.orientation import stable_ocr_identity
+
+    return stable_ocr_identity(Path(pdf_path), page_index)
+
+
 def _ocr_cache_path(pdf_path: str | Path, page_index: int, dpi: int, bbox: BBox) -> Path:
     # bbox is part of the key, not just file+page+dpi: segmentation's small
     # header/footer crops and redact_packet's full-page request are
@@ -86,7 +103,8 @@ def _ocr_cache_path(pdf_path: str | Path, page_index: int, dpi: int, bbox: BBox)
     # every *repeat* of that same call (the actual duplication this exists
     # to fix -- see cached_ocr_words_in_region's docstring) to one.
     bbox_key = "_".join(f"{v:.1f}" for v in bbox)
-    return Path(CACHE_DIR) / "ocr" / _file_content_hash(pdf_path) / f"page_{page_index:04d}_{dpi}_{bbox_key}.json"
+    identity = _stable_page_identity(pdf_path, page_index)
+    return Path(CACHE_DIR) / "ocr" / identity / f"page_{page_index:04d}_{dpi}_{bbox_key}.json"
 
 
 def cached_ocr_words_in_region(page: pdfplumber.page.Page, bbox: BBox, dpi: int = RENDER_DPI_FINAL) -> list[Word]:

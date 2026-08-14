@@ -186,18 +186,43 @@ import json
 import re
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from melredact.blocks import UNDATED_ROUND, collect_packet_rounds, round_labels_by_tag
-from melredact.config import RENDER_DPI_FINAL
+from melredact.blocks import (
+    UNDATED_ROUND,
+    RoundGroup,
+    collect_packet_dates,
+    collect_packet_rounds,
+    format_round_report,
+    group_into_rounds,
+    round_disagreeing_tags,
+    round_labels_by_tag,
+)
+from melredact.config import HEADER_SEARCH_MAX_TOP, MIN_MARGIN, MIN_SCORE, RENDER_DPI_FINAL
 from melredact.consensus import AnomalyHold, analyze_consensus_anomalies
-from melredact.match import HeldCandidate, MatchProposal, propose
+from melredact.match import HeldCandidate, MatchProposal, assign_all, propose
 from melredact.pdfio import open_pdf
-from melredact.redact import Bbox, HeaderBand, verify_no_leaked_names
+from melredact.redact import (
+    Bbox,
+    HeaderBand,
+    detect_header_band,
+    find_uncovered_group_words,
+    redact_bboxes_for_band,
+    verify_no_leaked_names,
+)
 from melredact.redact import redact_packet as _redact_packet
 from melredact.roster import Roster, RosterEntry
-from melredact.segment import Packet, SegmentResult, extract_header_fields
+from melredact.segment import (
+    Packet,
+    SegmentResult,
+    extract_header_fields,
+    header_row_height,
+    locate_header_anchors,
+    page_words,
+    segment_pdf,
+)
 
 DECISIONS_DIR = Path("decisions")
 OUT_DIR = Path("out")
@@ -1401,3 +1426,440 @@ def run_dispositions(
         _save_ledger(out_dir, pdf_path, ledger)
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Preflight: a read-only, whole-file report of everything wrong with a scan
+# before any review, before `run`/`analyze`, before anything touches out_dir,
+# decisions_dir, or the ledger -- meant to be runnable the moment a file
+# comes off Box, so a human can decide whether to review it now or hand it
+# back for a rescan/re-export without first paying for a full cold-OCR run
+# and then discovering the problem 20 minutes in.
+#
+# Deliberately does NOT call `analyze_redaction_holds` (the per-packet, real
+# `redact_packet` draft that also runs `verify_no_leaked_names`): that pass
+# exists to preserve the kept text layer at write time (see CLAUDE.md's "OCR
+# is disk-cached" section -- full-page OCR measured at ~29s/page, the
+# dominant cost of a real run) and preflight has no text layer to preserve.
+# Detection-hold and the uncovered-ink advisory only need the header page's
+# own raster (`detect_header_band` -- a pixel scan, no OCR involved at all)
+# plus the header-band OCR crop matching already made and disk-cached (see
+# `_header_geometry_check` below) -- so preflight computes both directly, at
+# a fraction of the cost, instead of drafting a full redaction per packet.
+# The cost that *is* unavoidable is the same one `segment_pdf`'s own
+# footer/header-label pass and `propose_all`'s own field-extraction pass
+# already require on a cold cache -- small header/footer-band OCR calls, not
+# full-page ones (see CLAUDE.md's "Speed finding" section: ~4.8s/call on the
+# real 44-page file, vs. ~29s/page for a full-page pass) -- `elapsed_seconds`
+# on the returned report says plainly whether that cost was actually paid.
+#
+# Every OCR/rasterize/orientation call preflight makes goes through the
+# exact same disk caches (ocr.py, orientation.py, consensus.py) the real
+# `segment_pdf`/`propose_all`/`analyze_consensus_anomalies`/`run_
+# dispositions` calls use -- so a `cli.py run` immediately following a
+# preflight run against the same file starts warm, not cold. Nothing here
+# is throwaway work.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OrientationFlag:
+    page_index: int
+    packet_tag: str | None
+    page_offset: int | None  # 1-indexed within its packet, when known
+    kind: str  # "unresolved" or "pending_confirmation"
+    detected_angle: int
+    score: float
+
+
+@dataclass
+class PreflightPacket:
+    packet_tag: str
+    packet_index: int
+    header_page_index: int | None
+    page_indices: list[int]
+    n_pages: int
+    declared_total: int | None
+    page_count_mismatch: bool
+    is_orphan: bool
+    issues: list[str]
+    worksheet_type: str | None
+    round_label: str | None
+    round_disagrees: bool
+    top_score: float | None
+    top_margin: float | None
+    has_plausible_match: bool
+    would_auto_assign: bool
+    detection_hold: bool = False
+    detection_reason: str | None = None
+    uncovered_ink_advisory: bool = False
+    consensus_hold: bool = False
+    consensus_reason: str | None = None
+    consensus_hold_pages: list[int] = field(default_factory=list)
+
+    @property
+    def blocked(self) -> bool:
+        """A structural problem (segmentation issue -- missing header,
+        unreadable footer, page-count mismatch, unresolved/unconfirmed
+        orientation) that has to be fixed or reviewed via the rotate
+        controls before *anything* -- matching, redaction -- can even be
+        attempted for this packet. Mirrors run_dispositions' own "a packet
+        with unresolved issues is refused even if decisions names a SID
+        for it" rule."""
+        return bool(self.issues)
+
+    @property
+    def clean(self) -> bool:
+        """No structural problem, no detection/consensus/advisory flag, and
+        would auto-assign with zero human input -- a one-click "looks
+        right, confirm" packet."""
+        return (
+            not self.blocked
+            and not self.detection_hold
+            and not self.consensus_hold
+            and not self.uncovered_ink_advisory
+            and self.would_auto_assign
+        )
+
+
+@dataclass
+class PreflightReport:
+    pdf_path: Path
+    page_count: int
+    packets: list[PreflightPacket]
+    round_groups: list[RoundGroup]
+    orientation_flags: list[OrientationFlag]
+    roster_period: str | None
+    roster_entry_count: int
+    elapsed_seconds: float
+
+    @property
+    def n_packets(self) -> int:
+        return len(self.packets)
+
+    @property
+    def n_page_count_mismatch(self) -> int:
+        return sum(1 for p in self.packets if p.page_count_mismatch)
+
+    @property
+    def n_unsegmentable(self) -> int:
+        return sum(1 for p in self.packets if p.is_orphan)
+
+    @property
+    def n_no_plausible_match(self) -> int:
+        return sum(1 for p in self.packets if not p.is_orphan and not p.has_plausible_match)
+
+    @property
+    def n_detection_holds(self) -> int:
+        return sum(1 for p in self.packets if p.detection_hold)
+
+    @property
+    def n_uncovered_ink_advisories(self) -> int:
+        return sum(1 for p in self.packets if p.uncovered_ink_advisory)
+
+    @property
+    def n_consensus_holds(self) -> int:
+        return sum(1 for p in self.packets if p.consensus_hold)
+
+    @property
+    def n_cannot_process(self) -> int:
+        return sum(1 for p in self.packets if p.blocked)
+
+    @property
+    def n_clean(self) -> int:
+        return sum(1 for p in self.packets if p.clean)
+
+    @property
+    def n_needs_editor(self) -> int:
+        # Deliberately "everything else", not a second independent count --
+        # every packet is in exactly one of the three verdict buckets, so
+        # this guarantees n_clean + n_needs_editor + n_cannot_process ==
+        # n_packets always, rather than risking two buckets silently
+        # double-counting (or missing) the same packet through separately
+        # maintained conditions.
+        return self.n_packets - self.n_cannot_process - self.n_clean
+
+
+def _header_geometry_check(page, *, dpi: int = RENDER_DPI_FINAL) -> tuple[HeaderBand, list]:
+    """band + uncovered_group_words for one header page, without a full
+    per-page OCR pass or a real redact_packet draft -- see the preflight
+    section's own module note above for why. Mirrors redact_packet's own
+    header-page logic exactly (same functions, same order, same
+    header_words bbox/dpi any matching call already made and disk-cached),
+    so a packet flagged here is flagged for the identical reason a real
+    run would flag it for -- not a looser, preflight-only approximation."""
+    header_words = page_words(page, (0, 0, page.width, HEADER_SEARCH_MAX_TOP))
+    anchors = locate_header_anchors(header_words)
+    row_height = header_row_height(anchors)
+    image = page.to_image(resolution=dpi).original.convert("RGB")
+    band = detect_header_band(image, dpi=dpi, anchors=anchors, row_height=row_height)
+    left_bbox, right_bbox = redact_bboxes_for_band(band, anchors.group_top)
+    uncovered = find_uncovered_group_words(header_words, anchors, left_bbox, right_bbox)
+    return band, uncovered
+
+
+def _collect_orientation_flags(
+    pdf_path: str | Path, segmented: SegmentResult, *, orientation_overrides: dict[int, int] | None = None
+) -> list[OrientationFlag]:
+    """Every page whose orientation is nonzero-and-unconfirmed or too
+    ambiguous to guess from at all, matched back to the packet (and
+    within-packet page offset) it belongs to, so a human can locate it as
+    "page N of packet X" rather than a bare physical page index. Reuses
+    orientation.orientation_for, already disk-cached by segment_pdf's own
+    call moments earlier in run_preflight -- this costs nothing extra."""
+    from melredact.orientation import orientation_for
+
+    result = orientation_for(pdf_path, overrides=orientation_overrides)
+    by_page = result.by_page()
+    located: dict[int, tuple[str, int]] = {}
+    for packet in segmented.packets:
+        tag = packet_tag(pdf_path, packet)
+        for offset, idx in enumerate(packet.page_indices):
+            located[idx] = (tag, offset + 1)
+
+    flagged = sorted(set(result.unresolved_page_indices()) | set(result.pending_confirmation_page_indices()))
+    flags: list[OrientationFlag] = []
+    for idx in flagged:
+        po = by_page[idx]
+        tag, offset = located.get(idx, (None, None))
+        flags.append(
+            OrientationFlag(
+                page_index=idx,
+                packet_tag=tag,
+                page_offset=offset,
+                kind="pending_confirmation" if po.needs_confirmation else "unresolved",
+                detected_angle=po.detected_angle,
+                score=po.score,
+            )
+        )
+    return flags
+
+
+def run_preflight(
+    pdf_path: str | Path,
+    roster: Roster,
+    *,
+    period: str | None = None,
+    orientation_overrides: dict[int, int] | None = None,
+    dpi: int = RENDER_DPI_FINAL,
+) -> PreflightReport:
+    """The preflight entry point -- see the module note above this section
+    for what this deliberately does and doesn't do, and why. Writes
+    nothing, deletes nothing, never touches decisions/ledger/manual-queue.
+    `roster` is the already-scoped roster (see roster.load_roster) the
+    real run would use -- `period` is carried onto the report purely for
+    display, not re-derived here."""
+    start = time.monotonic()
+    pdf_path = Path(pdf_path)
+
+    segmented = segment_pdf(pdf_path, orientation_overrides=orientation_overrides)
+    dates = collect_packet_dates(pdf_path, segmented=segmented, orientation_overrides=orientation_overrides)
+    round_groups = group_into_rounds(segmented.packets, dates)
+    round_labels = round_labels_by_tag(round_groups)
+    disagreeing = round_disagreeing_tags(round_groups, dates)
+
+    proposals = propose_all(pdf_path, segmented, roster, orientation_overrides=orientation_overrides)
+    proposals_by_tag = {p.packet_tag: p for p in proposals}
+    assignments = assign_all(proposals, round_labels)
+
+    consensus_analysis = analyze_consensus_anomalies(pdf_path, segmented, orientation_overrides=orientation_overrides)
+    orientation_flags = _collect_orientation_flags(pdf_path, segmented, orientation_overrides=orientation_overrides)
+
+    packets: list[PreflightPacket] = []
+    with open_pdf(pdf_path, orientation_overrides=orientation_overrides) as pdf:
+        for packet in segmented.packets:
+            tag = packet_tag(pdf_path, packet)
+            proposal = proposals_by_tag.get(tag)
+            top = proposal.top if proposal is not None else None
+
+            detection_hold = False
+            detection_reason = None
+            uncovered_ink_advisory = False
+            if packet.header_page_index is not None:
+                band, uncovered = _header_geometry_check(pdf.pages[packet.header_page_index], dpi=dpi)
+                if not band.detected:
+                    detection_hold = True
+                    detection_reason = f"header border not confidently detected: {band}"
+                uncovered_ink_advisory = bool(uncovered)
+
+            tag_holds = consensus_analysis.holds.get(tag, [])
+
+            packets.append(
+                PreflightPacket(
+                    packet_tag=tag,
+                    packet_index=packet.packet_index,
+                    header_page_index=packet.header_page_index,
+                    page_indices=list(packet.page_indices),
+                    n_pages=packet.n_pages,
+                    declared_total=packet.declared_total,
+                    page_count_mismatch=packet.declared_total is not None and packet.n_pages != packet.declared_total,
+                    is_orphan=packet.is_orphan,
+                    issues=list(packet.issues),
+                    worksheet_type=packet.worksheet_type,
+                    round_label=round_labels.get(tag),
+                    round_disagrees=tag in disagreeing,
+                    top_score=top.score if top is not None else None,
+                    top_margin=proposal.margin if proposal is not None else None,
+                    has_plausible_match=top is not None and top.score >= MIN_SCORE,
+                    would_auto_assign=assignments.get(tag) is not None,
+                    detection_hold=detection_hold,
+                    detection_reason=detection_reason,
+                    uncovered_ink_advisory=uncovered_ink_advisory,
+                    consensus_hold=bool(tag_holds),
+                    consensus_reason="; ".join(h.reason for h in tag_holds) if tag_holds else None,
+                    consensus_hold_pages=sorted({h.physical_page_index for h in tag_holds}),
+                )
+            )
+
+    return PreflightReport(
+        pdf_path=pdf_path,
+        page_count=segmented.page_count,
+        packets=packets,
+        round_groups=round_groups,
+        orientation_flags=orientation_flags,
+        roster_period=period,
+        roster_entry_count=len(roster),
+        elapsed_seconds=time.monotonic() - start,
+    )
+
+
+def format_preflight_report(report: PreflightReport) -> str:
+    """Human-readable preflight report -- everything wrong with the file,
+    then a plain verdict at the end (see PreflightReport.n_clean/n_needs_
+    editor/n_cannot_process) that's the actual number a human uses to
+    decide whether to run this file now or hand it back for a fix."""
+    lines = [
+        f"Preflight report: {report.pdf_path}",
+        f"  {report.page_count} page(s), {report.n_packets} packet(s)",
+    ]
+    for p in report.packets:
+        lines.append(f"    {p.packet_tag}: {p.n_pages} page(s) (footer declared {p.declared_total})")
+
+    mismatched = [p for p in report.packets if p.page_count_mismatch]
+    lines.append(f"\nPage-count vs. footer: {len(mismatched)} packet(s) disagree")
+    for p in mismatched:
+        lines.append(f"    {p.packet_tag}: {p.n_pages} actual page(s), footer declared {p.declared_total}")
+
+    lines.append("")
+    lines.append(format_round_report(report.round_groups))
+    round_disagreeing = [p.packet_tag for p in report.packets if p.round_disagrees]
+    if round_disagreeing:
+        lines.append(f"  {len(round_disagreeing)} packet(s) disagree with their own round group: {round_disagreeing}")
+
+    lines.append(f"\nOrientation: {len(report.orientation_flags)} page(s) flagged")
+    for f in report.orientation_flags:
+        loc = f"page {f.page_index} (packet {f.packet_tag}, page {f.page_offset})" if f.packet_tag else f"page {f.page_index} (no containing packet)"
+        if f.kind == "pending_confirmation":
+            lines.append(f"    {loc}: detected rotated {f.detected_angle}° (confidence {f.score:.2f}), not yet confirmed")
+        else:
+            lines.append(f"    {loc}: orientation could not be confidently determined (score {f.score:.2f})")
+
+    detection_holds = [p for p in report.packets if p.detection_hold]
+    lines.append(f"\nHeader detection: {len(detection_holds)} packet(s) with an undetected header border")
+    for p in detection_holds:
+        lines.append(f"    {p.packet_tag}: {p.detection_reason}")
+
+    no_match = [p for p in report.packets if not p.is_orphan and not p.has_plausible_match]
+    lines.append(f"\nRoster: period {report.roster_period!r}, {report.roster_entry_count} entries")
+    lines.append(f"  {len(no_match)} packet(s) with no plausible roster match: {[p.packet_tag for p in no_match]}")
+
+    lines.append(f"\nConsensus-ink anomalies: {report.n_consensus_holds} packet(s) flagged")
+    for p in report.packets:
+        if p.consensus_hold:
+            lines.append(f"    {p.packet_tag}: {p.consensus_reason}")
+
+    lines.append(f"\nUncovered-ink advisory (non-blocking): {report.n_uncovered_ink_advisories} packet(s) flagged")
+
+    unsegmentable = [p for p in report.packets if p.is_orphan]
+    lines.append(f"\nUnsegmentable packets: {len(unsegmentable)}")
+    for p in unsegmentable:
+        lines.append(f"    {p.packet_tag}: {'; '.join(p.issues)}")
+
+    lines.append(
+        f"\nVerdict: {report.n_clean} would process cleanly, {report.n_needs_editor} would need a human in "
+        f"the editor, {report.n_cannot_process} cannot be processed without a fix"
+    )
+    lines.append(f"Elapsed: {report.elapsed_seconds:.1f}s")
+    return "\n".join(lines)
+
+
+def _diagnostics_dir(out_dir: str | Path, pdf_path: str | Path) -> Path:
+    return Path(out_dir) / ".diagnostics" / f"{Path(pdf_path).stem}_preflight"
+
+
+def render_preflight_contact_sheet(
+    pdf_path: str | Path,
+    report: PreflightReport,
+    out_dir: str | Path,
+    *,
+    orientation_overrides: dict[int, int] | None = None,
+    dpi: int = 150,
+    thumb_width: int = 360,
+    columns: int = 4,
+) -> Path | None:
+    """One thumbnail per flagged page -- an orientation issue, an
+    undetected header border, uncovered-ink advisory ink, a consensus-ink
+    anomaly, or an unsegmentable/orphan packet's own first page -- laid
+    out into a single contact-sheet PNG under
+    `out_dir/.diagnostics/<pdf-stem>_preflight/contact_sheet.png`, each
+    thumbnail labelled with the specific reason(s) it was flagged. Meant
+    to be eyeballed in one place rather than paging through review_app.py
+    packet by packet. Returns None (writes nothing) when nothing was
+    flagged -- an empty contact sheet has no use.
+
+    Rendered at a modest preview DPI (150 by default), not the real
+    redaction DPI -- this is for a human to skim, not a geometry source of
+    truth for anything downstream."""
+    from PIL import Image, ImageDraw
+
+    notes: dict[int, list[str]] = {}
+
+    def flag(idx: int, note: str) -> None:
+        notes.setdefault(idx, []).append(note)
+
+    for f in report.orientation_flags:
+        if f.kind == "pending_confirmation":
+            flag(f.page_index, f"orientation: rotated {f.detected_angle}° (unconfirmed, score {f.score:.2f})")
+        else:
+            flag(f.page_index, f"orientation: unresolved (score {f.score:.2f})")
+
+    for p in report.packets:
+        if p.detection_hold and p.header_page_index is not None:
+            flag(p.header_page_index, f"{p.packet_tag}: header border not detected")
+        if p.uncovered_ink_advisory and p.header_page_index is not None:
+            flag(p.header_page_index, f"{p.packet_tag}: uncovered-ink advisory")
+        for idx in p.consensus_hold_pages:
+            flag(idx, f"{p.packet_tag}: consensus-ink anomaly")
+        if p.is_orphan and p.page_indices:
+            flag(p.page_indices[0], f"{p.packet_tag}: unsegmentable ({'; '.join(p.issues)})")
+        if p.page_count_mismatch and p.header_page_index is not None:
+            flag(p.header_page_index, f"{p.packet_tag}: page count vs. footer mismatch")
+
+    if not notes:
+        return None
+
+    page_indices = sorted(notes)
+    with open_pdf(pdf_path, orientation_overrides=orientation_overrides) as pdf:
+        thumbs = []
+        for idx in page_indices:
+            image = pdf.pages[idx].to_image(resolution=dpi).original.convert("RGB")
+            scale = thumb_width / image.width
+            image = image.resize((thumb_width, max(1, int(image.height * scale))))
+            thumbs.append((idx, image))
+
+    label_height = 90
+    cell_h = max(img.height for _, img in thumbs) + label_height
+    rows = (len(thumbs) + columns - 1) // columns
+    sheet = Image.new("RGB", (thumb_width * columns, cell_h * rows), color="white")
+    draw = ImageDraw.Draw(sheet)
+    for i, (idx, image) in enumerate(thumbs):
+        col, row = i % columns, i // columns
+        x, y = col * thumb_width, row * cell_h
+        sheet.paste(image, (x, y))
+        label = f"page {idx}\n" + "\n".join(notes[idx])
+        draw.multiline_text((x + 4, y + image.height + 4), label, fill="black")
+
+    out_path = _diagnostics_dir(out_dir, pdf_path) / "contact_sheet.png"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(out_path)
+    return out_path

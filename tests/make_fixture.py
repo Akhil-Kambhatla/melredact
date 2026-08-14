@@ -21,6 +21,9 @@ Three fixtures:
 - `build_footer_edge_case_fixture` — small fixture isolating footer/packet
   segmentation failures: an unreadable footer, and a packet missing its
   first page.
+- `build_preflight_fixture` — small fixture for preflight's own tests: a
+  clean roster-matching packet, an orphan (unsegmentable) packet, and a
+  packet whose name matches nothing on the roster, all in one file.
 
 Run directly to write all fixtures to a directory for manual inspection:
 
@@ -627,6 +630,72 @@ def build_footer_edge_case_fixture(out_dir: Path) -> Path:
 
     builder.save(pdf_path)
     return pdf_path
+
+
+def build_preflight_fixture(out_dir: Path) -> tuple[Path, Path]:
+    """Small, purpose-built fixture for preflight's own tests: three
+    independent, deterministic signals in one file, none of them needing
+    real OCR to construct (all pages carry the same invisible-text-layer
+    trick every other fixture uses) --
+
+    - packet A ("Jordan Ames", pages 0-1): a normal, fully clean,
+      roster-matching packet -- a caller can additionally rotate page 1 of
+      this packet (see build_rotated_page_copy) to add an independent
+      orientation signal without disturbing the header's own native-text
+      readability on page 0.
+    - packet B (page 2): a lone continuation page with no preceding
+      header -- an orphan/unsegmentable packet.
+    - packet C ("Zzyzx Qorvath", page 3): a normal, fully segmentable
+      packet whose name matches nothing on the small roster below -- "no
+      plausible match", not a structural problem.
+
+    Returns (pdf_path, roster_path); the roster has exactly one entry,
+    Jordan Ames, matching packet A only."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = out_dir / "preflight_fixture.pdf"
+    roster_path = out_dir / "preflight_roster.csv"
+    builder = PdfBuilder()
+
+    def header_page(name: str, marker: str):
+        img = render_header_image(
+            name_text=name,
+            teacher_text="Hannel",
+            group_text="none",
+            date_text="10/03/2025",
+            period_text="02",
+            worksheet_type=WORKSHEET_TYPE_TEXT,
+            page_marker=marker,
+            shade_blank_rows=False,
+        )
+        items = [
+            InvisibleText("Name:", NAME_ANCHOR["x0"], NAME_ANCHOR["top"], 9),
+            InvisibleText(name, 150, NAME_ANCHOR["top"]),
+            InvisibleText(WORKSHEET_TYPE_TEXT, FOOTER_WORKSHEET_TYPE["x0"], FOOTER_WORKSHEET_TYPE["top"], 9),
+        ]
+        if marker:
+            items.append(InvisibleText(marker, FOOTER_PAGE_MARKER["x0"], FOOTER_PAGE_MARKER["top"], 9))
+        return img, items
+
+    def continuation_page(marker: str):
+        img = render_continuation_image(worksheet_type=WORKSHEET_TYPE_TEXT, page_marker=marker)
+        items = [InvisibleText(WORKSHEET_TYPE_TEXT, FOOTER_WORKSHEET_TYPE["x0"], FOOTER_WORKSHEET_TYPE["top"], 9)]
+        if marker:
+            items.append(InvisibleText(marker, FOOTER_PAGE_MARKER["x0"], FOOTER_PAGE_MARKER["top"], 9))
+        return img, items
+
+    # Packet A: normal, page 1 of 2 then page 2 of 2 -- clean, roster match.
+    builder.add_page(*header_page("Jordan Ames", "Page 1 of 2"))
+    builder.add_page(*continuation_page("Page 2 of 2"))
+
+    # Packet B: an orphan -- a continuation page with no preceding header.
+    builder.add_page(*continuation_page("Page 2 of 2"))
+
+    # Packet C: normal, single page, but the name matches nothing below.
+    builder.add_page(*header_page("Zzyzx Qorvath", "Page 1 of 1"))
+
+    builder.save(pdf_path)
+    _write_roster_csv(roster_path, [("0204150201", "Ames", "Jordan")])
+    return pdf_path, roster_path
 
 
 # --- Consensus-ink fixture: a group of packets sharing one page-2 template ---

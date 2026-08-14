@@ -143,6 +143,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -155,6 +156,7 @@ from melredact.config import CACHE_DIR, ORIENTATION_DETECT_DPI, ORIENTATION_MAX_
 
 _CACHE_SUBDIR = "orientation"
 _CARDINAL_ANGLES = (0, 90, 180, 270)
+_NORMALIZED_PDF_STEM_RE = re.compile(r"^([0-9a-f]{16})_(auto|ov[0-9a-f]{16})$")
 
 _classifier = None
 
@@ -343,6 +345,51 @@ def _cache_paths(source_path: Path, overrides: dict[int, int] | None) -> tuple[P
     detections_path = base / f"{h}.detections.json"
     resolved_base = base / f"{h}_{_overrides_fingerprint(overrides)}"
     return detections_path, resolved_base.with_suffix(".json"), resolved_base.with_suffix(".pdf")
+
+
+def stable_ocr_identity(normalized_path: Path, page_index: int) -> str:
+    """Content identity for a single page, for a caller (ocr.py) that wants
+    to disk-cache per-page work keyed on "did this page's own pixels
+    change", not "did anything in the file change". `normalized_path` is
+    what `open_pdf` actually handed the caller (`page.pdf.path`) -- when no
+    page in the file needed a rotation applied, that's just the resolved
+    source path (repaired-or-original), whose content hash never depends on
+    `orientation_overrides` at all. But the instant *any* page needs a
+    rotation, `_write_normalized_pdf` resaves the *whole* file, so hashing
+    that resaved file's own bytes directly (what ocr.py used to do, via
+    `page.pdf.path`) changes for every page in the file the moment a single
+    page's override changes -- even pages whose own pixels never moved.
+    Real cost: rotating one page of a real, never-before-processed file
+    used to force a full cold re-OCR of the entire file (tens of minutes)
+    on the very next commit, just because the file-level hash moved.
+
+    This instead recovers the resolved *source's* own stable hash (encoded
+    in the resaved file's own cache filename, `<h>_<fingerprint>.pdf`) plus
+    this specific page's own resolved `applied_angle` (read from the
+    sibling manifest written alongside it) -- 0 for every page that wasn't
+    itself overridden, regardless of what happened elsewhere in the file.
+    Returns the bare source hash (matching exactly what a plain, never-
+    rotated file already hashed to, before this function ever existed) when
+    this page's own angle is 0, so the overwhelming common case -- no
+    rotation anywhere in the file -- keeps hitting the exact same cache
+    entries an already-warm cache built up before this fix. Only a page
+    whose own angle is genuinely nonzero gets a distinct suffix."""
+    m = normalized_path.parent == (Path(CACHE_DIR) / _CACHE_SUBDIR) and _NORMALIZED_PDF_STEM_RE.match(
+        normalized_path.stem
+    )
+    if m:
+        source_hash = m.group(1)
+        manifest_path = normalized_path.with_suffix(".json")
+        if manifest_path.exists():
+            for entry in json.loads(manifest_path.read_text()):
+                if entry["page_index"] == page_index:
+                    angle = int(entry["applied_angle"]) % 360
+                    return source_hash if angle == 0 else f"{source_hash}_r{angle}"
+        return source_hash
+
+    from melredact.ocr import file_content_hash
+
+    return file_content_hash(normalized_path)
 
 
 def _detect_pages(source_path: Path) -> list[PageDetection]:

@@ -6,13 +6,15 @@ import pdfplumber
 import pytest
 from streamlit.testing.v1 import AppTest
 
+import streamlit as st
+
 import review_app
 from melredact.config import RENDER_DPI_FINAL
-from melredact.pipeline import packet_tag
+from melredact.pipeline import load_orientation_overrides, packet_tag, run_dispositions
 from melredact.redact import redact_packet, verify_no_leaked_names
 from melredact.roster import load_roster
 from melredact.segment import segment_pdf
-from tests.make_fixture import PACKETS, build_footer_edge_case_fixture, build_main_fixture
+from tests.make_fixture import PACKETS, build_footer_edge_case_fixture, build_main_fixture, build_rotated_page_copy
 
 APP_PATH = str(Path(__file__).resolve().parent.parent / "review_app.py")
 
@@ -468,3 +470,106 @@ def test_canvas_drawn_rectangle_at_a_different_render_scale_redacts_the_intended
 
     findings = verify_no_leaked_names(out_path, roster)
     assert findings == [], f"box drawn at DPI {review_app.DPI} failed to redact under real DPI {RENDER_DPI_FINAL}: {findings}"
+
+
+# --- Rotation performance: preview vs. commit (see CLAUDE.md's rotation
+# performance section) ---
+
+
+def test_page_stack_preview_rotation_does_not_rerasterize_or_reocr(main_fixture, monkeypatch):
+    """Rotating a page in the page-stack preview (Left/Right/180 -- see
+    review_app._render_page_stack) must be visually immediate: it should
+    never call back into the PDF (pdfplumber's own Page.to_image) or OCR
+    (melredact.ocr's engine), only rotate the already-rendered base image
+    in memory. Warms the base image once (the way an ordinary first view
+    of the packet already would), then blocks any further PDF/OCR access
+    and cycles through several candidate rotations exactly the way
+    _render_page_stack's own preview path does."""
+    pdf_path = str(main_fixture.pdf_path)
+    page_idx = 0
+
+    base_image = review_app._page_image(pdf_path, page_idx, review_app.DPI, {})
+
+    calls = {"to_image": 0}
+    orig_to_image = pdfplumber.page.Page.to_image
+
+    def counting_to_image(self, *args, **kwargs):
+        calls["to_image"] += 1
+        return orig_to_image(self, *args, **kwargs)
+
+    monkeypatch.setattr(pdfplumber.page.Page, "to_image", counting_to_image)
+
+    import melredact.ocr as ocr_mod
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("OCR engine must not be invoked while only previewing a rotation")
+
+    monkeypatch.setattr(ocr_mod, "_engine", _boom)
+
+    for angle in (90, 180, 270, 0, 90):
+        # Same two calls _render_page_stack makes on every rerun to build
+        # what it displays: the cached as-scanned image, rotated in memory
+        # to the candidate preview angle.
+        base_again = review_app._page_image(pdf_path, page_idx, review_app.DPI, {})
+        preview = review_app._rotate_image_for_display(base_again, angle)
+        assert preview is not None
+
+    assert calls["to_image"] == 0, "previewing a rotation re-rasterized the page from the PDF"
+
+    # The rotation itself is correct, not just cheap: a 90 or 270 rotation
+    # (expand=True) swaps width/height; 0 and 180 don't.
+    rotated_90 = review_app._rotate_image_for_display(base_image, 90)
+    assert rotated_90.size == (base_image.height, base_image.width)
+    rotated_180 = review_app._rotate_image_for_display(base_image, 180)
+    assert rotated_180.size == base_image.size
+
+
+def test_preview_rotation_flows_into_redaction_correctly_once_applied(main_fixture, tmp_path):
+    """The preview mechanism (_set_pending_rotation) must never itself
+    reach orientation_overrides -- only the explicit Apply/Reset actions
+    (_set_page_rotation) do. Proves both halves: previewing several
+    candidate angles leaves the committed state untouched, and applying
+    one commits it correctly and reproduces through the real production
+    path (segment_pdf -> run_dispositions), the same path a real run uses,
+    with zero monkeypatching -- the same guarantee CLAUDE.md's rotation-
+    performance fix has to preserve, not just speed up."""
+    rotated_path = build_rotated_page_copy(main_fixture.pdf_path, tmp_path, 0, 180, "preview_then_apply.pdf")
+    decisions_dir = tmp_path / "decisions"
+
+    st.session_state.clear()
+    st.session_state.orientation_overrides = {}
+    st.session_state.pending_rotation = {}
+
+    # Cycling through candidate angles in the preview must not touch the
+    # real, committed orientation state at all.
+    review_app._set_pending_rotation(0, 90)
+    review_app._set_pending_rotation(0, 270)
+    review_app._set_pending_rotation(0, 180)
+    assert st.session_state.orientation_overrides == {}
+    assert st.session_state.pending_rotation == {0: 180}
+
+    # Apply: commits the previewed angle for real, and clears the preview.
+    review_app._set_page_rotation(str(rotated_path), str(decisions_dir), 0, 180)
+    assert st.session_state.orientation_overrides == {0: 180}
+    assert st.session_state.pending_rotation == {}
+
+    reloaded = load_orientation_overrides(rotated_path, decisions_dir=decisions_dir)
+    assert reloaded == {0: 180}
+
+    seg = segment_pdf(rotated_path, orientation_overrides=reloaded)
+    header_packet = seg.packets[0]
+    assert header_packet.header_page_index == 0
+    assert not any("orientation" in issue for issue in header_packet.issues)
+
+    roster = load_roster(main_fixture.roster_path, infer_period_from=main_fixture.pdf_path)
+    tag = packet_tag(rotated_path, header_packet)
+    sid = next(e.sid for e in roster if e.full_name == "Jordan Ames")
+
+    out_dir = tmp_path / "out"
+    results = run_dispositions(
+        rotated_path, seg, {tag: sid}, roster, out_dir=out_dir, orientation_overrides=reloaded
+    )
+    result = next(r for r in results if r.packet_tag == tag)
+    assert not result.held_back, result.reason
+    assert result.out_path is not None and result.out_path.exists()
+    assert verify_no_leaked_names(result.out_path, roster) == []

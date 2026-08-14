@@ -3577,6 +3577,240 @@ advisory status, `010406`'s still-unreviewed real packets, or the
 consensus-ink hold on `010406_PD1_PRT_p078` — all pre-existing, unrelated
 to this session's own scope.
 
+## A preflight command, and a fix for a rotation-triggered cache-key cascade (2026-08-14)
+
+**Motivation: every issue with a new real file was being discovered one at a
+time, deep into a real `run`, after cold OCR had already cost 20-70 minutes
+(see the round-audit and `analyze` sections above for the real numbers this
+project has already measured) — and rotating one page in the review UI was,
+independently, very slow.** Two related but distinct problems, fixed
+separately below: a way to see everything wrong with a file *before* paying
+for a real run, and a real performance bug in how rotation interacted with
+this codebase's own disk caches.
+
+### `cli.py preflight`: a read-only, whole-file report, before anything else touches the file
+
+**`python -m melredact.cli preflight --pdf <scan.pdf> --roster <roster.csv>`
+(`pipeline.run_preflight`/`format_preflight_report`/`render_preflight_
+contact_sheet`, wired into `cli.py` as `_cmd_preflight`) reports everything
+CLAUDE.md's own existing checks can find, in one pass, before any human
+review and before `run`/`analyze` ever touch `out/`, `decisions/`, or the
+ledger.** Report contents: page/packet counts with each packet's own
+footer-declared length; any packet whose actual page count disagrees with
+its footer; round groups with their date histograms and any packet
+disagreeing with its own group (`blocks.group_into_rounds`, unchanged);
+every page whose orientation is nonzero-and-unconfirmed or too ambiguous to
+guess from at all, located as "page N of packet X" (`orientation.
+orientation_for`, unchanged); every packet where the header border couldn't
+be confidently detected; the roster block in use, its entry count, and how
+many packets have no plausible roster match (`top.score < MIN_SCORE`);
+consensus-ink anomaly counts (`consensus.analyze_consensus_anomalies`,
+unchanged); uncovered-ink advisory counts (`redact.
+find_uncovered_group_words`, unchanged); and any unsegmentable (orphan)
+packet with its own reason — ending in a plain verdict: how many packets
+would process cleanly (no structural issue, no detection/consensus/advisory
+flag, would auto-assign with zero human input), how many would need a human
+in the editor, and how many cannot be processed at all without a fix first
+(`PreflightReport.n_clean`/`n_needs_editor`/`n_cannot_process` — deliberately
+`n_needs_editor = n_packets - n_cannot_process - n_clean`, not a third,
+independently-maintained condition, so the three buckets can never silently
+double-count or drop a packet between them).
+
+**Deliberately does not reuse `analyze_redaction_holds` — the one thing
+`analyze` already does that preflight skips on purpose.** `analyze`'s own
+per-packet redaction draft exists to prove `verify_no_leaked_names` would
+pass on the *written* file, which needs a real `redact_packet` call — and
+`redact_packet` OCRs every page of the packet in full to preserve the kept
+text layer (see "Speed finding" above: ~29s/page, the dominant real cost of
+a run). Preflight has no text layer to preserve and isn't trying to prove a
+leak check would pass; detection-hold and the uncovered-ink advisory only
+need the header page's own raster (`redact.detect_header_band` — a pixel
+border-scan, no OCR at all) plus the header-band OCR crop matching's own
+`extract_header_fields` call already makes and disk-caches (see "OCR is
+disk-cached" above — identical bbox, identical dpi, guaranteed cache hit).
+`pipeline._header_geometry_check` calls the exact same sequence of
+functions `redact_packet` calls for its own header page (`page_words` →
+`locate_header_anchors` → `detect_header_band` → `redact_bboxes_for_band` →
+`find_uncovered_group_words`), so a packet flagged by preflight is flagged
+for the identical reason a real run would flag it for — not a looser,
+preflight-only approximation. The cost that remains is the one `run`'s own
+segmentation stage already pays on a cold cache: small header/footer-band
+OCR calls, not full-page ones. `PreflightReport.elapsed_seconds` says
+plainly how long this actually took, so a human isn't left guessing whether
+the cache was warm or cold.
+
+**Every disk cache preflight populates is the identical cache `run`/
+`analyze` read from — nothing here is throwaway work.** `run_preflight`
+calls the same `segment_pdf`/`propose_all`/`analyze_consensus_anomalies`
+functions (unchanged) a real run calls, through the same `ocr.py`/
+`orientation.py`/`consensus.py` disk caches (also unchanged) — a `cli.py
+run` immediately following a `preflight` against the same file starts warm,
+not cold. Verified directly, not assumed: `tests/test_preflight.py::
+test_preflight_populates_the_same_cache_the_real_run_reads` runs
+`run_preflight` against a fixture page with its native text layer
+deliberately stripped (forcing real OCR, unlike every other synthetic
+fixture in this repo — see `tests/make_fixture.py`'s own module docstring),
+then monkeypatches `ocr._engine` to raise if invoked again, then calls
+`segment_pdf`/`propose_all` — the exact functions `cli.py run` itself
+calls — and asserts they complete with zero further OCR calls.
+
+**A contact sheet of every flagged page, rendered to
+`out/.diagnostics/<pdf-stem>_preflight/contact_sheet.png`, unless
+`--no-contact-sheet`.** One thumbnail per page flagged for any reason
+(orientation, undetected header border, uncovered-ink advisory,
+consensus-ink anomaly, an unsegmentable packet's own first page, or a
+page-count-vs-footer mismatch), each labelled with the specific reason(s)
+it was flagged, laid out in a grid via plain PIL (`pipeline.
+render_preflight_contact_sheet`) — meant to be eyeballed in one place
+instead of paging through `review_app.py` packet by packet. Returns `None`
+(writes nothing at all) when nothing was flagged — a genuinely clean file
+never creates `out/.diagnostics/`, confirmed by
+`tests/test_preflight.py::test_preflight_clean_file_reports_zero_blocking_
+issues_and_writes_nothing`, which also confirms `preflight` never creates
+`decisions/` (it only ever *reads* an existing orientation-overrides
+sidecar there, tolerating a missing one the same way every other loader in
+this codebase does) or anything under `out/<teacher>/...` — `preflight`
+takes no action on `decisions`/the ledger/the manual queue at all, ever.
+
+**`--decisions` is read-only here, purely so a page a reviewer already
+rotated is reported at its confirmed orientation instead of being flagged
+all over again** — the same `pipeline.load_orientation_overrides` call
+`cli.py run`/`analyze` already make, tolerating a missing directory (the
+overwhelmingly common case: preflight is meant to run *before* any review
+has happened at all) exactly like `load_decisions`'s own "missing file
+returns empty" contract.
+
+### The rotation-performance bug: a whole-file resave meant one page's rotation invalidated every other page's OCR cache
+
+**Root cause, found by tracing exactly how a rotation override reaches
+`ocr.py`'s own disk cache, not assumed:** `ocr.cached_ocr_words_in_region`
+keys its cache directory on `_file_content_hash(page.pdf.path)` — the
+content hash of whatever file `open_pdf` actually opened. For the
+overwhelming common case (no page in the file has ever been rotated),
+`page.pdf.path` is the resolved source path itself, stable regardless of
+anything else. But the instant *any* page in the file has an orientation
+override, `orientation._write_normalized_pdf` resaves the **entire** file
+via pikepdf (setting that one page's `/Rotate`) to a new,
+override-fingerprinted cache path (`orientation._cache_paths`) — and
+`page.pdf.path` becomes *that* file for every page, not just the rotated
+one. Hashing that resaved file's own bytes directly, as `ocr.py` used to,
+meant every page in the file got a brand-new OCR cache key the moment a
+single, unrelated page's rotation changed — confirmed to be the dominant
+cost of the review UI's rotate control: a real, never-before-processed file
+would pay its full cold-OCR cost (per CLAUDE.md's own real measurements,
+20-70 minutes depending on file size) again on every single rotation click,
+not just once. `consensus.py`'s own disk cache turned out **not** to share
+this bug — its cache functions are handed the *original* caller-facing
+`pdf_path` string directly as a parameter (not derived from `page.pdf.path`
+the way `ocr.py`'s was), so its cache key was already stable across
+orientation-override changes; confirmed by inspection, not changed.
+
+**Fix: a page-scoped cache identity, not a whole-file one.**
+`orientation.stable_ocr_identity(normalized_path, page_index)` recovers the
+resolved source's own stable content hash (encoded in the resaved file's
+own cache filename, `<hash>_<fingerprint>.pdf`) plus *this specific page's*
+own resolved `applied_angle` (read from the sibling manifest JSON already
+written alongside it) — `0` for every page that wasn't itself overridden,
+regardless of what happened elsewhere in the file. Returns the bare source
+hash, byte-identical to what `_file_content_hash(page.pdf.path)` already
+computed before this fix existed, whenever this page's own angle is `0` —
+so an already-warm cache built up over a real session keeps hitting the
+exact same entries; only a page whose own angle is genuinely nonzero gets a
+new, and correctly *different*, cache key. `ocr.py`'s `_ocr_cache_path`
+calls this instead of hashing `page.pdf.path` directly
+(`ocr._stable_page_identity`, one deferred import to avoid a
+module-load-time cycle with `orientation.py`, which already imports back
+from `ocr.py` the same deferred way for its own cache-path helper).
+Verified against the existing, unmodified `tests/test_orientation.py` suite
+(9/9 still pass) plus the new rotation tests below — no change to
+`orientation.py`'s detection/resolution logic itself, only to what a
+*different* module (`ocr.py`) hashes to name its own cache directory.
+
+**Separately, the review UI's rotate buttons no longer commit — and
+re-rasterize/re-OCR — on every click.** Before this fix,
+`_render_page_stack`'s Left/Right/180/Reset buttons each called
+`_set_page_rotation` immediately, which (a) wrote straight to
+`orientation_overrides`, invalidating every `st.cache_data`-wrapped
+function keyed on that dict (`_segment`, `_proposals`, `_consensus`,
+`_round_data`) on the very next rerun, and (b) called `_page_image` with
+the *new* override angle, which (cache miss, since that exact angle had
+never been rendered before) re-opened the PDF through `open_pdf` — a full
+pikepdf resave, even just to show a candidate rotation a reviewer hadn't
+settled on yet. Fixed with a genuine preview/commit split:
+`st.session_state.pending_rotation` (initialized in `_init_state`, never
+persisted, never touching `orientation_overrides`) holds an *uncommitted*
+candidate angle per page. Left/Right/180 (`_set_pending_rotation`) only
+ever mutate this dict. The displayed image comes from `_page_image(...,
+orientation_overrides={})` — the page's own as-scanned rendering, which
+*never* needs a resave (no page is ever automatically rotated a nonzero
+amount — see orientation.py's detect-and-ask design above — so the `{}`
+lookup always resolves to the plain, unresaved source file) — rotated in
+memory via `_rotate_image_for_display` (plain `PIL.Image.rotate(angle,
+expand=True)`, the identical convention `orientation.normalize_page_image`
+already uses and has verified by exact pixel round-trip). A reviewer can
+now cycle through every candidate angle for free, with zero PDF or OCR
+calls of any kind. Only the new "✅ Apply rotation" button (or "Reset to
+automatic", unchanged) calls `_set_page_rotation` — the real commit, which
+now costs only the *touched* page's own small-crop OCR (thanks to the
+cache-identity fix above), never the whole file's.
+
+**Timing, this file's own fixture, not a real file (no real file was
+processed this session — see below):** cold-cache rotation of one page in
+the synthetic main fixture (a scenario deliberately built to force real OCR
+— see `tests/test_preflight.py`'s own `ocr_forced_path` construction, since
+every *other* fixture in this repo carries a native invisible text layer
+and was never going to exercise either bug at all) went from re-running
+`segment_pdf`'s and `propose_all`'s full OCR pass on every click (before
+this fix, that means every rotation attempt paying the *entire file's* cold
+OCR cost, not just this one page's) to zero additional OCR calls for the
+preview loop and a single small header/footer-crop OCR pass, only once, on
+Apply. The `before` number isn't reproduced as a wall-clock figure here
+deliberately — see CLAUDE.md's own repeated posture on this: a synthetic
+fixture's OCR cost has no relationship to a real file's, and fabricating a
+precise "before" timing against fixture data would misrepresent the real
+cost this fix actually addresses. The real-file cost this fixes is the one
+already measured and cited throughout this file (20-70 minutes of cold OCR,
+now paid once per file instead of once per rotation click).
+
+**Tests, synthetic fixture only, never real data**
+(`tests/test_preflight.py`, `tests/test_review_app.py`):
+`test_preflight_clean_file_reports_zero_blocking_issues_and_writes_nothing`,
+`test_preflight_reports_rotation_unsegmentable_and_no_match_packets` (a
+purpose-built three-packet fixture, `tests.make_fixture.
+build_preflight_fixture` — a clean roster-matching packet, an orphan, and a
+packet whose name matches nothing on the roster — with one packet's own
+continuation page additionally rotated 180° and left unconfirmed),
+`test_preflight_populates_the_same_cache_the_real_run_reads` (above),
+`test_page_stack_preview_rotation_does_not_rerasterize_or_reocr` (warms the
+base image once, then blocks all further `Page.to_image`/OCR calls and
+cycles through five candidate angles, asserting zero of either — plus a
+correctness check that a 90/270 rotation actually swaps width/height and
+180/0 don't), `test_preview_rotation_flows_into_redaction_correctly_once_
+applied` (previewing three different candidate angles leaves
+`orientation_overrides` untouched; applying one commits it, and the
+committed state reproduces through the real `segment_pdf` →
+`run_dispositions` path — no monkeypatching — to a written, leak-free
+file, the same end-to-end guarantee the existing 180°-rotation pipeline
+tests already prove, now proven through the new preview/apply session-state
+functions specifically rather than a direct `_set_page_rotation` call).
+
+### What this session did not do
+
+Did not change `redact.py`'s detection geometry, `match.py`'s scoring, or
+`consensus.py`'s two-pass algorithm — `consensus.py`'s own cache-key
+stability was found already correct by inspection, not modified. Did not
+enable deletion for any run. Did not process any real file — every
+measurement and test in this section is against the synthetic fixture
+(`tests/make_fixture.py`), including the one fixture deliberately built to
+force real OCR (`build_rotated_page_copy(..., degrees=0)`, which strips a
+page's native text layer without actually rotating it). `preflight` and the
+rotation-performance fix are both verified against synthetic data only;
+running `preflight` against `010406`'s or `020415`'s real files, and
+measuring the real before/after rotation timing on a real packet, is real,
+useful follow-up work this session didn't do — CLAUDE.md's own repeated
+"verified, not automatically re-shipped" posture applies here too: these
+tools are ready to use, not yet used against real data.
+
 ## Working preferences
 
 - Calibrate against real measured data, not assumptions — when a

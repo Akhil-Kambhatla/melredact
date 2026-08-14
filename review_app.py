@@ -274,6 +274,44 @@ def _page_image(pdf_path: str, page_index: int, dpi: int, orientation_overrides:
     return image
 
 
+def _rotate_image_for_display(image: Image.Image, angle: int) -> Image.Image:
+    """Pure in-memory rotation of an already-rendered page image, for the
+    page-stack preview (see _render_page_stack) -- deliberately never
+    touches the PDF, `open_pdf`, or OCR. Same angle convention `orientation.
+    normalize_page_image` already established and verified by exact pixel
+    round-trip against the classifier's own convention (see orientation.
+    py's module docstring): `PIL.Image.rotate(angle, expand=True)`. Used to
+    show a *candidate* rotation the reviewer hasn't committed yet -- see
+    `_preview_angle`/`_set_pending_rotation` -- so trying several angles
+    before settling on one costs nothing beyond this call."""
+    angle = angle % 360
+    if angle == 0:
+        return image
+    return image.rotate(angle, expand=True)
+
+
+def _preview_angle(page_idx: int, committed_angle: int) -> int:
+    """The angle currently shown for this page in the page-stack preview:
+    an uncommitted candidate rotation if the reviewer is mid-adjustment,
+    else whatever's actually committed (a saved override, or the
+    detector's own resolved angle)."""
+    return st.session_state.pending_rotation.get(page_idx, committed_angle)
+
+
+def _set_pending_rotation(page_idx: int, angle: int | None) -> None:
+    """Update (or clear) this page's *preview-only* candidate rotation --
+    never written to disk, never touches orientation_overrides, so it
+    cannot invalidate _segment/_proposals/_consensus/_page_image's own
+    disk-cached work. This is the mechanism that lets a reviewer cycle
+    through Left/Right/180 to find the right orientation without paying
+    for a re-segment or re-OCR on every click -- only `_set_page_rotation`
+    (called from the explicit Apply/Reset actions) commits anything real."""
+    if angle is None:
+        st.session_state.pending_rotation.pop(page_idx, None)
+    else:
+        st.session_state.pending_rotation[page_idx] = angle % 360
+
+
 def _status_icon(tag: str, packet: Packet, decisions: dict[str, str | None], proposal) -> str:
     if packet.issues:
         return "⚠️"
@@ -302,6 +340,13 @@ def _init_state(pdf_path: str, decisions_dir: str) -> None:
         st.session_state.detection_overrides = load_detection_overrides(pdf_path, decisions_dir=Path(decisions_dir))
     if "orientation_overrides" not in st.session_state:
         st.session_state.orientation_overrides = load_orientation_overrides(pdf_path, decisions_dir=Path(decisions_dir))
+    if "pending_rotation" not in st.session_state:
+        # In-memory-only preview state (see _render_page_stack), never
+        # persisted and never part of orientation_overrides -- a reviewer
+        # cycling through candidate rotations before settling on one must
+        # not repeatedly pay for a re-segment/re-OCR/re-consensus pass on
+        # every click, only once, when a rotation is actually applied.
+        st.session_state.pending_rotation = {}
 
 
 def _set_page_rotation(pdf_path: str, decisions_dir: str, page_index: int, angle: int | None) -> None:
@@ -310,14 +355,22 @@ def _set_page_rotation(pdf_path: str, decisions_dir: str, page_index: int, angle
     that page (see orientation.py's detect-and-ask design), and persists
     immediately so a re-run reproduces it without asking again. Every
     downstream cache (`_segment`, `_proposals`, `_consensus`, `_round_
-    data`, `_page_image`, ...) is keyed on this exact dict, so mutating it
-    and rerunning naturally invalidates every cache entry that depended on
-    the old orientation -- no separate cache-clearing step needed."""
+    data`, ...) is keyed on this exact dict, so mutating it and rerunning
+    naturally invalidates every in-memory cache entry that depended on the
+    old orientation. This is the actual *commit* -- see `_render_page_
+    stack`'s Apply/Reset actions, the only two things that call this;
+    everything else (Left/Right/180) only ever touches the uncommitted
+    `pending_rotation` preview via `_set_pending_rotation`, never this.
+    Committing is disk-cache-cheap even so, since orientation.py's and
+    ocr.py's own cache keys are page-scoped (see orientation.
+    stable_ocr_identity) -- only the page whose own rotation actually
+    changed pays for a fresh OCR pass, not every page in the file."""
     if angle is None:
         st.session_state.orientation_overrides.pop(page_index, None)
     else:
         st.session_state.orientation_overrides[page_index] = angle % 360
     save_orientation_overrides(pdf_path, st.session_state.orientation_overrides, decisions_dir=Path(decisions_dir))
+    _set_pending_rotation(page_index, None)
 
 
 def _confirm(pdf_path: str, decisions_dir: str, tag: str, sid: str | None) -> None:
@@ -912,11 +965,25 @@ def _render_page_stack(args: argparse.Namespace, packet: Packet, tag: str) -> No
 
     Rotating a page here always wins over the detector's own guess (see
     orientation.resolve_pages) and reaches segmentation, OCR, matching,
-    and redaction identically, not just this preview -- every one of
-    those goes through the same `st.session_state.orientation_overrides`
-    dict via `open_pdf`'s own `orientation_overrides` parameter, and
-    changing that dict naturally invalidates every st.cache_data-wrapped
-    function keyed on it (see `_set_page_rotation`)."""
+    and redaction identically, not just this preview -- once *applied*
+    (see the Apply button below), every one of those goes through the same
+    `st.session_state.orientation_overrides` dict via `open_pdf`'s own
+    `orientation_overrides` parameter, and changing that dict naturally
+    invalidates every in-memory cache entry that depended on the old
+    orientation (see `_set_page_rotation`).
+
+    **Left/Right/180 only ever move an uncommitted preview, never the real
+    orientation.** The displayed image comes from `_page_image(...,
+    orientation_overrides={})` -- the page's own as-scanned rendering,
+    which never needs a resave (no page anywhere is ever automatically
+    rotated a nonzero amount -- see orientation.py's detect-and-ask
+    design) and is therefore always already disk-cached the moment this
+    page has been viewed once -- rotated in memory via `_rotate_image_
+    for_display` (plain PIL, no PDF or OCR work at all) to show what the
+    candidate angle would look like. A reviewer can cycle through several
+    candidate angles for free; only clicking Apply pays for anything
+    real, and only for this one page, not the whole file (see
+    `_set_page_rotation`'s own docstring)."""
     orientation_map = _orientation_map(args.pdf_path, st.session_state.orientation_overrides)
     st.subheader(f"Pages — packet {tag}")
     for offset, page_idx in enumerate(packet.page_indices):
@@ -924,10 +991,17 @@ def _render_page_stack(args: argparse.Namespace, packet: Packet, tag: str) -> No
         page_label = f"Page {offset + 1} of {packet.n_pages}"
         has_override = page_idx in st.session_state.orientation_overrides
         needs_attention = po is not None and not has_override and (po.needs_confirmation or not po.resolved)
+        committed_angle = st.session_state.orientation_overrides.get(
+            page_idx, po.applied_angle if po is not None else 0
+        )
+        preview_angle = _preview_angle(page_idx, committed_angle)
+        is_pending = preview_angle != committed_angle
         with st.container(border=True):
             title = f"**{tag} — {page_label}**"
             if has_override:
                 title += "  🔄 rotated by reviewer"
+            if is_pending:
+                title += "  ✏️ preview (not yet applied)"
             st.markdown(title)
             if needs_attention and po.needs_confirmation:
                 st.warning(
@@ -942,32 +1016,40 @@ def _render_page_stack(args: argparse.Namespace, packet: Packet, tag: str) -> No
                     f"(score {po.score:.2f}) — rotate it by hand below if you can tell which way "
                     "it should go."
                 )
-            raw_image = _page_image(args.pdf_path, page_idx, DPI, st.session_state.orientation_overrides)
-            st.image(raw_image, width=360)
+            base_image = _page_image(args.pdf_path, page_idx, DPI, {})
+            preview_image = _rotate_image_for_display(base_image, preview_angle)
+            st.image(preview_image, width=360)
 
-            current_angle = st.session_state.orientation_overrides.get(
-                page_idx, po.applied_angle if po is not None else 0
-            )
-            rot_cols = st.columns(4)
+            rot_cols = st.columns(5)
             if rot_cols[0].button("⟲ Left 90°", key=f"rot_l_{tag}_{page_idx}"):
-                _set_page_rotation(args.pdf_path, args.decisions_dir, page_idx, current_angle - 90)
+                _set_pending_rotation(page_idx, preview_angle - 90)
                 st.rerun()
             if rot_cols[1].button("↻ Right 90°", key=f"rot_r_{tag}_{page_idx}"):
-                _set_page_rotation(args.pdf_path, args.decisions_dir, page_idx, current_angle + 90)
+                _set_pending_rotation(page_idx, preview_angle + 90)
                 st.rerun()
             if rot_cols[2].button("⟳ 180°", key=f"rot_180_{tag}_{page_idx}"):
-                _set_page_rotation(args.pdf_path, args.decisions_dir, page_idx, current_angle + 180)
+                _set_pending_rotation(page_idx, preview_angle + 180)
                 st.rerun()
             if rot_cols[3].button(
                 "Reset to automatic",
                 key=f"rot_reset_{tag}_{page_idx}",
-                disabled=not has_override,
+                disabled=not has_override and not is_pending,
             ):
                 _set_page_rotation(args.pdf_path, args.decisions_dir, page_idx, None)
                 st.rerun()
+            if rot_cols[4].button(
+                "✅ Apply rotation",
+                key=f"rot_apply_{tag}_{page_idx}",
+                disabled=not is_pending,
+                type="primary" if is_pending else "secondary",
+            ):
+                _set_page_rotation(args.pdf_path, args.decisions_dir, page_idx, preview_angle)
+                st.rerun()
 
-            if has_override:
-                st.caption(f"Reviewer-confirmed rotation: {current_angle}° from as-scanned.")
+            if is_pending:
+                st.caption(f"Previewing {preview_angle}° from as-scanned — click Apply to use this for real processing.")
+            elif has_override:
+                st.caption(f"Reviewer-confirmed rotation: {committed_angle}° from as-scanned.")
             elif po is not None and po.source == "auto" and po.applied_angle == 0:
                 st.caption("Orientation: upright (automatic).")
 
@@ -1410,6 +1492,12 @@ def _prefetch_next_packet(
     try:
         for page_idx in next_packet.page_indices:
             _page_image(args.pdf_path, page_idx, DPI, st.session_state.orientation_overrides)
+            # Also warm the as-scanned ({}) rendering the page-stack preview
+            # reads from (see _render_page_stack) -- same page, a second,
+            # cheap disk-cache entry, not a second expensive render whenever
+            # this page has no override (the overwhelming case: both calls
+            # resolve to the identical cache_file already).
+            _page_image(args.pdf_path, page_idx, DPI, {})
     except Exception:
         pass
 

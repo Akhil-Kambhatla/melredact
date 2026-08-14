@@ -1,8 +1,36 @@
 """Command-line entry point.
 
+    python -m melredact.cli preflight --pdf <scan.pdf> --roster <roster.csv> [--period 2]
     python -m melredact.cli run --pdf <scan.pdf> --roster <roster.csv> [--out out] [--decisions decisions] [--period 2]
     python -m melredact.cli analyze --pdf <scan.pdf> --roster <roster.csv> [--period 2]
     python -m melredact.cli verify --roster <roster.csv> [--out out]
+
+`preflight` is read-only, whole-file, and meant to run first -- the moment
+a file comes off Box, before any review, before `run`/`analyze`, before
+anything touches `out/`, `decisions/`, or the ledger (see pipeline.
+run_preflight). It reports, in one pass: page/packet counts and each
+packet's footer-declared length, any page-count-vs-footer disagreement,
+round groups with their date histograms and disagreeing packets, every
+page with a nonzero-or-low-confidence orientation (located as "page N of
+packet X"), every packet with an undetected header border, the roster
+block in use and how many packets have no plausible match, consensus-ink
+anomaly counts, uncovered-ink advisory counts, and any unsegmentable
+packet with its reason -- ending in a plain verdict: how many packets
+would process cleanly, how many would need a human in the editor, and how
+many can't be processed without a fix. It deliberately skips the one
+expensive thing `analyze` does (a real per-packet redaction draft with a
+full-page OCR pass, just to run verify_no_leaked_names) -- detection-hold
+and the uncovered-ink advisory only need the header page's own raster
+plus the header-band OCR crop matching already makes, so preflight stays
+bounded by the same small-crop OCR cost `run`'s own segmentation stage
+already pays on a cold cache, not the full-page cost. Every OCR/
+orientation/consensus call it makes is disk-cached the identical way
+`run`'s own calls are, so a `run` immediately following a `preflight`
+against the same file starts warm. Unless `--no-contact-sheet`, it also
+renders a contact sheet of every flagged page's thumbnail (labelled with
+why it was flagged) to `out/.diagnostics/<pdf-stem>_preflight/contact_
+sheet.png`, to eyeball in one place instead of paging through
+review_app.py.
 
 `analyze` is read-only: it segments the file, prints the round grouping
 report, then drafts (never writes) a redaction attempt for every header
@@ -101,12 +129,15 @@ from melredact.pipeline import (
     decisions_path,
     filter_packets_by_round,
     format_hold_analysis_report,
+    format_preflight_report,
     load_decisions,
     load_detection_overrides,
     load_manual_geometry,
     load_orientation_overrides,
     packet_tag,
+    render_preflight_contact_sheet,
     run_dispositions,
+    run_preflight,
 )
 from melredact.redact import verify_no_leaked_names
 from melredact.roster import RosterError, infer_period_from_filename, load_full_roster, load_roster
@@ -414,6 +445,43 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_preflight(args: argparse.Namespace) -> int:
+    pdf_path = Path(args.pdf)
+    roster_path = Path(args.roster)
+    if not pdf_path.exists():
+        print(f"PDF not found: {pdf_path}", file=sys.stderr)
+        return 1
+    if not roster_path.exists():
+        print(f"Roster CSV not found: {roster_path}", file=sys.stderr)
+        return 1
+
+    # Meant to be runnable the moment this file comes off Box -- so a
+    # missing decisions directory (no review has happened yet, the normal
+    # case for a brand-new file) just means no orientation overrides yet,
+    # not an error.
+    orientation_overrides = load_orientation_overrides(pdf_path, decisions_dir=Path(args.decisions))
+
+    try:
+        roster = load_roster(roster_path, period=args.period, infer_period_from=pdf_path)
+    except RosterError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    report = run_preflight(pdf_path, roster, period=args.period, orientation_overrides=orientation_overrides)
+    print(format_preflight_report(report))
+
+    if not args.no_contact_sheet:
+        sheet_path = render_preflight_contact_sheet(
+            pdf_path, report, Path(args.out), orientation_overrides=orientation_overrides
+        )
+        if sheet_path is not None:
+            print(f"\nContact sheet of flagged pages: {sheet_path}")
+        else:
+            print("\nNo pages flagged -- no contact sheet written.")
+
+    return 0
+
+
 def _cmd_verify(args: argparse.Namespace) -> int:
     roster_path = Path(args.roster)
     if not roster_path.exists():
@@ -554,6 +622,44 @@ def main(argv: list[str] | None = None) -> int:
         "reported unresolved a second time",
     )
     p_analyze.set_defaults(func=_cmd_analyze)
+
+    p_preflight = sub.add_parser(
+        "preflight",
+        help="read-only whole-file report of everything wrong with a scan before any review or run: "
+        "page/packet counts vs. footer, round-date histograms, orientation issues, undetected header "
+        "borders, roster match coverage, consensus-ink/uncovered-ink counts, and unsegmentable "
+        "packets, ending in a plain clean/needs-editor/cannot-process verdict. Writes nothing, "
+        "deletes nothing -- meant to be run the moment a file comes off Box, before deciding whether "
+        "to review it now or hand it back. Populates the same OCR/orientation/consensus disk caches "
+        "the real run reads, so nothing here is wasted work.",
+    )
+    _add_common_args(p_preflight)
+    p_preflight.add_argument(
+        "--period",
+        default=None,
+        help="restrict the roster to this period's block (e.g. '2' or '02'); inferred from --pdf's "
+        "filename (e.g. 'PD2') if omitted",
+    )
+    p_preflight.add_argument(
+        "--decisions",
+        default="decisions",
+        help="decisions directory (default: decisions) -- read here only for any already-recorded "
+        "per-page orientation confirmations, so a page a reviewer already rotated is reported at its "
+        "confirmed orientation rather than flagged all over again",
+    )
+    p_preflight.add_argument(
+        "--out",
+        default="out",
+        help="output directory (default: out) -- preflight never writes redacted output here, only "
+        "(unless --no-contact-sheet) a contact sheet of flagged pages under out/.diagnostics/",
+    )
+    p_preflight.add_argument(
+        "--no-contact-sheet",
+        action="store_true",
+        dest="no_contact_sheet",
+        help="skip rendering the contact-sheet image of flagged pages under out/.diagnostics/",
+    )
+    p_preflight.set_defaults(func=_cmd_preflight)
 
     p_verify = sub.add_parser("verify", help="re-check files already in --out for leaked roster names")
     p_verify.add_argument("--roster", required=True, help="consent roster CSV (every period, unscoped)")
