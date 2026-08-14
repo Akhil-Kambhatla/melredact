@@ -641,14 +641,17 @@ def build_consensus_fixture(out_dir: Path, *, n_packets: int = 6) -> ConsensusFi
     packets, identical worksheet_type, 2 pages each. Page 2 carries the
     printed footer plus, for specific packets:
 
-    - the first 3 packets share CONSENSUS_ANSWER_BOX at the same position
-      -- simulating an ordinary field most of a small group filled in.
-      With n=6, CONSENSUS_ANOMALY_MAX_GROUP_FRACTION's ceiling is
-      max(1, int(0.10*6)) = 1, so a 3-packet cluster (occurrence_count=3)
-      clears it and must never be held.
-    - the *last* packet alone carries CONSENSUS_ANOMALY_BOX, at a position
-      no other packet has any ink at all -- occurrence_count=1 <= ceiling
-      of 1, must always be held.
+    - the first 3 packets share CONSENSUS_ANSWER_BOX at the exact same
+      position -- simulating an ordinary field most of a small group
+      filled in identically. A cluster of 3 packets all landing on the
+      same blocks trivially has >= CONSENSUS_WRITING_ZONE_MIN_SHARE=2
+      *other* corroborating packets in its own footprint at any dilation
+      radius, including zero, so it must never be held.
+    - the *last* packet alone carries CONSENSUS_ANOMALY_BOX, over 300pt
+      from CONSENSUS_ANSWER_BOX -- far outside CONSENSUS_WRITING_ZONE_
+      DILATION_PT's real-data-calibrated reach, so no other packet's ink
+      ever corroborates it; occurrence_count=1 (no corroborators, just
+      itself), must always be held.
     - the remaining packets have no extra page-2 ink at all, and must
       follow the ordinary, unaffected redaction path.
 
@@ -711,6 +714,111 @@ def build_consensus_fixture(out_dir: Path, *, n_packets: int = 6) -> ConsensusFi
             result.anomaly_tag = tag
         if not is_answer and not is_anomaly:
             result.clean_tags.append(tag)
+
+    builder.save(pdf_path)
+    _write_roster_csv(roster_path, roster_rows)
+    return result
+
+
+@dataclass
+class ConsensusZoneFixtureResult:
+    pdf_path: Path
+    roster_path: Path
+    zone_tags: list[str] = field(default_factory=list)  # staggered, non-overlapping "response" positions
+    ragged_edge_tag: str = ""  # sits in the gap between two zone positions, must not be held
+    margin_leak_tag: str = ""  # isolated top-margin mark, far from the zone, must always be held
+
+
+CONSENSUS_ZONE_BOXES = [
+    (200.0, 150.0, 208.0, 170.0),
+    (212.0, 150.0, 220.0, 170.0),
+    (224.0, 150.0, 232.0, 170.0),
+    (236.0, 150.0, 244.0, 170.0),
+    (248.0, 150.0, 256.0, 170.0),
+]
+CONSENSUS_RAGGED_EDGE_BOX = (218.0, 150.0, 226.0, 170.0)
+CONSENSUS_MARGIN_LEAK_BOX = (40.0, 40.0, 55.0, 60.0)
+
+
+def build_consensus_writing_zone_fixture(out_dir: Path) -> ConsensusZoneFixtureResult:
+    """A group of 7 packets exercising the writing-zone mask (see consensus.
+    py's `_analyze_group`/CONSENSUS_WRITING_ZONE_DILATION_PT in config.py):
+
+    - 5 packets each place a small mark at a different, non-overlapping x
+      position (CONSENSUS_ZONE_BOXES, 4pt gaps, 12pt period) -- real
+      students answering the same prompt rarely land on identical pixels,
+      so this models genuine ragged-answer-position ink that must never
+      cluster into one exact-overlap group but must still read as an
+      ordinary shared response area once corroborated by dilation. The
+      12pt period keeps every one of the 5 (including the two at the ends
+      of the row) within CONSENSUS_WRITING_ZONE_DILATION_PT of at least
+      two *other* zone marks, not just its immediate neighbor -- an edge
+      position with only one corroborator nearby would itself fail
+      CONSENSUS_WRITING_ZONE_MIN_SHARE=2 and be wrongly held. None of
+      these 5 may ever be held, at any dilation setting.
+    - 1 packet's mark (CONSENSUS_RAGGED_EDGE_BOX) sits in the 4pt gap
+      between two of the five response positions, comfortably within
+      CONSENSUS_WRITING_ZONE_DILATION_PT of at least two others -- the
+      "ragged edge of a shared writing zone" case: never exactly
+      overlapping anyone else's mark, but must still not be held.
+    - 1 packet's mark (CONSENSUS_MARGIN_LEAK_BOX) sits in the blank top
+      margin, over 140pt from every response-area mark -- far outside any
+      real dilation setting's reach, modeling the real p026/p034 shape (a
+      freehand name alone in an otherwise-blank margin). Must always be
+      held, regardless of dilation.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = out_dir / "consensus_zone_fixture.pdf"
+    roster_path = out_dir / "consensus_zone_roster.csv"
+    builder = PdfBuilder()
+
+    result = ConsensusZoneFixtureResult(pdf_path=pdf_path, roster_path=roster_path)
+    roster_rows: list[tuple[str, str, str]] = []
+
+    packets: list[tuple[str, tuple[float, float, float, float]]] = (
+        [("zone", box) for box in CONSENSUS_ZONE_BOXES]
+        + [("ragged_edge", CONSENSUS_RAGGED_EDGE_BOX)]
+        + [("margin_leak", CONSENSUS_MARGIN_LEAK_BOX)]
+    )
+
+    for i, (kind, box) in enumerate(packets):
+        sid = _sid(i + 1)
+        first, last = f"Num{i}", f"Student{i}"
+        name_text = f"{first} {last}"
+        roster_rows.append((sid, last, first))
+
+        img1 = render_header_image(
+            name_text=name_text,
+            teacher_text="Hannel",
+            group_text="",
+            date_text="10/03/2025",
+            period_text="02",
+            worksheet_type=CONSENSUS_WORKSHEET_TYPE,
+            page_marker="Page 1 of 2",
+            shade_blank_rows=False,
+        )
+        items1 = [
+            InvisibleText("Name:", NAME_ANCHOR["x0"], NAME_ANCHOR["top"], 9),
+            InvisibleText(name_text, 150, NAME_ANCHOR["top"]),
+            InvisibleText(CONSENSUS_WORKSHEET_TYPE, FOOTER_WORKSHEET_TYPE["x0"], FOOTER_WORKSHEET_TYPE["top"], 9),
+            InvisibleText("Page 1 of 2", FOOTER_PAGE_MARKER["x0"], FOOTER_PAGE_MARKER["top"], 9),
+        ]
+        builder.add_page(img1, items1)
+
+        img2 = _consensus_page2_image("Page 2 of 2", [box])
+        items2 = [
+            InvisibleText(CONSENSUS_WORKSHEET_TYPE, FOOTER_WORKSHEET_TYPE["x0"], FOOTER_WORKSHEET_TYPE["top"], 9),
+            InvisibleText("Page 2 of 2", FOOTER_PAGE_MARKER["x0"], FOOTER_PAGE_MARKER["top"], 9),
+        ]
+        builder.add_page(img2, items2)
+
+        tag = f"consensus_zone_fixture_p{2 * i:03d}"
+        if kind == "zone":
+            result.zone_tags.append(tag)
+        elif kind == "ragged_edge":
+            result.ragged_edge_tag = tag
+        else:
+            result.margin_leak_tag = tag
 
     builder.save(pdf_path)
     _write_roster_csv(roster_path, roster_rows)

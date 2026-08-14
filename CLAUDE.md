@@ -2464,6 +2464,170 @@ stays refused) releases the packet through `release_from_manual_queue`;
 packets with no anomalous ink (both the shared-answer-ink ones and the
 plain ones) follow the ordinary, unaffected write path.
 
+## Consensus-ink: registration tolerance and a writing-zone mask, replacing a frequency threshold that didn't generalize (2026-08-14)
+
+**Motivated by the previous section's own real finding: 87% of packets on
+both real 020415 files were held by the consensus-ink check with no
+identifying mark on any of them.** Diagnosing the 42 held packets by
+rendering their flagged regions found three real, non-identifying causes:
+students circling or writing a number at a different position in a fixed
+answer table (ragged answer position), per-copy registration/darkness
+variation on densely-printed pages reading printed instructional words as
+extra ink (printed-text alignment noise), and genuine stray marks (a
+doodle, a page-edge scan artifact). Two independent fixes address these,
+done in dependency order (pass one first, since it reduces the noise pass
+two has to separate).
+
+**Fix 1 -- pass one precision: registration tolerance, not darkness
+normalization.** Diagnosed before changing anything, per real measurement,
+not assumption: pass one (block-density-vs-median) flagged 135 regions on
+`Hannel MPR PD2.pdf`'s page-2 group and 401 on `Hannel PRT PD2.pdf`'s, with
+no known real leak in either file. Two pieces of real evidence ruled out
+per-copy darkness/contrast as the cause: each packet's own whole-page mean
+block density varied by only ~0.0006-0.0015 across its entire 20-22-packet
+group (a ~1-3% relative spread — there is no meaningful "some copies are
+darker scans" effect to normalize away), and the correlation between a
+flagged region's own peak density-diff and its packet's whole-page darkness
+offset was weak to nonexistent (r=0.32 on MPR, r=0.02 on PRT). What the
+flagged regions actually were instead: 58-66% of them were exactly one
+block tall (a single text-line row), most sitting directly on top of a
+position where the group median already shows substantial ink (thin-region
+median-density-there: 0.156 on MPR, 0.150 on PRT) — the same printed line
+nearly every other packet also has, just quantized into a different block
+by a sub-block registration difference between independently ECC-aligned
+copies. This matches consensus.py's own already-documented finding that
+alignment leaves small, smoothly-varying local distortion behind (Dice
+overlap only 0.29-0.44 even post-alignment). Confirmed directly by
+rendering five spot-checked flagged regions (two on `010406_PD1_
+PRT.pdf`, three on `Hannel PRT PD2.pdf`): every one was a printed word, a
+printed table-border rule, or the footer's "Page X of Y" marker — never a
+blank patch of elevated density. **Registration, not darkness — evidence,
+not assumption.**
+
+Fix: `melredact/consensus.py`'s `flagged_regions` now dilates the group
+median (per-block max filter, radius `CONSENSUS_REGISTRATION_TOLERANCE_
+BLOCKS=1`, `consensus._dilate_float_max`) before diffing against it, so a
+packet's block is only flagged when its density exceeds the *highest*
+median density in its own immediate neighborhood, not just its
+exact-position counterpart. A per-copy density-normalization fix (matching
+each packet's ink level to a common reference before comparing) was
+considered and **rejected**: the darkness-correlation evidence above shows
+there is no real per-copy darkness effect on this data to normalize away,
+so it would add a step that does nothing on the actual failure mode while
+risking flattening genuine differences in how heavily a student presses a
+pen. `radius=1` (the smallest possible correction) already measured a
+93-90% reduction (135->9 on MPR, 401->39 on PRT) while both known real
+leaks (`010406_PD1_PRT_p026`, `_p034`) stayed flagged with dozens of
+surviving regions each — nowhere close to a too-aggressive radius's risk of
+suppressing real ink. Larger radii were measured and rejected for
+diminishing returns against growing risk; see `CONSENSUS_REGISTRATION_
+TOLERANCE_BLOCKS`'s own docstring in `config.py` for the full real numbers.
+
+**Fix 2 -- pass two: a spatial writing-zone mask, replacing the frequency
+threshold entirely.** The previous `CONSENSUS_ANOMALY_MAX_GROUP_FRACTION`
+threshold (a cluster shared by more than 10% of the group was an ordinary
+field) was calibrated against a single file's own real gap
+(`010406_PD1_PRT.pdf`'s page-2 group) and **did not generalize**: re-run
+against the two Hannel files (Fix 1 already applied, to isolate this
+problem from the one it fixes), the occurrence-fraction distribution was
+continuous at every candidate cutoff on both files — no step of more than
+~5 points anywhere, nothing resembling the single file's own clean gap.
+Root cause: real free-response handwriting varies in *position*, not just
+presence — two students answering the same prompt rarely land on the exact
+same blocks, so their marks never cluster into one high-occurrence group
+under bbox-overlap clustering even though both are, correctly, ordinary
+answer ink in the same general area. **The frequency threshold's single-
+file calibration was the bug, not any one number it picked** — no fraction
+could have separated "shared field" from "isolated mark" on data shaped
+like this.
+
+Replacement: a block position is "in the writing zone" — an ordinary place
+the class writes — when at least `CONSENSUS_WRITING_ZONE_MIN_SHARE` *other*
+packets in the group have their own (registration-tolerant) flagged ink
+within `CONSENSUS_WRITING_ZONE_DILATION_PT` of it: spatial corroboration
+from nearby ink, not exact-position overlap. A flagged region is held only
+when its own footprint has no such corroboration anywhere in it, regardless
+of how many packets have *some* unrelated ink *somewhere* on the page
+(`consensus._analyze_group`, `consensus._zone_params`). Both values are
+dict-keyed by `worksheet_type` in `config.py` (`CONSENSUS_WRITING_ZONE_
+DILATION_PT`, `CONSENSUS_WRITING_ZONE_MIN_SHARE`), not hardcoded, with a
+module-level default (23.0pt / 2) for any type without its own entry.
+
+**Calibration, on both teachers, real numbers (post-Fix-1 hold counts,
+dilation swept at 0 / 11.5pt / 23.0pt / 34.6pt, i.e. 0/2/4/6 blocks,
+min_share=2 throughout):**
+
+| file (worksheet_type) | 0pt | 11.5pt | 23.0pt | 34.6pt |
+|---|---|---|---|---|
+| `010406_PD1_PRT.pdf` (PRT, 44 scored) | 42 | 16 | **7** | 6 |
+| `Hannel PRT PD2.pdf` (PRT, 20) | 13 | 10 | **8** | 6 |
+| `Hannel MPR PD2.pdf` (PCMEL_MPR_ADR, 22) | 6 | 6 | **6** | 6 |
+
+010406 shows a real knee at 23.0pt: the 0->23pt step absorbs the bulk of
+ragged-answer-position noise (42->7 held), while the next 11.6pt of
+dilation buys only one more packet (7->6) — diminishing returns, not a
+continuing clean trend, so pushing further isn't justified by the data.
+Hannel PRT shows **no comparable knee** — a steadier decline consistent
+with free-response prose having no single characteristic answer-field size
+the way 010406's structured digit answers do; reported plainly rather than
+picking a number that pretends to a gap that isn't there. Hannel MPR is
+stuck at 6 held at *every* radius tested: after Fix 1, MPR's remaining
+flagged regions formed zero occurrence>=2 clusters at any radius, so there
+is no shared-position signal for a spatial mask to find on this file at
+all — clean gap or not, dilation cannot help a file with no clustering
+signal to begin with.
+
+**23.0pt / min_share=2 was kept as the one real value in play, not because
+every type has its own clean gap, but because a fine enough key to give
+them separate ones doesn't exist**: `010406_PD1_PRT.pdf` and `Hannel PRT
+PD2.pdf` both parse to the **identical** footer-read `worksheet_type`
+`"PRT"` (`WORKSHEET_TYPE_PATTERN` strips the trailing `(mm/yyyy)` the same
+way for both) despite very different real page-2 content — one a
+structured digit-answer table, the other free-response prose.
+`worksheet_type` cannot separate them, so one config entry necessarily
+governs both real PRT files; 23.0pt is 010406's own real-gap-justified
+number, which also happens to give Hannel PRT a real (if less dramatic)
+13->8 reduction. The dict-keyed shape exists so a future teacher's
+worksheet_type that genuinely does have its own distinguishable gap can get
+its own calibrated entry without a code change — there is just no real
+evidence yet to put a *different* number in either of today's two real
+keys, and manufacturing one would be exactly the single-file-overfit
+mistake this replacement fixes.
+
+**Both real leaks stayed held at every dilation radius tested, including
+zero** — `010406_PD1_PRT_p026` and `_p034` never depended on the writing-
+zone mask at all; they were already isolated (no corroborating ink
+anywhere near them) under Fix 1 alone. At the chosen real config (Fix 1
+radius=1, 23.0pt/min_share=2), the pipeline holds `010406_PD1_PRT.pdf` at
+7/44, `Hannel PRT PD2.pdf` at 8/20, `Hannel MPR PD2.pdf` at 6/22 — matching
+the swept-radius table above exactly, confirmed via the real, non-test
+`analyze_consensus_anomalies` entry point, not a reimplementation.
+
+**The stray-mark category, its real cost made explicit.** Spot-rendering
+residual holds after both fixes found a genuine mix, not just further
+false positives: on Hannel MPR, one residual hold (`Hannel MPR PD2_p022`)
+is a confirmed real stray mark — a hand-drawn doodle in the top margin,
+correctly held, since the check cannot and should not try to distinguish a
+doodle from a name; a human clearing it via the manual-redaction queue is
+the intended, accepted cost, not a bug. The remaining residual holds
+spot-checked (010406: printed body text, a printed table-border rule, the
+footer's own "Page X of Y" marker, and one long curved scan-artifact line
+running most of the page width; Hannel PRT: more printed-table-border and
+printed-word instances) are further printed-text/scan-artifact noise the
+tolerance fix didn't fully absorb — an accepted residual under the same "a
+held-back false positive is cheap via the manual queue, a shipped leak is
+not" trade-off bug #7 already established, not something further tuned
+away this session (a larger registration-tolerance radius would reduce it
+further but was rejected above for diminishing returns against growing
+risk to genuine ink).
+
+**Nothing was regenerated or shipped for any real teacher as part of this
+session** — same "verified, not automatically re-shipped" posture as every
+other real-data finding in this file. The real numbers above come from
+`analyze_consensus_anomalies` run directly (read-only, the same function
+`cli.py analyze`/`run_dispositions` call) against the real source PDFs, not
+from any write to `out/`, `decisions/`, or the ledger.
+
 ## Working preferences
 
 - Calibrate against real measured data, not assumptions — when a

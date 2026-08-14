@@ -14,31 +14,40 @@ text-based check can be trusted to catch (see "Why this exists" below).
 Pass one, per packet (`flagged_regions`): for a (worksheet_type, page_offset)
 group, rasterize every packet's page, align each to a common reference via
 ECC, and vote at block granularity -- each packet's own per-block ink
-*density* against the group's per-block *median* density. A block whose
-density exceeds the median by more than DENSITY_DIFF_THRESHOLD is flagged;
-flagged blocks are then grouped into connected regions and small ones
-(speckle, alignment jitter) are dropped via MIN_CONNECTED_BLOCKS. This
-identifies "ink that isn't part of the shared template" per packet -- see
-"Why block-median voting, not per-pixel or optical flow" below for why this
-specific method, at this specific granularity, is what real measurement
-supports.
+*density* against the group's per-block *median* density, dilated by
+CONSENSUS_REGISTRATION_TOLERANCE_BLOCKS before the comparison (see
+config.py's own docstring on that constant for the real-data diagnosis: a
+sub-block registration difference between independently re-aligned copies,
+not per-copy darkness/contrast, was measured as the cause of most false
+flags on printed text). A block whose density exceeds the *dilated* median
+by more than DENSITY_DIFF_THRESHOLD is flagged; flagged blocks are then
+grouped into connected regions and small ones (speckle, residual alignment
+jitter) are dropped via MIN_CONNECTED_BLOCKS. This identifies "ink that
+isn't part of the shared template, once a modest registration difference is
+tolerated" per packet -- see "Why block-median voting, not per-pixel or
+optical flow" below for why this specific method, at this specific
+granularity, is what real measurement supports.
 
-Pass two, across the whole group (`_cluster_and_count`/`_anomaly_ceiling`):
-for a (worksheet_type, page_offset) group, cluster every packet's flagged
-regions by bbox overlap -- two regions land in the same cluster whenever
-they overlap at all, since independent students' handwriting at the same
-field never lands on identical pixels (same alignment-noise finding as pass
-one). Count how many *distinct packets* contributed to each cluster. A
-cluster most of the group shares is an ordinary answer/response field --
-expected, harmless, not identifying on its own. A cluster only one or a few
-packets have is anomalous: it isn't part of the printed template (pass one
-already established that) and it isn't something most of the group also
-wrote there either. This replaces an earlier, page-position-based heuristic
-("is this in the blank top margin, or somewhere content is expected?") that
-mislabelled part of a real leak's own name ink as harmless body content
-because the handwriting's vertical extent straddled an approximate
-margin/body boundary -- position on the page was never actually the signal
-that mattered; how many packets share a position is.
+Pass two, across the whole group (`_zone_params`/`_build_writing_zone`): a
+spatial writing-zone mask, not an occurrence-frequency threshold (replaced
+2026-08-14 -- see config.py's CONSENSUS_WRITING_ZONE_DILATION_PT docstring
+for the real-data reason the original frequency threshold, calibrated on a
+single file, did not generalize to free-response worksheets). A block
+position is "in the zone" -- an ordinary place the class writes -- when at
+least CONSENSUS_WRITING_ZONE_MIN_SHARE *other* packets in the group have
+their own flagged ink within CONSENSUS_WRITING_ZONE_DILATION_PT of it,
+spatial corroboration rather than exact-position overlap (real students
+answering the same prompt rarely land on the identical blocks, so exact
+overlap under-counts genuine shared answer areas). A flagged region is held
+only when its own footprint has no such corroboration anywhere in it,
+regardless of how many packets have *some* unrelated ink *somewhere* on the
+page. This is the second replacement of an earlier, page-position-based
+heuristic ("is this in the blank top margin, or somewhere content is
+expected?") that mislabelled part of a real leak's own name ink as harmless
+body content because the handwriting's vertical extent straddled an
+approximate margin/body boundary -- position on the page in the abstract was
+never the signal that mattered; whether *other packets* independently wrote
+nearby is.
 
 The header page is excluded from this check entirely (see
 `_build_groups`): its Name/Teacher/Group ink is already destroyed
@@ -135,7 +144,6 @@ from PIL import Image
 from melredact.config import (
     BORDER_DARK_THRESHOLD,
     CACHE_DIR,
-    CONSENSUS_ANOMALY_MAX_GROUP_FRACTION,
     CONSENSUS_BLOCK_PX,
     CONSENSUS_DENSITY_DIFF_THRESHOLD,
     CONSENSUS_DPI,
@@ -144,6 +152,11 @@ from melredact.config import (
     CONSENSUS_ECC_ITERS,
     CONSENSUS_MIN_CONNECTED_BLOCKS,
     CONSENSUS_MIN_GROUP_SIZE,
+    CONSENSUS_REGISTRATION_TOLERANCE_BLOCKS,
+    CONSENSUS_WRITING_ZONE_DILATION_DEFAULT_PT,
+    CONSENSUS_WRITING_ZONE_DILATION_PT,
+    CONSENSUS_WRITING_ZONE_MIN_SHARE,
+    CONSENSUS_WRITING_ZONE_MIN_SHARE_DEFAULT,
 )
 from melredact.ocr import file_content_hash
 from melredact.pdfio import open_pdf
@@ -168,10 +181,10 @@ class AnomalyHold:
         left, top, right, bottom = (round(v, 1) for v in self.bbox_pt)
         return (
             f"consensus-ink anomaly on page {self.page_offset + 1}: ink at "
-            f"({left}, {top})-({right}, {bottom}) pt appears on only "
-            f"{self.occurrence_count} of {self.group_size} packet(s) sharing this "
-            "worksheet page -- not printed template content, and not shared widely "
-            "enough across the group to be an ordinary answer field"
+            f"({left}, {top})-({right}, {bottom}) pt has only {self.occurrence_count} "
+            f"of {self.group_size} packet(s) (counting itself) with any ink nearby -- "
+            "not printed template content, and outside the group's shared writing-zone "
+            "mask, so not an ordinary answer/response field either"
         )
 
 
@@ -227,16 +240,50 @@ def block_density(mask_float: np.ndarray, b: int) -> np.ndarray:
     return reshaped.mean(axis=(1, 3))
 
 
-def flagged_regions(dens_i: np.ndarray, median: np.ndarray, b: int = CONSENSUS_BLOCK_PX) -> list[tuple[Bbox, float]]:
+def _dilate_float_max(arr: np.ndarray, radius_blocks: int) -> np.ndarray:
+    """Per-block max filter: each cell becomes the max of itself and every
+    cell within radius_blocks (Chebyshev distance). Used on the group
+    median before pass one's diff, tolerating a sub-block registration
+    difference between independently re-aligned copies -- see
+    CONSENSUS_REGISTRATION_TOLERANCE_BLOCKS's docstring in config.py."""
+    if radius_blocks <= 0:
+        return arr
+    k = 2 * radius_blocks + 1
+    kernel = np.ones((k, k), dtype=np.uint8)
+    return cv2.dilate(arr.astype(np.float32), kernel)
+
+
+def _dilate_binary_any(mask: np.ndarray, radius_blocks: int) -> np.ndarray:
+    """Same neighborhood expansion as _dilate_float_max, but for a binary
+    flagged-block mask: a block becomes 1 if any block within radius_blocks
+    was 1. Used to build the writing-zone mask's spatial tolerance -- see
+    CONSENSUS_WRITING_ZONE_DILATION_PT's docstring in config.py."""
+    if radius_blocks <= 0:
+        return mask
+    k = 2 * radius_blocks + 1
+    kernel = np.ones((k, k), dtype=np.uint8)
+    return cv2.dilate(mask, kernel)
+
+
+def flagged_regions(
+    dens_i: np.ndarray,
+    median: np.ndarray,
+    b: int = CONSENSUS_BLOCK_PX,
+    tolerance_blocks: int = CONSENSUS_REGISTRATION_TOLERANCE_BLOCKS,
+) -> list[tuple[Bbox, float, tuple[int, int, int, int]]]:
     """Pass one: this packet's own blocks whose density exceeds the group's
-    median by more than DENSITY_DIFF_THRESHOLD, grouped into connected
-    regions with speckle (fewer than MIN_CONNECTED_BLOCKS blocks) dropped.
-    Returns (bbox_pt, peak_density_diff) pairs in the aligned page's own
-    point-space."""
-    diff = dens_i - median
+    median -- dilated by tolerance_blocks first, see _dilate_float_max --
+    by more than DENSITY_DIFF_THRESHOLD, grouped into connected regions
+    with speckle (fewer than MIN_CONNECTED_BLOCKS blocks) dropped. Returns
+    (bbox_pt, peak_density_diff, block_bbox) triples, block_bbox as
+    (x0, y0, x1, y1) in the same block-grid coordinates as `median`/
+    `dens_i` -- needed by the writing-zone check in `_analyze_group`, which
+    operates on that grid directly rather than re-deriving it from points."""
+    ref = _dilate_float_max(median, tolerance_blocks)
+    diff = dens_i - ref
     flagged = (diff > CONSENSUS_DENSITY_DIFF_THRESHOLD).astype(np.uint8)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(flagged, connectivity=8)
-    regions: list[tuple[Bbox, float]] = []
+    regions: list[tuple[Bbox, float, tuple[int, int, int, int]]] = []
     for label in range(1, n):
         x, y, w, h, area_blocks = stats[label]
         if area_blocks < CONSENSUS_MIN_CONNECTED_BLOCKS:
@@ -246,7 +293,7 @@ def flagged_regions(dens_i: np.ndarray, median: np.ndarray, b: int = CONSENSUS_B
         right = (x + w) * b * PT_PER_PX
         bottom = (y + h) * b * PT_PER_PX
         peak = float(diff[labels == label].max())
-        regions.append(((left, top, right, bottom), peak))
+        regions.append(((left, top, right, bottom), peak, (x, y, x + w, y + h)))
     return regions
 
 
@@ -298,60 +345,17 @@ def cached_block_density(
     return density, ok
 
 
-def _overlaps(a: Bbox, b: Bbox) -> bool:
-    al, at, ar, ab = a
-    bl, bt, br, bb = b
-    return not (ar <= bl or al >= br or ab <= bt or at >= bb)
-
-
-def _cluster_and_count(per_packet_regions: dict[str, list[tuple[Bbox, float]]]) -> list[tuple[set[str], list[tuple[str, Bbox, float]]]]:
-    """Pass two: union-find cluster every flagged region across the whole
-    group by bbox overlap -- the position-frequency vote the module
-    docstring describes. Two packets' regions land in the same cluster
-    whenever their boxes overlap at all, regardless of exact shape, since
-    independent students' handwriting at the same field never lands on
-    identical pixels (see the module docstring's alignment-noise findings).
-    Returns one (distinct packet tags, member entries) pair per cluster."""
-    entries: list[tuple[str, Bbox, float]] = []
-    for tag, regions in per_packet_regions.items():
-        for bbox, peak in regions:
-            entries.append((tag, bbox, peak))
-    n = len(entries)
-    parent = list(range(n))
-
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(x: int, y: int) -> None:
-        rx, ry = find(x), find(y)
-        if rx != ry:
-            parent[rx] = ry
-
-    for i in range(n):
-        for j in range(i + 1, n):
-            if _overlaps(entries[i][1], entries[j][1]):
-                union(i, j)
-
-    clusters: dict[int, list[tuple[str, Bbox, float]]] = {}
-    for i, entry in enumerate(entries):
-        clusters.setdefault(find(i), []).append(entry)
-
-    return [({m[0] for m in members}, members) for members in clusters.values()]
-
-
-def _anomaly_ceiling(group_size: int) -> int:
-    """A cluster shared by at most this many distinct packets is anomalous;
-    more than this is treated as an ordinary answer field. See
-    CONSENSUS_ANOMALY_MAX_GROUP_FRACTION's own docstring in config.py for
-    the real-data gap this is picked from. `max(1, ...)` matters at small
-    group sizes (down to CONSENSUS_MIN_GROUP_SIZE): a bare fraction would
-    let a singleton occurrence round down to a ceiling of 0, which would
-    make the check unable to ever flag anything at the group floor -- the
-    one case (a lone anomalous packet) this check exists to catch."""
-    return max(1, int(CONSENSUS_ANOMALY_MAX_GROUP_FRACTION * group_size))
+def _zone_params(worksheet_type: str) -> tuple[float, int]:
+    """(dilation_pt, min_share) for this worksheet_type's writing-zone mask,
+    read from config.py's dict-keyed CONSENSUS_WRITING_ZONE_DILATION_PT/
+    CONSENSUS_WRITING_ZONE_MIN_SHARE with a fallback to the module-level
+    defaults for any worksheet_type without its own real-data-justified
+    entry -- see those constants' own docstrings for why today's two real
+    worksheet_types ("PCMEL_MPR_ADR", "PRT") both currently fall through to
+    the default rather than getting distinct calibrated entries."""
+    dilation_pt = CONSENSUS_WRITING_ZONE_DILATION_PT.get(worksheet_type, CONSENSUS_WRITING_ZONE_DILATION_DEFAULT_PT)
+    min_share = CONSENSUS_WRITING_ZONE_MIN_SHARE.get(worksheet_type, CONSENSUS_WRITING_ZONE_MIN_SHARE_DEFAULT)
+    return dilation_pt, min_share
 
 
 def _build_groups(pdf_path: str | Path, segmented: SegmentResult) -> dict[tuple[str, int], list[tuple[str, int]]]:
@@ -403,26 +407,45 @@ def _analyze_group(
     stacked = np.stack(list(densities.values()))
     median = np.median(stacked, axis=0)
 
-    per_packet_regions: dict[str, list[tuple[Bbox, float]]] = {}
+    per_packet_regions: dict[str, list[tuple[Bbox, float, tuple[int, int, int, int]]]] = {}
+    per_packet_masks: dict[str, np.ndarray] = {}
     for tag, density in densities.items():
         regions = flagged_regions(density, median, CONSENSUS_BLOCK_PX)
-        if regions:
-            per_packet_regions[tag] = regions
+        if not regions:
+            continue
+        per_packet_regions[tag] = regions
+        mask = np.zeros(median.shape, dtype=np.uint8)
+        for _bbox, _peak, (x0, y0, x1, y1) in regions:
+            mask[y0:y1, x0:x1] = 1
+        per_packet_masks[tag] = mask
 
     n_used = len(densities)
-    ceiling = _anomaly_ceiling(n_used)
     holds: list[AnomalyHold] = []
-    for tags, members in _cluster_and_count(per_packet_regions):
-        if len(tags) > ceiling:
-            continue
-        for tag, bbox, _peak in members:
+    if not per_packet_masks:
+        return holds, None
+
+    dilation_pt, min_share = _zone_params(worksheet_type)
+    block_pt = CONSENSUS_BLOCK_PX * PT_PER_PX
+    zone_radius_blocks = round(dilation_pt / block_pt)
+
+    dilated_masks = {tag: _dilate_binary_any(mask, zone_radius_blocks) for tag, mask in per_packet_masks.items()}
+    total_coverage = np.zeros(median.shape, dtype=np.int32)
+    for dilated in dilated_masks.values():
+        total_coverage += dilated
+
+    for tag, regions in per_packet_regions.items():
+        coverage_excl_self = total_coverage - dilated_masks[tag]
+        for bbox, _peak, (x0, y0, x1, y1) in regions:
+            nearby_other_packets = int(coverage_excl_self[y0:y1, x0:x1].max())
+            if nearby_other_packets >= min_share:
+                continue
             holds.append(
                 AnomalyHold(
                     packet_tag=tag,
                     page_offset=page_offset,
                     physical_page_index=phys_by_tag[tag],
                     bbox_pt=bbox,
-                    occurrence_count=len(tags),
+                    occurrence_count=nearby_other_packets + 1,
                     group_size=n_used,
                 )
             )
