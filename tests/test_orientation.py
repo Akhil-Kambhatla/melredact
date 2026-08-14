@@ -14,19 +14,16 @@ writing orientation.py.
 from __future__ import annotations
 
 import json
-import zlib
 
 import pdfplumber
-import pikepdf
 import pytest
-from pikepdf import Dictionary, Name
 from PIL import Image
 
 from melredact import orientation
 from melredact.redact import redact_packet, verify_no_leaked_names
 from melredact.roster import load_roster
 from melredact.segment import segment_pdf
-from tests.make_fixture import build_main_fixture
+from tests.make_fixture import build_main_fixture, build_rotated_page_copy, replace_page_content
 
 
 @pytest.fixture(scope="module")
@@ -34,54 +31,8 @@ def main_fixture(tmp_path_factory):
     return build_main_fixture(tmp_path_factory.mktemp("orientation_fixture"))
 
 
-def _replace_page_content(pdf_path, page_index: int, tmp_path, out_name: str, image: Image.Image, page_size):
-    """Rebuild one page of `pdf_path` from a caller-supplied raster image
-    (and page size), copying every other page across unchanged (including
-    their own invisible OCR text layer -- see make_fixture.PdfBuilder) via
-    pikepdf's own cross-document page copy. The replaced page carries no
-    text layer at all, same as a real scan (see CLAUDE.md's "Real scans
-    have no text layer at all")."""
-    pw, ph = page_size
-    with pikepdf.open(pdf_path) as src:
-        out_pdf = pikepdf.Pdf.new()
-        for idx, page in enumerate(src.pages):
-            if idx != page_index:
-                out_pdf.pages.append(page)
-                continue
-            new_page = out_pdf.add_blank_page(page_size=(pw, ph))
-            compressed = zlib.compress(image.tobytes())
-            im_obj = pikepdf.Stream(out_pdf, compressed)
-            im_obj.Type = Name.XObject
-            im_obj.Subtype = Name.Image
-            im_obj.Width = image.width
-            im_obj.Height = image.height
-            im_obj.ColorSpace = Name.DeviceRGB
-            im_obj.BitsPerComponent = 8
-            im_obj.Filter = Name.FlateDecode
-            new_page.Resources = out_pdf.make_indirect(
-                Dictionary(XObject=Dictionary(Im0=out_pdf.make_indirect(im_obj)))
-            )
-            new_page.Contents = out_pdf.make_indirect(
-                pikepdf.Stream(out_pdf, f"q {pw} 0 0 {ph} 0 0 cm /Im0 Do Q".encode())
-            )
-        out_path = tmp_path / out_name
-        out_pdf.save(out_path)
-    return out_path
-
-
 def _build_rotated_copy(main_fixture, tmp_path, page_index: int, degrees: int, out_name: str):
-    """A copy of the main fixture with `page_index`'s own embedded content
-    physically pre-rotated by `degrees` (simulating a real scanner flip,
-    not a /Rotate-metadata-only mislabel) -- the sign convention (`-degrees`
-    to simulate a page that needs `degrees` of correction) is the same one
-    validated against the real classifier before writing orientation.py."""
-    with pdfplumber.open(main_fixture.pdf_path) as pdf:
-        page = pdf.pages[page_index]
-        image = page.to_image(resolution=150).original.convert("RGB")
-        pw, ph = page.width, page.height
-    rotated = image.rotate(-degrees, expand=True) if degrees else image
-    new_size = (ph, pw) if degrees in (90, 270) else (pw, ph)
-    return _replace_page_content(main_fixture.pdf_path, page_index, tmp_path, out_name, rotated, new_size)
+    return build_rotated_page_copy(main_fixture.pdf_path, tmp_path, page_index, degrees, out_name)
 
 
 def _build_blank_copy(main_fixture, tmp_path, page_index: int, out_name: str):
@@ -95,7 +46,7 @@ def _build_blank_copy(main_fixture, tmp_path, page_index: int, out_name: str):
         pw, ph = page.width, page.height
         px_w, px_h = page.to_image(resolution=150).original.size
     blank = Image.new("RGB", (px_w, px_h), "white")
-    return _replace_page_content(main_fixture.pdf_path, page_index, tmp_path, out_name, blank, (pw, ph))
+    return replace_page_content(main_fixture.pdf_path, page_index, tmp_path, out_name, blank, (pw, ph))
 
 
 @pytest.mark.parametrize("degrees", [90, 180, 270])

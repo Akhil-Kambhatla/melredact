@@ -18,7 +18,15 @@ from melredact.pipeline import (
 )
 from melredact.roster import load_roster
 from melredact.segment import segment_pdf
-from tests.make_fixture import PACKETS, ROSTER, PacketSpec, _build_packets_pdf, build_footer_edge_case_fixture, build_main_fixture
+from tests.make_fixture import (
+    PACKETS,
+    ROSTER,
+    PacketSpec,
+    _build_packets_pdf,
+    build_footer_edge_case_fixture,
+    build_main_fixture,
+    build_rotated_page_copy,
+)
 
 DPI = RENDER_DPI_PREVIEW
 
@@ -655,6 +663,40 @@ def test_undetected_header_border_holds_back_only_that_packet_not_the_whole_run(
     assert not good_result.held_back
     assert good_result.out_path is not None
     assert good_result.out_path.exists()
+
+
+def test_180_degree_rotated_header_page_redacts_correctly_end_to_end(main_fixture, roster, tmp_path):
+    """Regression for the real incident this session audited: two real
+    pages in data/PRT/010406_PD1_PRT.pdf are rotated a clean 180 degrees
+    by a duplex-scanner flip (see CLAUDE.md's page-orientation section).
+    Before orientation normalization existed, detect_header_band/
+    locate_header_anchors assumed an upright page and would cover the
+    wrong region on a rotated one. tests/test_orientation.py already
+    proves normalize_pdf + redact_packet handle this correctly in
+    isolation; this proves it through the actual production path
+    (segment_pdf -> run_dispositions), the same path a real run uses,
+    with no monkeypatching."""
+    rotated_path = build_rotated_page_copy(main_fixture.pdf_path, tmp_path, 0, 180, "rotated_180_pipeline.pdf")
+
+    seg = segment_pdf(rotated_path)
+    header_packet = seg.packets[0]
+    assert header_packet.header_page_index == 0
+    assert not any("page 0: orientation" in issue for issue in header_packet.issues)
+
+    tag = packet_tag(rotated_path, header_packet)
+    sid = _sid_for(roster, "Jordan Ames")
+
+    out_dir = tmp_path / "out"
+    results = run_dispositions(rotated_path, seg, {tag: sid}, roster, out_dir=out_dir, dpi=DPI)
+    result = next(r for r in results if r.packet_tag == tag)
+
+    assert not result.held_back, result.reason
+    assert result.out_path is not None
+    assert result.out_path.exists()
+
+    from melredact.redact import verify_no_leaked_names
+
+    assert verify_no_leaked_names(result.out_path, roster) == []
 
 
 def test_detection_override_releases_the_hold_and_writes_the_packet(

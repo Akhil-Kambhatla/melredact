@@ -3121,6 +3121,139 @@ rect round-trip at three DPIs; `scaleX`/`scaleY` folding on a resized
 object; a box drawn at the editor's own preview DPI redacts correctly
 under the real, different, final-output DPI.
 
+## The 010406 October 2025 round audit, first real write for this teacher, and a pinned canvas fork (2026-08-14)
+
+**Audit requested against a premise that turned out to be false, checked
+directly rather than assumed: no October 2025 (or any) output had ever
+actually been written for teacher 010406 before this session.**
+`out/010406/`, `out/.ledger/010406_PD1_PRT.json`, and
+`out/.manual_queue/` for this pdf all did not exist — confirmed by
+listing them directly, not inferred. `decisions/010406_PD1_PRT.json` did
+exist (3 entries — `010406_PD1_PRT_p078`/`_p080`/`_p082`, the three clean
+auto-assigns from the earlier round-scoped-claiming pilot preview,
+timestamped the same day) but had never actually been run through
+`run_dispositions` — no corresponding ledger entry or output file existed
+for any of the three. This matches this file's own most recent entry
+verbatim (the page-orientation section's shipped-output audit: "nothing
+has been written for 010406 yet, confirmed via both the ledger and `out/`
+itself") — the premise this session started from was simply stale.
+
+**Both 180-degree-rotated real pages fall in the October 2025 round, but
+neither was ever going to ship regardless of rotation.** Computed
+directly against the real, normalized `data/PRT/010406_PD1_PRT.pdf`
+(warm orientation cache): the two rotated pages are 0-indexed 84 and 85
+(physical pages 85-86), and the round report places both inside the
+2025-10 group (pages 79-92). Packet `010406_PD1_PRT_p084` is the already-
+documented orphan (no header page, footer declares "2 of 2" but only 1
+page present); `010406_PD1_PRT_p085` is the header page the orientation
+fix newly recovered (see the page-orientation section above) but still
+carries its own unresolved "packet has 1 page(s) but footer declared 2"
+issue. Both hold on unresolved `segment.py` issues independent of
+rotation — `run_dispositions` refuses a packet with unresolved issues
+even with a decision naming a SID (see "Packet identity and the decisions
+store") — so rotation was never actually a live leak risk for this
+specific round's real data; it mattered for the *general* case (see the
+page-orientation section above) and for keeping the audit honest, not
+because these two exact pages were one fix away from shipping.
+
+**Given the true state (nothing shipped yet) and human confirmation to
+proceed, this session ran the October round for real, for the first
+time, through the now-fixed orientation stage:**
+`python -m melredact.cli run --pdf data/PRT/010406_PD1_PRT.pdf --roster
+data/teacher_codes/010406.csv --round 2025-10 --no-delete`, using the 3
+already-persisted decisions and the warm OCR/orientation cache.
+`--no-delete` per this session's own explicit instruction, on top of the
+fact that a first-ever run has no prior output to delete regardless.
+Result: **2 written**
+(`out/010406/01/PRT/NA/2025-10/0104060110.pdf` — SID 0104060110, packet
+`_p080`; `out/010406/01/PRT/NA/2025-10/0104060101.pdf` — SID 0104060101,
+packet `_p082`), **1 held back** (`_p078`, SID 0104060114 — a genuine
+consensus-ink anomaly on page 2, non-overridable, correctly queued to the
+manual-redaction queue for a human to resolve, not a bug), **5 pending**
+(`_p084`, `_p085` — the two rotated/issue-holding pages above — plus
+`_p086`/`_p088`/`_p090`, never reviewed). 0 deleted, matching
+`--no-delete`.
+
+**Both written files verified clean two ways: `verify` (0104060101.pdf
+and 0104060110.pdf both `ok` against the real 010406 roster, and the
+whole `out/` tree passes 0 failed when each subtree is checked against
+its own teacher's roster — see the note below on a verify roster-scope
+false-positive found while doing this, not a real leak) and direct visual
+render of every page of both files.** Both header pages show a fully
+opaque redaction box with the `SID: <sid>` / `PD: 01` stamp and no
+residual name ink at any edge; both page-2s show only the worksheet's own
+printed text plus ordinary handwritten markup (circles, underlines) — no
+name visible. Rendered images were deleted immediately after inspection,
+per the no-real-scan-derived-images-left-on-disk posture already
+established elsewhere in this file.
+
+**Found, and worth recording so it isn't mistaken for a regression next
+time: running `cli.py verify` with the *wrong* teacher's roster produces
+a false-positive leak report, not a real one.** Running `verify --out out
+--roster data/teacher_codes/010406.csv` unscoped against the whole `out/`
+tree flagged 15 of the 20 already-shipped 020415 files for token `"sun"`
+matching SID `0104060216` (a 010406 roster surname, "Sun") — the word
+"sun" is common English-worksheet body text, and `verify`'s design (see
+"Packet identity and the decisions store" above) checks every file under
+`--out` against whichever single roster it's given, not each file's own
+teacher's roster; there is currently no per-teacher roster routing.
+Re-running with 020415's own roster file cleared all 15 (0 failed, 22
+checked). This is a real, pre-existing gap in `verify`'s multi-teacher
+scoping — worth a future fix (route each `out/<teacher>/...` subtree to
+its own `data/teacher_codes/<teacher>.csv` automatically) — but out of
+scope for this session's own task, and not a redaction problem: nothing
+about the 020415 files themselves changed or regressed.
+
+**Canvas dependency pinned exactly, not range-pinned, since it's a
+third-party fork, not the maintained upstream package.**
+`requirements.txt` now reads `streamlit-drawable-canvas-fix==0.9.8`
+(previously `>=0.9.8`) — the exact version this environment has installed
+and the version the drag-corner manual editor (see "A drag-corner editor
+for the manual-redaction queue" above) was built and tested against. Why
+a fork and not `streamlit-drawable-canvas` (the original, more widely
+known package on PyPI): the original's bundled frontend JS is a pre-2023
+build against an old `streamlit-component-lib` whose iframe handshake
+doesn't reliably complete against this project's Streamlit version (see
+"The manual-redaction editor's canvas... was two independent problems"
+under the page-orientation section above for the full diagnosis — draw/
+resize silently did nothing, no exception anywhere) — a frontend-bundle
+problem no Python-side shim can reach. `streamlit-drawable-canvas-fix`
+(https://github.com/AndreasBauerGit/streamlit-drawable-canvas-fix) is a
+maintained fork built specifically to track newer Streamlit releases,
+confirmed to ship an actually-different, rebuilt frontend bundle (diffed
+byte-for-byte against the original's own bundle, not just a re-hashed
+re-package). **A future environment rebuild must install this exact fork
+at this exact version — `pip install streamlit-drawable-canvas` (the
+unpinned or upstream package) will silently reintroduce the broken-canvas
+bug**, since both packages share the identical `streamlit_drawable_canvas`
+import path and neither raises an error; the failure mode is draw/resize
+doing nothing at all, easy to mistake for a code bug in `review_app.py`
+rather than a dependency substitution.
+
+**New end-to-end regression test: a packet with a 180-degree-rotated
+header page redacts correctly through the real production path, not just
+through a direct `redact_packet` call.**
+`tests/test_orientation.py`'s existing `test_rotated_header_page_is_
+normalized_upright_and_redacted_correctly` (parametrized 90/180/270)
+already proved `orientation.normalize_pdf` + `segment_pdf` +
+`redact_packet` work correctly called directly; it doesn't exercise
+`run_dispositions` itself. Added
+`test_180_degree_rotated_header_page_redacts_correctly_end_to_end`
+(`tests/test_pipeline.py`): builds a copy of the main fixture with page 0
+physically pre-rotated 180 degrees (real scanner-flip simulation, not a
+`/Rotate`-metadata-only mislabel), then drives it through the exact real
+path a production run uses — `segment_pdf` (which chains orientation
+normalization automatically via `pdfio.open_pdf`, with zero explicit
+`orientation.normalize_pdf` call in the test) into `run_dispositions`
+with a plain decision dict, no monkeypatching — and asserts the packet is
+not held back, the output file exists, and `verify_no_leaked_names` finds
+nothing in it. The rotation-fixture helpers (`replace_page_content`,
+`build_rotated_page_copy`) were factored out of `tests/test_orientation.py`
+(previously private, module-local functions) into `tests/make_fixture.py`
+as shared fixture infrastructure, since a second test module now needs
+the identical construction — `test_orientation.py`'s own tests are
+otherwise unchanged and still pass.
+
 ## Working preferences
 
 - Calibrate against real measured data, not assumptions — when a

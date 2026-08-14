@@ -34,6 +34,7 @@ import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import pdfplumber
 import pikepdf
 from pikepdf import Dictionary, Name
 from PIL import Image, ImageDraw, ImageFont
@@ -893,6 +894,56 @@ def build_small_consensus_group_fixture(out_dir: Path, *, n_packets: int = 3) ->
     it. The last packet still carries CONSENSUS_ANOMALY_BOX so a bug that
     ignored the group-size floor would be caught by a spurious hold."""
     return build_consensus_fixture(out_dir, n_packets=n_packets)
+
+
+def replace_page_content(pdf_path, page_index: int, tmp_path, out_name: str, image: Image.Image, page_size):
+    """Rebuild one page of `pdf_path` from a caller-supplied raster image
+    (and page size), copying every other page across unchanged (including
+    their own invisible OCR text layer) via pikepdf's own cross-document
+    page copy. The replaced page carries no text layer at all, same as a
+    real scan."""
+    pw, ph = page_size
+    with pikepdf.open(pdf_path) as src:
+        out_pdf = pikepdf.Pdf.new()
+        for idx, page in enumerate(src.pages):
+            if idx != page_index:
+                out_pdf.pages.append(page)
+                continue
+            new_page = out_pdf.add_blank_page(page_size=(pw, ph))
+            compressed = zlib.compress(image.tobytes())
+            im_obj = pikepdf.Stream(out_pdf, compressed)
+            im_obj.Type = Name.XObject
+            im_obj.Subtype = Name.Image
+            im_obj.Width = image.width
+            im_obj.Height = image.height
+            im_obj.ColorSpace = Name.DeviceRGB
+            im_obj.BitsPerComponent = 8
+            im_obj.Filter = Name.FlateDecode
+            new_page.Resources = out_pdf.make_indirect(
+                Dictionary(XObject=Dictionary(Im0=out_pdf.make_indirect(im_obj)))
+            )
+            new_page.Contents = out_pdf.make_indirect(
+                pikepdf.Stream(out_pdf, f"q {pw} 0 0 {ph} 0 0 cm /Im0 Do Q".encode())
+            )
+        out_path = tmp_path / out_name
+        out_pdf.save(out_path)
+    return out_path
+
+
+def build_rotated_page_copy(pdf_path, tmp_path, page_index: int, degrees: int, out_name: str):
+    """A copy of `pdf_path` with `page_index`'s own embedded content
+    physically pre-rotated by `degrees` (simulating a real scanner flip,
+    not a /Rotate-metadata-only mislabel) -- the sign convention (`-degrees`
+    to simulate a page that needs `degrees` of correction) is the same one
+    validated by hand against the real orientation classifier before
+    orientation.py was written (see CLAUDE.md's page-orientation section)."""
+    with pdfplumber.open(pdf_path) as pdf:
+        page = pdf.pages[page_index]
+        image = page.to_image(resolution=150).original.convert("RGB")
+        pw, ph = page.width, page.height
+    rotated = image.rotate(-degrees, expand=True) if degrees else image
+    new_size = (ph, pw) if degrees in (90, 270) else (pw, ph)
+    return replace_page_content(pdf_path, page_index, tmp_path, out_name, rotated, new_size)
 
 
 if __name__ == "__main__":
