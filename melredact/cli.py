@@ -95,6 +95,7 @@ from melredact.blocks import (
     round_labels_by_tag,
     save_resolved_block_record,
 )
+from melredact.consensus import analyze_consensus_anomalies, format_consensus_report
 from melredact.pipeline import (
     analyze_redaction_holds,
     decisions_path,
@@ -168,6 +169,16 @@ def _cmd_run(args: argparse.Namespace) -> int:
             return 1
         run_segmented = filter_packets_by_round(pdf_path, segmented, round_labels, args.round)
         print(f"  restricting to round {args.round!r}: {len(run_segmented.packets)} of {len(segmented.packets)} packet(s)")
+
+    # Computed once here (same "whole file, up front" posture as round
+    # grouping above), never re-derived inside run_dispositions below --
+    # see pipeline.run_dispositions's `consensus_holds` parameter and
+    # consensus.py's own module docstring for the cost this pass carries
+    # (a full-group rasterize + ECC alignment pass, disk-cached, but still
+    # worth computing once, not twice).
+    consensus_analysis = analyze_consensus_anomalies(pdf_path, segmented)
+    print()
+    print(format_consensus_report(consensus_analysis))
 
     metadata = load_block_metadata(roster_path)
     resolved_block = None
@@ -292,6 +303,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         round_labels=round_labels,
         allow_delete=not args.no_delete,
         manual_geometry=manual_geometry,
+        consensus_holds=consensus_analysis.holds,
     )
 
     written = [r for r in results if r.out_path is not None]
@@ -349,12 +361,16 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
+    consensus_analysis = analyze_consensus_anomalies(pdf_path, segmented)
+    print()
+    print(format_consensus_report(consensus_analysis))
+
     print(
         "\nDrafting a redaction attempt for every header packet to check hold reasons -- nothing "
         "is written to out/, redacted output is discarded immediately after inspection, and "
         "nothing is deleted.\n"
     )
-    results = analyze_redaction_holds(pdf_path, segmented, roster, round_labels)
+    results = analyze_redaction_holds(pdf_path, segmented, roster, round_labels, consensus_analysis.holds)
     print(format_hold_analysis_report(results))
     return 0
 

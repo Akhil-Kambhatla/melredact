@@ -596,6 +596,136 @@ def build_footer_edge_case_fixture(out_dir: Path) -> Path:
     return pdf_path
 
 
+# --- Consensus-ink fixture: a group of packets sharing one page-2 template ---
+#
+# melredact.consensus needs a real *group* of packets (>= CONSENSUS_MIN_
+# GROUP_SIZE) rendering near-identical page-2 rasters to vote a consensus
+# over -- the other fixtures above never repeat a page-2 layout across
+# packets, so they can't exercise this check at all. Ink here is drawn as
+# solid filled rectangles rather than rendered text specifically so the
+# resulting block-density pattern is deterministic and doesn't depend on
+# font rasterization varying across environments.
+
+CONSENSUS_WORKSHEET_TYPE = "PRT (01/2024)"
+# Both boxes are comfortably larger than CONSENSUS_MIN_CONNECTED_BLOCKS
+# (3) blocks at CONSENSUS_BLOCK_PX=16px/CONSENSUS_DPI=200 (5.76pt/block):
+# 30x20pt is ~5.2 blocks wide, ~3.5 tall.
+CONSENSUS_ANSWER_BOX = (200.0, 150.0, 230.0, 170.0)
+CONSENSUS_ANOMALY_BOX = (400.0, 500.0, 430.0, 520.0)
+
+
+def _consensus_page2_image(page_marker: str, rects: list[tuple[float, float, float, float]]) -> Image.Image:
+    w, h = int(_px(PAGE_WIDTH_PT)), int(_px(PAGE_HEIGHT_PT))
+    img = Image.new("RGB", (w, h), "white")
+    draw = ImageDraw.Draw(img)
+    for left, top, right, bottom in rects:
+        draw.rectangle([_px(left), _px(top), _px(right), _px(bottom)], fill=INK_COLOR)
+    _draw_footer(draw, CONSENSUS_WORKSHEET_TYPE, page_marker)
+    return img
+
+
+@dataclass
+class ConsensusFixtureResult:
+    pdf_path: Path
+    roster_path: Path
+    tags_in_order: list[str] = field(default_factory=list)
+    sid_by_tag: dict[str, str] = field(default_factory=dict)
+    answer_tags: list[str] = field(default_factory=list)  # share CONSENSUS_ANSWER_BOX, must never be held
+    anomaly_tag: str = ""  # alone carries CONSENSUS_ANOMALY_BOX, must always be held
+    clean_tags: list[str] = field(default_factory=list)  # no extra page-2 ink at all
+    anomaly_page_offset: int = 1
+
+
+def build_consensus_fixture(out_dir: Path, *, n_packets: int = 6) -> ConsensusFixtureResult:
+    """`n_packets` (default 6, comfortably >= CONSENSUS_MIN_GROUP_SIZE=5)
+    packets, identical worksheet_type, 2 pages each. Page 2 carries the
+    printed footer plus, for specific packets:
+
+    - the first 3 packets share CONSENSUS_ANSWER_BOX at the same position
+      -- simulating an ordinary field most of a small group filled in.
+      With n=6, CONSENSUS_ANOMALY_MAX_GROUP_FRACTION's ceiling is
+      max(1, int(0.10*6)) = 1, so a 3-packet cluster (occurrence_count=3)
+      clears it and must never be held.
+    - the *last* packet alone carries CONSENSUS_ANOMALY_BOX, at a position
+      no other packet has any ink at all -- occurrence_count=1 <= ceiling
+      of 1, must always be held.
+    - the remaining packets have no extra page-2 ink at all, and must
+      follow the ordinary, unaffected redaction path.
+
+    Directly measured against melredact.consensus.analyze_consensus_
+    anomalies before being checked in as a fixture, not just reasoned
+    about: with these exact boxes and n=6, exactly one packet (the last)
+    is held, with exactly one flagged region."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = out_dir / "consensus_fixture.pdf"
+    roster_path = out_dir / "consensus_roster.csv"
+    builder = PdfBuilder()
+
+    result = ConsensusFixtureResult(pdf_path=pdf_path, roster_path=roster_path)
+    roster_rows: list[tuple[str, str, str]] = []
+
+    for i in range(n_packets):
+        sid = _sid(i + 1)
+        first, last = f"Num{i}", f"Student{i}"
+        name_text = f"{first} {last}"
+        roster_rows.append((sid, last, first))
+
+        img1 = render_header_image(
+            name_text=name_text,
+            teacher_text="Hannel",
+            group_text="",
+            date_text="10/03/2025",
+            period_text="02",
+            worksheet_type=CONSENSUS_WORKSHEET_TYPE,
+            page_marker="Page 1 of 2",
+            shade_blank_rows=False,
+        )
+        items1 = [
+            InvisibleText("Name:", NAME_ANCHOR["x0"], NAME_ANCHOR["top"], 9),
+            InvisibleText(name_text, 150, NAME_ANCHOR["top"]),
+            InvisibleText(CONSENSUS_WORKSHEET_TYPE, FOOTER_WORKSHEET_TYPE["x0"], FOOTER_WORKSHEET_TYPE["top"], 9),
+            InvisibleText("Page 1 of 2", FOOTER_PAGE_MARKER["x0"], FOOTER_PAGE_MARKER["top"], 9),
+        ]
+        builder.add_page(img1, items1)
+
+        rects: list[tuple[float, float, float, float]] = []
+        is_answer = i < 3
+        is_anomaly = i == n_packets - 1
+        if is_answer:
+            rects.append(CONSENSUS_ANSWER_BOX)
+        if is_anomaly:
+            rects.append(CONSENSUS_ANOMALY_BOX)
+        img2 = _consensus_page2_image("Page 2 of 2", rects)
+        items2 = [
+            InvisibleText(CONSENSUS_WORKSHEET_TYPE, FOOTER_WORKSHEET_TYPE["x0"], FOOTER_WORKSHEET_TYPE["top"], 9),
+            InvisibleText("Page 2 of 2", FOOTER_PAGE_MARKER["x0"], FOOTER_PAGE_MARKER["top"], 9),
+        ]
+        builder.add_page(img2, items2)
+
+        tag = f"consensus_fixture_p{2 * i:03d}"
+        result.tags_in_order.append(tag)
+        result.sid_by_tag[tag] = sid
+        if is_answer:
+            result.answer_tags.append(tag)
+        if is_anomaly:
+            result.anomaly_tag = tag
+        if not is_answer and not is_anomaly:
+            result.clean_tags.append(tag)
+
+    builder.save(pdf_path)
+    _write_roster_csv(roster_path, roster_rows)
+    return result
+
+
+def build_small_consensus_group_fixture(out_dir: Path, *, n_packets: int = 3) -> ConsensusFixtureResult:
+    """Same shape as build_consensus_fixture but with fewer packets than
+    CONSENSUS_MIN_GROUP_SIZE (default 3 < 5) -- the check must hold nothing
+    at all for this group and report it as skipped, not silently ignore
+    it. The last packet still carries CONSENSUS_ANOMALY_BOX so a bug that
+    ignored the group-size floor would be caught by a spurious hold."""
+    return build_consensus_fixture(out_dir, n_packets=n_packets)
+
+
 if __name__ == "__main__":
     out = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/tmp/melredact_fixture")
     main = build_main_fixture(out)

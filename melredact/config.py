@@ -328,3 +328,66 @@ CACHE_DIR = ".cache/melredact"
 # clears Period's real ink with room on one side and the overflow ink
 # with room on the other, instead of sitting right on either edge.
 GROUP_ROW_SPLIT_OFFSET_PT = 2
+
+# --- Consensus-ink detection (template-agnostic handwriting finder) ---
+# See melredact/consensus.py's module docstring for the full two-pass
+# method (per-block density-vs-median, then group occurrence-frequency) and
+# CLAUDE.md's "A leak class verify_no_leaked_names cannot catch" section for
+# the real find this was built for: two page-2 freehand names in
+# data/PRT/010406_PD1_PRT.pdf (010406_PD1_PRT_p026 "Brian Lu",
+# 010406_PD1_PRT_p034 "Ollie Maduro") that redaction never reaches (only the
+# header page is redacted) and that verify_no_leaked_names cannot flag
+# either -- Maduro is not on the roster at all, so there is no roster token
+# for a text-based check to match against.
+#
+# DPI/block/density/connected-block values are unchanged from the original
+# diagnostic script's own real-data validation (positive control: 104/104
+# real header pages correctly flagged known-present handwriting; see
+# scripts/diagnose_consensus_ink.py's module docstring for the full
+# before/after at BLOCK_PX 24 vs 16).
+CONSENSUS_DPI = 200
+CONSENSUS_BLOCK_PX = 16
+CONSENSUS_DENSITY_DIFF_THRESHOLD = 0.15
+CONSENSUS_MIN_CONNECTED_BLOCKS = 3
+CONSENSUS_ECC_DOWNSCALE = 0.25
+CONSENSUS_ECC_ITERS = 200
+CONSENSUS_ECC_EPS = 1e-8
+
+# A (worksheet_type, page_offset) group needs at least this many
+# successfully-aligned packets before a per-block median -- and therefore
+# the occurrence-frequency vote below -- is trustworthy at all. Below this,
+# the check holds nothing and says so explicitly in the run report, rather
+# than voting on a sample too small to mean anything. Unchanged from the
+# original diagnostic script's own calibration: "the practical floor given
+# the real 020415 shipped-output re-check only has 5-11 files per group."
+CONSENSUS_MIN_GROUP_SIZE = 5
+
+# Second pass: how many packets in a group may share a given ink position
+# before that position is treated as an ordinary answer/response field
+# rather than anomalous, identifying-risk ink -- see consensus.py's
+# classify-by-frequency step. Picked from real data, not assumed: mining
+# the validated diagnostic run's own output
+# (out/.diagnostics/consensus_ink/report.json) for data/PRT/
+# 010406_PD1_PRT.pdf's page-2 group (46 packets -- the real file this
+# feature is built for) by clustering every packet's flagged region by bbox
+# overlap and counting distinct packets per cluster, the real occurrence
+# fractions split into two clearly separated bands with an empty gap
+# between them: 22 of 27 clusters at 1-2 packets (4.3%-8.7% of the group)
+# -- including both real leaks, 010406_PD1_PRT_p026 and _p034, each a
+# singleton at 2.2% -- and the remaining 5 clusters at 32.6% or higher (one
+# genuine shared answer-digit field reaching 100%, every packet). Nothing
+# in the real data falls between 8.7% and 32.6%. 0.10 sits in that empty
+# gap with headroom on both sides: comfortably above the real leaks' own
+# 2.2% and the largest coincidental same-position overlap (4.3%),
+# comfortably below the lowest real shared-field cluster (32.6%).
+#
+# Not every real group shows as clean a gap -- the two Hannel files' own
+# page-2 groups (body/answer-prose pages, not the digit-style answer field
+# 010406's group has) show a smoother spread of low-frequency clusters
+# instead of a bimodal split (see CLAUDE.md's real re-run results). This
+# threshold is calibrated against the file the actual leaks were found in,
+# not against every file's own distribution -- a smoother spread elsewhere
+# means more manual-queue holds on those files' body content, an accepted
+# cost under the same "a held-back false positive is cheap, a shipped leak
+# is not" trade-off bug #7 already established (see CLAUDE.md).
+CONSENSUS_ANOMALY_MAX_GROUP_FRACTION = 0.10

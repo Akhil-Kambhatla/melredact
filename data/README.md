@@ -25,3 +25,13 @@ this directory. That cache contains identifiable scanned worksheets. It is
 gitignored, but git is not the only way data leaks: do not point Dropbox,
 iCloud, a shared drive, or any other sync tool at the repo root or at that
 cache directory. Treat it the same as `data/` itself.
+
+`melredact/consensus.py` (the template-agnostic handwriting detector --
+see CLAUDE.md) adds its own cache under `.cache/melredact/consensus/`,
+keyed the same way the OCR cache above is (source file content hash, page,
+dpi), plus the group's reference page and block size. Each cached file is
+a per-page ink-density grid derived directly from a real rasterized scan --
+not the raster image itself, but still identifiable in the same sense the
+OCR word cache is, since it's positional handwriting-ink data. Already
+covered by the blanket `.cache/` gitignore rule; called out here explicitly
+so it isn't mistaken for a smaller, less-sensitive cache than it is.

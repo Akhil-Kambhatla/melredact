@@ -65,6 +65,14 @@ def _file_content_hash(path: str | Path) -> str:
     return result
 
 
+def file_content_hash(path: str | Path) -> str:
+    """Public wrapper around _file_content_hash -- melredact.consensus keys
+    its own disk cache (consensus masks) the same way this module keys OCR
+    words, off the source file's actual content, and shares this single
+    hashing implementation rather than duplicating it."""
+    return _file_content_hash(path)
+
+
 def _ocr_cache_path(pdf_path: str | Path, page_index: int, dpi: int, bbox: BBox) -> Path:
     # bbox is part of the key, not just file+page+dpi: segmentation's small
     # header/footer crops and redact_packet's full-page request are

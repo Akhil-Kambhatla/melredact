@@ -1356,3 +1356,176 @@ def test_round_label_does_not_alter_match_proposals(tmp_path):
     p0, p1 = proposals
     assert [(c.sid, c.score) for c in p0.candidates] == [(c.sid, c.score) for c in p1.candidates]
     assert [(c.full_name, c.score) for c in p0.held_candidates] == [(c.full_name, c.score) for c in p1.held_candidates]
+
+
+# --- Consensus-ink anomaly check integration (see melredact/consensus.py) ---
+
+
+@pytest.fixture(scope="module")
+def consensus_pipeline_fixture(tmp_path_factory):
+    from tests.make_fixture import build_consensus_fixture
+
+    return build_consensus_fixture(tmp_path_factory.mktemp("consensus_pipeline_fixture"))
+
+
+@pytest.fixture(scope="module")
+def consensus_pipeline_roster(consensus_pipeline_fixture):
+    return load_roster(consensus_pipeline_fixture.roster_path)
+
+
+@pytest.fixture(scope="module")
+def consensus_pipeline_segmented(consensus_pipeline_fixture):
+    return segment_pdf(consensus_pipeline_fixture.pdf_path)
+
+
+@pytest.fixture
+def consensus_pipeline_decisions(consensus_pipeline_fixture):
+    return dict(consensus_pipeline_fixture.sid_by_tag)
+
+
+def test_consensus_hold_is_held_back_end_to_end(
+    consensus_pipeline_fixture, consensus_pipeline_segmented, consensus_pipeline_roster, consensus_pipeline_decisions, tmp_path
+):
+    tag = consensus_pipeline_fixture.anomaly_tag
+    out_dir = tmp_path / "out"
+    results = run_dispositions(
+        consensus_pipeline_fixture.pdf_path,
+        consensus_pipeline_segmented,
+        consensus_pipeline_decisions,
+        consensus_pipeline_roster,
+        out_dir=out_dir,
+        dpi=DPI,
+    )
+    result = next(r for r in results if r.packet_tag == tag)
+    assert result.held_back
+    assert "consensus-ink anomaly" in result.reason
+    assert result.out_path is None
+
+
+def test_consensus_hold_is_not_releasable_via_detection_overrides(
+    consensus_pipeline_fixture, consensus_pipeline_segmented, consensus_pipeline_roster, consensus_pipeline_decisions, tmp_path
+):
+    """detection_overrides only ever releases the *detection-confidence*
+    hold (see pipeline.py's module docstring, "One of these five holds is
+    human-overridable"). A consensus-ink anomaly is a finding of real
+    anomalous ink, not a confidence gap -- putting this packet's own tag in
+    detection_overrides must have zero effect on it."""
+    tag = consensus_pipeline_fixture.anomaly_tag
+    out_dir = tmp_path / "out"
+    results = run_dispositions(
+        consensus_pipeline_fixture.pdf_path,
+        consensus_pipeline_segmented,
+        consensus_pipeline_decisions,
+        consensus_pipeline_roster,
+        out_dir=out_dir,
+        dpi=DPI,
+        detection_overrides={tag},
+    )
+    result = next(r for r in results if r.packet_tag == tag)
+    assert result.held_back
+    assert "consensus-ink anomaly" in result.reason
+    assert result.out_path is None
+
+
+def test_consensus_hold_is_queued_and_released_by_drawing_a_manual_region_over_the_flagged_ink(
+    consensus_pipeline_fixture, consensus_pipeline_segmented, consensus_pipeline_roster, consensus_pipeline_decisions, tmp_path
+):
+    """The actual, checked resolution path for this hold: a human draws a
+    region over the flagged ink in review_app.py's manual editor, which
+    calls release_from_manual_queue with that region as `extra_page_
+    regions` and the hold's own bbox as `flagged_regions_to_verify` -- only
+    a region that actually reaches the flagged ink releases the packet."""
+    from melredact.consensus import analyze_consensus_anomalies
+    from melredact.pipeline import list_manual_queue, release_from_manual_queue
+
+    tag = consensus_pipeline_fixture.anomaly_tag
+    sid = consensus_pipeline_fixture.sid_by_tag[tag]
+    out_dir = tmp_path / "out"
+    run_dispositions(
+        consensus_pipeline_fixture.pdf_path,
+        consensus_pipeline_segmented,
+        consensus_pipeline_decisions,
+        consensus_pipeline_roster,
+        out_dir=out_dir,
+        dpi=DPI,
+    )
+    queued = [e for e in list_manual_queue(out_dir) if e["packet_tag"] == tag]
+    assert len(queued) == 1
+    flagged_regions = queued[0]["flagged_regions"]
+    assert flagged_regions is not None
+    offset_key, bboxes = next(iter(flagged_regions.items()))
+    assert int(offset_key) == 1
+    flagged_bbox = tuple(bboxes[0])
+
+    packet = next(p for p in consensus_pipeline_segmented.packets if packet_tag(consensus_pipeline_fixture.pdf_path, p) == tag)
+    release = release_from_manual_queue(
+        consensus_pipeline_fixture.pdf_path,
+        packet,
+        tag,
+        sid,
+        consensus_pipeline_roster,
+        out_dir=out_dir,
+        dpi=DPI,
+        extra_page_regions={1: [flagged_bbox]},
+        flagged_regions_to_verify={1: [flagged_bbox]},
+    )
+    assert release.released, release.reason
+    assert release.out_path.exists()
+    assert list_manual_queue(out_dir) == []
+
+
+def test_consensus_hold_release_refused_when_drawn_region_misses_the_flagged_ink(
+    consensus_pipeline_fixture, consensus_pipeline_segmented, consensus_pipeline_roster, consensus_pipeline_decisions, tmp_path
+):
+    from melredact.pipeline import list_manual_queue, release_from_manual_queue
+
+    tag = consensus_pipeline_fixture.anomaly_tag
+    sid = consensus_pipeline_fixture.sid_by_tag[tag]
+    out_dir = tmp_path / "out"
+    run_dispositions(
+        consensus_pipeline_fixture.pdf_path,
+        consensus_pipeline_segmented,
+        consensus_pipeline_decisions,
+        consensus_pipeline_roster,
+        out_dir=out_dir,
+        dpi=DPI,
+    )
+    packet = next(p for p in consensus_pipeline_segmented.packets if packet_tag(consensus_pipeline_fixture.pdf_path, p) == tag)
+    wrong_region = (0.0, 0.0, 10.0, 10.0)  # nowhere near CONSENSUS_ANOMALY_BOX
+    release = release_from_manual_queue(
+        consensus_pipeline_fixture.pdf_path,
+        packet,
+        tag,
+        sid,
+        consensus_pipeline_roster,
+        out_dir=out_dir,
+        dpi=DPI,
+        extra_page_regions={1: [wrong_region]},
+        flagged_regions_to_verify={1: [(400.0, 500.0, 430.0, 520.0)]},
+    )
+    assert not release.released
+    assert "consensus-ink anomaly" in release.reason
+    assert len(list_manual_queue(out_dir)) == 1
+
+
+def test_packets_without_anomalous_ink_follow_the_unchanged_path(
+    consensus_pipeline_fixture, consensus_pipeline_segmented, consensus_pipeline_roster, consensus_pipeline_decisions, tmp_path
+):
+    """The shared-answer-ink packets and the plain clean packets must both
+    write normally -- the consensus-ink check must never hold a packet it
+    has no anomaly finding for."""
+    out_dir = tmp_path / "out"
+    results = run_dispositions(
+        consensus_pipeline_fixture.pdf_path,
+        consensus_pipeline_segmented,
+        consensus_pipeline_decisions,
+        consensus_pipeline_roster,
+        out_dir=out_dir,
+        dpi=DPI,
+    )
+    unaffected_tags = set(consensus_pipeline_fixture.answer_tags) | set(consensus_pipeline_fixture.clean_tags)
+    for tag in unaffected_tags:
+        result = next(r for r in results if r.packet_tag == tag)
+        assert not result.held_back, f"{tag} should not be held: {result.reason}"
+        assert result.out_path is not None
+        assert result.out_path.exists()

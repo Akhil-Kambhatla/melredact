@@ -171,6 +171,7 @@ from pathlib import Path
 
 from melredact.blocks import UNDATED_ROUND, collect_packet_rounds, round_labels_by_tag
 from melredact.config import RENDER_DPI_FINAL
+from melredact.consensus import AnomalyHold, analyze_consensus_anomalies
 from melredact.match import HeldCandidate, MatchProposal, propose
 from melredact.pdfio import open_pdf
 from melredact.redact import Bbox, HeaderBand, verify_no_leaked_names
@@ -374,6 +375,7 @@ def _queue_for_manual_redaction(
     worksheet_type: str,
     reason: str,
     drafted_path: Path,
+    flagged_regions: dict[int, list] | None = None,
 ) -> None:
     """Move (never copy) a held-back packet's already-drawn draft into the
     manual-redaction queue instead of just deleting it -- the backstop a
@@ -381,7 +383,15 @@ def _queue_for_manual_redaction(
     rather than starting over from nothing. Moved, not copied: the draft
     can be exactly as unsafe as the reason it was held back for (that's the
     whole reason it's here), so it must exist in at most one place on
-    disk, never both the queue and (however briefly) somewhere else."""
+    disk, never both the queue and (however briefly) somewhere else.
+
+    `flagged_regions` (packet page offset -> list of Bbox), when given, is
+    persisted into the queue entry's own metadata so review_app.py's manual
+    editor can seed the exact flagged region directly on the correct page --
+    see consensus.py's AnomalyHold, the only current caller that passes
+    this. Absent for the other two queueable hold reasons (undetected
+    header border, uncovered group-row ink), which already show a human
+    where to look via the header page's own seeded rectangles."""
     qdir = manual_queue_dir(out_dir, pdf_path)
     qdir.mkdir(parents=True, exist_ok=True)
     shutil.move(str(drafted_path), manual_queue_draft_path(out_dir, pdf_path, tag))
@@ -391,6 +401,11 @@ def _queue_for_manual_redaction(
         "worksheet_type": worksheet_type,
         "reason": reason,
         "pdf_path": str(pdf_path),
+        "flagged_regions": (
+            {str(offset): [list(b) for b in boxes] for offset, boxes in flagged_regions.items()}
+            if flagged_regions
+            else None
+        ),
     }
     manual_queue_meta_path(out_dir, pdf_path, tag).write_text(json.dumps(meta, indent=2))
 
@@ -410,6 +425,17 @@ def list_manual_queue(out_dir: str | Path) -> list[dict]:
 def _clear_manual_queue_entry(out_dir: str | Path, pdf_path: str | Path, tag: str) -> None:
     manual_queue_draft_path(out_dir, pdf_path, tag).unlink(missing_ok=True)
     manual_queue_meta_path(out_dir, pdf_path, tag).unlink(missing_ok=True)
+
+
+def _overlaps_bbox_pair(a: Bbox, b: Bbox) -> bool:
+    """bbox-vs-bbox overlap, the same test redact._overlaps_bbox applies to
+    a word against a redaction rectangle, generalized to two rectangles --
+    used to check a human-drawn region actually reaches a flagged
+    consensus-ink bbox (see release_from_manual_queue's
+    `flagged_regions_to_verify`)."""
+    al, at, ar, ab = a
+    bl, bt, br, bb = b
+    return not (ar <= bl or al >= br or ab <= bt or at >= bb)
 
 
 @dataclass
@@ -435,6 +461,7 @@ def release_from_manual_queue(
     round_label: str | None = None,
     header_bbox_override: tuple[Bbox, Bbox] | None = None,
     extra_page_regions: dict[int, list[Bbox]] | None = None,
+    flagged_regions_to_verify: dict[int, list[Bbox]] | None = None,
     decisions_dir: str | Path = DECISIONS_DIR,
 ) -> ManualReleaseResult:
     """The human side of the manual-redaction queue: re-redacts `packet`
@@ -477,6 +504,21 @@ def release_from_manual_queue(
     same packet_tag can reproduce this exact result without a human
     drawing the same boxes again (see run_dispositions' `manual_geometry`
     parameter).
+
+    `flagged_regions_to_verify` (packet page offset -> list[Bbox], see the
+    manual-queue entry's own `flagged_regions` metadata -- consensus.
+    AnomalyHold's bboxes, keyed the same way `extra_page_regions` is) is
+    the consensus-ink check's own re-verification: a packet queued for a
+    consensus-ink anomaly must have its human-drawn `extra_page_regions`
+    actually overlap every one of the flagged bboxes it was held for, same
+    overlap-based coverage test `redact.find_uncovered_group_words` already
+    uses for the Group row -- release refuses (packet stays queued, nothing
+    written) if any flagged region is left uncovered by what was drawn,
+    regardless of whether `find_uncovered_group_words`/
+    `verify_no_leaked_names` happen to pass. This is what makes "draw a
+    region over the flagged ink" the actual, checked resolution path for
+    this hold, not merely a plausible-looking one -- the automated checks
+    still have the final say, same as every other hold reason.
     """
     if sid not in roster:
         return ManualReleaseResult(packet_tag=tag, sid=sid, released=False, reason=f"sid {sid!r} not on roster")
@@ -507,6 +549,23 @@ def release_from_manual_queue(
             released=False,
             reason=f"still uncovered group-row ink with this geometry: {redact_result.uncovered_group_words}",
         )
+    if flagged_regions_to_verify:
+        drawn = extra_page_regions or {}
+        still_uncovered = [
+            (offset, bbox)
+            for offset_key, bboxes in flagged_regions_to_verify.items()
+            for offset in [int(offset_key)]
+            for bbox in bboxes
+            if not any(_overlaps_bbox_pair(bbox, drawn_bbox) for drawn_bbox in drawn.get(offset, []))
+        ]
+        if still_uncovered:
+            out_path.unlink()
+            return ManualReleaseResult(
+                packet_tag=tag,
+                sid=sid,
+                released=False,
+                reason=f"consensus-ink anomaly still not covered by a drawn region: {still_uncovered}",
+            )
     findings = verify_no_leaked_names(out_path, roster)
     if findings:
         out_path.unlink()
@@ -711,12 +770,13 @@ class HoldAnalysis:
     round_label: str
     detection_hold: bool = False
     uncovered_ink_hold: bool = False
+    consensus_hold: bool = False
     leak_hold: bool = False
     reason: str | None = None
 
     @property
     def clean(self) -> bool:
-        return not (self.detection_hold or self.uncovered_ink_hold or self.leak_hold)
+        return not (self.detection_hold or self.uncovered_ink_hold or self.consensus_hold or self.leak_hold)
 
 
 def analyze_redaction_holds(
@@ -724,19 +784,20 @@ def analyze_redaction_holds(
     segmented: SegmentResult,
     roster: Roster,
     round_labels: dict[str, str] | None = None,
+    consensus_holds: dict[str, list[AnomalyHold]] | None = None,
     *,
     dpi: int = RENDER_DPI_FINAL,
     flatten: bool = False,
 ) -> list[HoldAnalysis]:
     """Read-only redaction analysis: reports which of run_dispositions'
-    three unconditional per-packet checks (detection confidence, uncovered
-    group-row ink, verify_no_leaked_names) each packet would trigger, or
-    that it would pass cleanly, WITHOUT ever writing to out_dir, touching
-    decisions, the ledger, or the manual-redaction queue, or deleting
-    anything. Exists so a real, never-before-processed file (see CLAUDE.md's
-    bug #7 trade-off, and its own finding that the trade-off fires far more
-    broadly on real data than first measured) can be sized up before
-    committing to a real run.
+    four unconditional per-packet checks (detection confidence, uncovered
+    group-row ink, consensus-ink anomaly, verify_no_leaked_names) each
+    packet would trigger, or that it would pass cleanly, WITHOUT ever
+    writing to out_dir, touching decisions, the ledger, or the
+    manual-redaction queue, or deleting anything. Exists so a real,
+    never-before-processed file (see CLAUDE.md's bug #7 trade-off, and its
+    own finding that the trade-off fires far more broadly on real data than
+    first measured) can be sized up before committing to a real run.
 
     Each packet's own redaction is drafted to a scratch file inside a
     TemporaryDirectory removed the instant this function returns -- the
@@ -745,13 +806,20 @@ def analyze_redaction_holds(
     ran, without ever leaving a file sitting on disk anywhere.
 
     Mirrors run_dispositions' own hold precedence exactly -- detection
-    confidence checked first, then uncovered-ink, then a full
-    verify_no_leaked_names pass, each gating the next the same way
-    run_dispositions' `continue`s do -- rather than checking all three
-    independently, so a packet reported here as "held for detection
-    confidence" is the same packet a real run (absent a
+    confidence checked first, then uncovered-ink, then consensus-ink
+    anomaly, then a full verify_no_leaked_names pass, each gating the next
+    the same way run_dispositions' `continue`s do -- rather than checking
+    all four independently, so a packet reported here as "held for
+    detection confidence" is the same packet a real run (absent a
     detection_overrides entry for it) would actually hold for that reason,
     not a looser union of every check that happens to fire on it.
+
+    `consensus_holds` (see consensus.analyze_consensus_anomalies) is
+    computed once for the whole file, the same way `round_labels` already
+    is -- left as None, it's computed here from `segmented`; a caller
+    (cli.py's analyze command) that's already computed it for its own
+    report should pass it through rather than paying for the group
+    alignment pass twice.
 
     Orphan packets (no header page) have nothing to redact and are
     skipped -- a real run would refuse them via `packet.issues` before ever
@@ -763,6 +831,7 @@ def analyze_redaction_holds(
     """
     results: list[HoldAnalysis] = []
     labels = round_labels or {}
+    consensus = consensus_holds if consensus_holds is not None else analyze_consensus_anomalies(pdf_path, segmented).holds
     with tempfile.TemporaryDirectory() as scratch_dir:
         for packet in segmented.packets:
             if packet.header_page_index is None:
@@ -771,12 +840,16 @@ def analyze_redaction_holds(
             scratch_path = Path(scratch_dir) / f"{tag}.pdf"
             redact_result = _redact_packet(pdf_path, packet, scratch_path, dpi=dpi, flatten=flatten)
             analysis = HoldAnalysis(packet_tag=tag, round_label=labels.get(tag, UNDATED_ROUND))
+            tag_holds = consensus.get(tag, [])
             if redact_result.band is not None and not redact_result.band.detected:
                 analysis.detection_hold = True
                 analysis.reason = f"header border not confidently detected: {redact_result.band}"
             elif redact_result.uncovered_group_words:
                 analysis.uncovered_ink_hold = True
                 analysis.reason = f"uncovered group-row ink: {redact_result.uncovered_group_words}"
+            elif tag_holds:
+                analysis.consensus_hold = True
+                analysis.reason = "; ".join(h.reason for h in tag_holds)
             else:
                 findings = verify_no_leaked_names(scratch_path, roster)
                 if findings:
@@ -801,11 +874,13 @@ def format_hold_analysis_report(results: list[HoldAnalysis]) -> str:
         group = by_round[label]
         n_detection = sum(1 for r in group if r.detection_hold)
         n_ink = sum(1 for r in group if r.uncovered_ink_hold)
+        n_consensus = sum(1 for r in group if r.consensus_hold)
         n_leak = sum(1 for r in group if r.leak_hold)
         n_clean = sum(1 for r in group if r.clean)
         lines.append(
             f"  {label}: {len(group)} packet(s) -- {n_clean} clean, {n_detection} detection-confidence "
-            f"hold(s), {n_ink} uncovered-ink hold(s), {n_leak} leak hold(s)"
+            f"hold(s), {n_ink} uncovered-ink hold(s), {n_consensus} consensus-ink anomaly hold(s), "
+            f"{n_leak} leak hold(s)"
         )
     return "\n".join(lines)
 
@@ -872,6 +947,7 @@ def run_dispositions(
     round_labels: dict[str, str] | None = None,
     allow_delete: bool = True,
     manual_geometry: dict[str, dict] | None = None,
+    consensus_holds: dict[str, list[AnomalyHold]] | None = None,
 ) -> list[DispositionResult]:
     """Apply final per-packet decisions. See module docstring for the
     three-state `decisions` contract -- this is where "confirmed
@@ -941,6 +1017,27 @@ def run_dispositions(
     editor same as always. Left as None (the default), no packet in this
     run gets any geometry override beyond band_override/header_bbox_
     override/extra_page_regions this function never itself constructs.
+
+    `consensus_holds` (packet_tag -> list[consensus.AnomalyHold], see
+    consensus.analyze_consensus_anomalies) is a fourth unconditional check,
+    alongside detection confidence, uncovered group-row ink, and
+    verify_no_leaked_names: template-agnostic handwriting found on a
+    *non-header* page that only a few packets in the group share -- ink
+    redaction never reaches (it only ever touches the header page) and that
+    verify_no_leaked_names cannot catch if the name isn't on the roster at
+    all (see consensus.py's module docstring for the real find this closes:
+    a freehand page-2 name for a student, "Ollie Maduro", who was never on
+    the roster to begin with). Like uncovered_group_words, this is never
+    overridable via `detection_overrides` -- it's a finding of real
+    anomalous ink, not a confidence question about otherwise-sound
+    geometry -- and a held packet is queued to the manual-redaction queue,
+    not just deleted, since a human drawing a region over the flagged ink
+    is exactly what resolves it (see review_app.py's manual editor). Left
+    as None (the default), it's computed here from `segmented` via a fresh
+    consensus pass; a caller that's already computed it for its own report
+    (cli.py, review_app.py) should pass it through directly rather than
+    paying for the group alignment pass twice -- see CLAUDE.md's "cost"
+    measurement for why that pass is worth avoiding twice.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -950,6 +1047,8 @@ def run_dispositions(
     topic = topic_from_filename(pdf_path)
     if round_labels is None:
         round_labels = round_labels_by_tag(collect_packet_rounds(pdf_path, segmented=segmented))
+    if consensus_holds is None:
+        consensus_holds = analyze_consensus_anomalies(pdf_path, segmented).holds
 
     def _delete_stale_output(stale_path: Path, stale_sid: str) -> None:
         # Deliberately doesn't touch `ledger` -- callers own that, since
@@ -1079,6 +1178,24 @@ def run_dispositions(
             # the pixels, not a confidence question about the geometry.
             reason = f"uncovered group-row ink: {redact_result.uncovered_group_words}"
             _queue_for_manual_redaction(out_dir, pdf_path, tag, sid, packet.worksheet_type, reason, out_path)
+            results.append(DispositionResult(packet_tag=tag, sid=sid, pending=False, held_back=True, reason=reason))
+            continue
+        tag_consensus_holds = consensus_holds.get(tag, [])
+        if tag_consensus_holds:
+            # Template-agnostic handwriting on a non-header page that only
+            # a few packets in its group share -- see consensus.py's module
+            # docstring. Never overridable via detection_overrides, same
+            # reasoning as uncovered_group_words above: a finding of real
+            # anomalous ink, not a confidence gap. Queued, not just
+            # deleted, since a human drawing a region over the flagged ink
+            # is exactly what resolves it.
+            reason = "; ".join(h.reason for h in tag_consensus_holds)
+            flagged_by_offset: dict[int, list] = {}
+            for h in tag_consensus_holds:
+                flagged_by_offset.setdefault(h.page_offset, []).append(h.bbox_pt)
+            _queue_for_manual_redaction(
+                out_dir, pdf_path, tag, sid, packet.worksheet_type, reason, out_path, flagged_regions=flagged_by_offset
+            )
             results.append(DispositionResult(packet_tag=tag, sid=sid, pending=False, held_back=True, reason=reason))
             continue
         findings = verify_no_leaked_names(out_path, roster)

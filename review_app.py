@@ -75,6 +75,7 @@ from melredact.blocks import (
     save_resolved_block_record,
 )
 from melredact.config import CACHE_DIR, MIN_MARGIN, MIN_SCORE, RENDER_DPI_PREVIEW
+from melredact.consensus import ConsensusAnalysis, analyze_consensus_anomalies, format_consensus_report
 from melredact.match import assign_all
 from melredact.pdfio import open_pdf
 from melredact.pipeline import (
@@ -184,6 +185,17 @@ def _round_data(pdf_path: str) -> tuple[list, list[RoundGroup]]:
     return dates, groups
 
 
+@st.cache_data(show_spinner="Checking for template-agnostic handwriting anomalies (consensus-ink)...")
+def _consensus(pdf_path: str) -> ConsensusAnalysis:
+    """Cached the same way _round_data is: the expensive part (whole-group
+    rasterize + ECC alignment, see consensus.py) is itself disk-cached per
+    (file, page, reference page, dpi, block size), so a warm rerun is
+    cheap -- but there's no reason to repeat even the in-memory clustering
+    on every Streamlit rerun (a button click, Prev/Next) within one
+    session."""
+    return analyze_consensus_anomalies(pdf_path, _segment(pdf_path))
+
+
 @st.cache_data(show_spinner="Loading roster...")
 def _roster(roster_path: str, pdf_path: str, period: str | None) -> Roster:
     return load_roster(roster_path, period=period, infer_period_from=pdf_path)
@@ -277,6 +289,7 @@ def _render_sidebar(
     roster: Roster,
     resolved_block: BlockMeaning | None = None,
     round_labels: dict[str, str] | None = None,
+    consensus_holds: dict[str, list] | None = None,
 ) -> None:
     decisions = st.session_state.decisions
     n_pending = sum(1 for p in segmented.packets if packet_tag(args.pdf_path, p) not in decisions)
@@ -316,6 +329,7 @@ def _render_sidebar(
                 round_labels=round_labels,
                 allow_delete=not disable_deletion,
                 manual_geometry=fresh_manual_geometry,
+                consensus_holds=consensus_holds,
             )
             written = [r for r in results if r.out_path is not None]
             deleted = sum(1 for r in results if r.deleted_path is not None)
@@ -450,13 +464,21 @@ def _canvas_rect_to_bbox(obj: dict, dpi: int) -> Bbox:
     return (left / scale, top / scale, (left + width) / scale, (top + height) / scale)
 
 
-def _seed_manual_regions(args: argparse.Namespace, packet: Packet) -> dict[int, list[Bbox]]:
+def _seed_manual_regions(
+    args: argparse.Namespace, packet: Packet, flagged_regions: dict[str, list] | None = None
+) -> dict[int, list[Bbox]]:
     """Initial regions for a freshly-opened editor session: the header
     page's own automatically-detected two rectangles (see redact_bboxes_
     for_band), so a reviewer starts from what detection already proposed
     and only has to nudge it -- never from a blank page. Other pages start
-    with no regions; a reviewer adds them by hand (e.g. a PRT packet's
-    page 2 name)."""
+    with no regions, UNLESS this packet was queued for a consensus-ink
+    anomaly (see pipeline.AnomalyHold/`flagged_regions`, persisted on the
+    queue entry by `_queue_for_manual_redaction`) -- in that case the exact
+    flagged bbox is pre-seeded on its own page too, so a reviewer opening
+    the editor sees a box already sitting on the anomalous ink rather than
+    having to hunt across the packet's pages for it. `flagged_regions` uses
+    JSON string offset keys (see pipeline._serialize style), normalized to
+    int here."""
     regions: dict[int, list[Bbox]] = {}
     if packet.header_page_index is not None:
         header_offset = packet.page_indices.index(packet.header_page_index)
@@ -466,42 +488,63 @@ def _seed_manual_regions(args: argparse.Namespace, packet: Packet) -> dict[int, 
             raw_image, dpi=DPI, anchors=fields.anchors, row_height=header_row_height(fields.anchors)
         )
         regions[header_offset] = list(redact_bboxes_for_band(band, fields.anchors.group_top))
+    for offset_key, bboxes in (flagged_regions or {}).items():
+        offset = int(offset_key)
+        regions.setdefault(offset, [])
+        regions[offset] = regions[offset] + [tuple(b) for b in bboxes]
     return regions
 
 
-def _render_manual_editor(args: argparse.Namespace, roster: Roster, packet: Packet, tag: str, sid: str) -> None:
+def _render_manual_editor(
+    args: argparse.Namespace,
+    roster: Roster,
+    packet: Packet,
+    tag: str,
+    sid: str,
+    flagged_regions: dict[str, list] | None = None,
+) -> None:
     """One queued packet's editor: original page on the left, live redacted
     result on the right, both at DPI (see review_app.py's own DPI
     constant). A reviewer drags the corners of the seeded rectangles (see
     `_seed_manual_regions`) or draws new ones on any page of the packet --
     a header and a page-2 name are separate regions, so the page selector
-    defaults to page 1 but nothing stops a reviewer from switching to page
-    2 and adding a region there too.
+    defaults to page 1 (or the flagged consensus-ink page, when this hold
+    is a consensus-ink anomaly -- see below) but nothing stops a reviewer
+    from switching pages and adding a region there too.
 
     Applying goes through `pipeline.release_from_manual_queue`, which
-    re-runs the real redaction and both unconditional checks
-    (find_uncovered_group_words, verify_no_leaked_names) against exactly
-    this geometry -- a region that still leaves ink uncovered keeps the
-    packet held, the editor supplies geometry, it never bypasses either
-    check. A reviewer resolves the student by typing their NAME (see
+    re-runs the real redaction and every unconditional check
+    (find_uncovered_group_words, the consensus-ink coverage re-check when
+    `flagged_regions` is set, verify_no_leaked_names) against exactly this
+    geometry -- a region that still leaves ink uncovered keeps the packet
+    held, the editor supplies geometry, it never bypasses any check. A
+    reviewer resolves the student by typing their NAME (see
     `filter_roster_by_name`) -- there is no field anywhere in this editor
     that accepts a SID directly, since a mistyped digit would be a
     silently wrong assignment nothing downstream could catch."""
     regions_key = f"mq_regions_{tag}"
     if regions_key not in st.session_state:
-        st.session_state[regions_key] = _seed_manual_regions(args, packet)
+        st.session_state[regions_key] = _seed_manual_regions(args, packet, flagged_regions)
     regions: dict[int, list[Bbox]] = st.session_state[regions_key]
 
     header_offset = packet.page_indices.index(packet.header_page_index) if packet.header_page_index is not None else None
+    flagged_offsets = {int(k) for k in (flagged_regions or {})}
     page_options = list(range(packet.n_pages))
-    default_page = header_offset if header_offset is not None else 0
+    default_page = min(flagged_offsets) if flagged_offsets else (header_offset if header_offset is not None else 0)
     page_offset = st.selectbox(
         "Editing page",
         options=page_options,
-        format_func=lambda i: f"Page {i + 1} of {packet.n_pages}",
+        format_func=lambda i: f"Page {i + 1} of {packet.n_pages}" + (" (flagged ink here)" if i in flagged_offsets else ""),
         index=default_page,
         key=f"mq_pageselect_{tag}",
     )
+    if page_offset in flagged_offsets:
+        st.warning(
+            "This page has consensus-ink anomaly ink flagged (see the pre-drawn region below) -- "
+            "template-agnostic handwriting detection found ink here that only a few packets sharing "
+            "this worksheet page have, not printed content and not a common answer field. Confirm the "
+            "seeded region actually covers it (resize if needed) before applying."
+        )
 
     current_boxes = regions.get(page_offset, [])
     page_idx = packet.page_indices[page_offset]
@@ -605,6 +648,7 @@ def _render_manual_editor(args: argparse.Namespace, roster: Roster, packet: Pack
             decisions_dir=Path(args.decisions_dir),
             header_bbox_override=header_bbox_override,
             extra_page_regions=extra_page_regions or None,
+            flagged_regions_to_verify=flagged_regions,
         )
         if result.released:
             st.success(f"Released {tag} -> {result.out_path}")
@@ -615,15 +659,17 @@ def _render_manual_editor(args: argparse.Namespace, roster: Roster, packet: Pack
 
 
 def _render_manual_queue(args: argparse.Namespace, roster: Roster, packet_by_tag: dict[str, Packet]) -> None:
-    """The backstop for a genuine detection-confidence or coverage-check
-    miss (see CLAUDE.md's "the manual-redaction queue is a backstop"
-    section) -- never a substitute for the automated checks catching it in
-    the first place. Each queued entry shows the drafted (not-safe-to-ship)
-    attempt exactly as it was held back, then opens `_render_manual_editor`
-    for drawing a corrected region directly -- applying always goes through
-    `release_from_manual_queue`'s own re-check of both automated checks
-    (uncovered_group_words, verify_no_leaked_names); a wrong correction
-    stays queued, nothing is written."""
+    """The backstop for a genuine detection-confidence, uncovered-ink, or
+    consensus-ink-anomaly miss (see CLAUDE.md's "the manual-redaction queue
+    is a backstop" section) -- never a substitute for the automated checks
+    catching it in the first place. Each queued entry shows the drafted
+    (not-safe-to-ship) attempt exactly as it was held back, then opens
+    `_render_manual_editor` for drawing a corrected region directly --
+    applying always goes through `release_from_manual_queue`'s own re-check
+    of every automated check (uncovered_group_words, the consensus-ink
+    coverage re-check when this entry carries `flagged_regions`,
+    verify_no_leaked_names); a wrong correction stays queued, nothing is
+    written."""
     entries = [e for e in list_manual_queue(args.out_dir) if e["pdf_path"] == str(Path(args.pdf_path))]
     if not entries:
         st.info("Manual redaction queue is empty for this scan.")
@@ -645,7 +691,7 @@ def _render_manual_queue(args: argparse.Namespace, roster: Roster, packet_by_tag
                     draft_image = pdf.pages[0].to_image(resolution=DPI).original.convert("RGB")
                 st.image(draft_image, caption="Drafted redaction attempt that was held back -- not safe to ship as is")
 
-            _render_manual_editor(args, roster, packet, tag, sid)
+            _render_manual_editor(args, roster, packet, tag, sid, flagged_regions=entry.get("flagged_regions"))
 
 
 def _render_packet(
@@ -921,6 +967,16 @@ def main() -> None:
     st.header("Round grouping")
     st.code(format_round_report(round_groups), language=None)
 
+    # Consensus-ink anomaly check (see melredact/consensus.py): a
+    # template-agnostic handwriting finder that only ever looks at
+    # non-header pages, since the header page is already unconditionally
+    # redacted regardless of any match. Shown here purely so a reviewer
+    # sees what the check found before it gates "Run redaction pipeline"
+    # below the same way held_back already does for the other checks.
+    consensus_analysis = _consensus(args.pdf_path)
+    with st.expander("Consensus-ink anomaly check", expanded=bool(consensus_analysis.holds)):
+        st.code(format_consensus_report(consensus_analysis), language=None)
+
     # --round restricts this whole session to one collection session inside
     # a larger concatenated scan (see pipeline.filter_packets_by_round).
     # Round grouping itself is always computed over the whole file above --
@@ -962,7 +1018,7 @@ def main() -> None:
     proposals_by_tag = {p.packet_tag: p for p in proposals}
 
     _init_state(args.pdf_path, args.decisions_dir)
-    _render_sidebar(args, segmented, roster, resolved_block, round_labels)
+    _render_sidebar(args, segmented, roster, resolved_block, round_labels, consensus_analysis.holds)
 
     tags = [packet_tag(args.pdf_path, p) for p in segmented.packets]
     packet_by_tag = dict(zip(tags, segmented.packets))

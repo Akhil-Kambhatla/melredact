@@ -2250,6 +2250,220 @@ that test seeds `st.session_state`'s region dict the same way a reviewer's
 drag would have populated it before the first run, then drives the real
 name-resolution and Apply widgets exactly as a human would click them.
 
+## A leak class verify_no_leaked_names cannot catch: freehand ink on a page redaction never reaches (2026-08-14)
+
+**`redact_packet` only ever redacts the header page.** Every other check in
+this pipeline is built on top of that same assumption:
+`find_uncovered_group_words` only checks the header page's own Group row,
+and `verify_no_leaked_names` is a *text*-based safety net -- it can only
+flag a leak if the leaked name is both extractable as text (the kept OCR
+layer) and a token on the roster. A freehand name written in the blank
+margin of a *continuation* page defeats both halves at once: redaction
+never reaches that page at all (wrong page, structurally), and if the name
+belongs to a student who was never on the roster to begin with, there is
+no roster token for a text check to compare against -- `verify_no_leaked_
+names` would pass *vacuously* on a page that is visibly leaking a real
+name, the same "vacuous pass looks identical to a real one" problem
+`flatten=True` already creates for the text-layer check (see "Keep the OCR
+text layer" above), just from a different direction (no page to check, not
+no text to extract).
+
+**Found real, not hypothetical, by `scripts/diagnose_consensus_ink.py`
+(then a template-agnostic, position-agnostic diagnostic; now promoted --
+see below): two page-2 freehand names in `data/PRT/010406_PD1_PRT.pdf`.**
+`010406_PD1_PRT_p026` ("Brian Lu" -- a name that also happens to be on the
+roster, so a text check *could* have caught this one if it were ever run
+against page-2 content, which it structurally isn't). `010406_PD1_PRT_p034`
+is the sharper case: "Ollie Maduro" is not on the roster at all, so no
+text-based check, however thorough, has anything to compare it against --
+this packet would have shipped as clean under every check that existed
+before this session.
+
+## Promoted: a template-agnostic consensus-ink detector, as an unconditional pipeline check (2026-08-14)
+
+**The detection logic moved from `scripts/diagnose_consensus_ink.py` into
+`melredact/consensus.py`, a first-class module wired into `run_dispositions`
+as a fifth unconditional per-packet check** (alongside detection
+confidence, uncovered group-row ink, and `verify_no_leaked_names` -- see
+"A packet whose decision names a SID can still fail to redact safely"
+under "Packet identity and the decisions store" above). The script itself
+is kept as a thin, read-only caller around the module (same real three
+source files, same JSON report shape under
+`out/.diagnostics/consensus_ink/`) -- it no longer does its own detection,
+alignment, or classification. Every worksheet of a given type shares one
+printed template: ink recurring at the same position across a
+supermajority of packets is printed, ink that shows up on only one or a
+few packets at that position is either handwriting or a genuine per-copy
+mark. Full method (block-median voting, why per-pixel/optical-flow
+alternatives were tried and rejected) lives in `consensus.py`'s own module
+docstring, not duplicated here -- this section covers what changed to
+promote it into the real pipeline.
+
+**Two passes, not one -- the second pass is new this session, replacing a
+page-position heuristic.** Pass one (unchanged from the original
+diagnostic, kept exactly as validated: `CONSENSUS_BLOCK_PX=16`,
+`CONSENSUS_DENSITY_DIFF_THRESHOLD=0.15`, `CONSENSUS_MIN_CONNECTED_
+BLOCKS=3`) finds, per packet, which of *that packet's own* blocks exceed
+the group's per-block median ink density -- "ink that isn't part of the
+shared template." The original diagnostic then classified each such region
+by *where on the page* it fell ("top-margin, no printed content expected"
+vs. "body, likely answer ink"), a heuristic that already mislabelled part
+of `010406_PD1_PRT_p026`'s own name ink as harmless body content, because
+the handwriting's vertical extent straddled the diagnostic's own
+approximate margin/body boundary (see the original diagnostic's own
+"Note" in its module docstring, kept verbatim in `consensus.py`'s history).
+**Pass two (new) replaces that boundary entirely: instead of asking where
+on the page a region is, it asks how many *distinct packets in the group*
+have ink at that same position.** Every packet's flagged regions are
+clustered by bbox overlap across the whole group (`consensus.
+_cluster_and_count`); a cluster most of the group shares is an ordinary
+answer/response field (expected, harmless on its own); a cluster only one
+or a few packets have is anomalous. This is strictly more principled than
+the position heuristic it replaces -- position on the page was never
+actually the signal that mattered, frequency across the group is -- and it
+has no notion of "margin" or "body" to get wrong.
+
+**Threshold picked from real data, not assumed:
+`CONSENSUS_ANOMALY_MAX_GROUP_FRACTION = 0.10`** (config.py). Mined from
+the original diagnostic's own already-validated output
+(`out/.diagnostics/consensus_ink/report.json`) by clustering every
+packet's flagged region by bbox overlap and counting distinct packets per
+cluster, for `010406_PD1_PRT.pdf`'s real page-2 group (46 packets -- the
+file the two real leaks were found in): the real occurrence fractions
+split into two clearly separated bands with an *empty gap* between them --
+22 of 27 clusters at 1-2 packets (4.3%-8.7%, including both real leaks,
+each a singleton at 2.2%) and the remaining 5 at 32.6% or higher (one
+genuine shared answer-digit field reaching 100%, every packet). Nothing in
+the real data falls between 8.7% and 32.6%. 0.10 sits in that gap with
+headroom on both sides. The anomaly ceiling itself is `max(1,
+int(0.10 * group_size))` (`consensus._anomaly_ceiling`) -- `max(1, ...)`
+matters at the group floor (`CONSENSUS_MIN_GROUP_SIZE=5`, unchanged from
+the original diagnostic's own calibration): a bare fraction would round a
+singleton occurrence down to a ceiling of 0 at small group sizes, making
+the check unable to ever flag the exact case (a lone anomalous packet) it
+exists to catch.
+
+**Not every real group shows as clean a gap as the one this was calibrated
+against -- re-running against every real file this session surfaced that
+plainly, not just as a caveat.** Both real leaks (`010406_PD1_PRT_p026`,
+`_p034`) are correctly held on their real page-2 group. But the two Hannel
+files' own page-2 groups (free-response prose worksheets, not 010406's
+digit-style answer field) show a much smoother, unimodal spread of
+low-frequency clusters instead of a bimodal split -- real, individually
+varying handwritten prose naturally lands at slightly different block
+positions per student (response length, line wrapping), so a meaningful
+number of positions are genuinely shared by only 1-2 students out of the
+group by chance, not because they're identifying. Measured directly, cold
+cache, this session: **`Hannel MPR PD2.pdf`'s page-2 group holds 18 of 22
+packets (104 regions total); `Hannel PRT PD2.pdf`'s holds 10 of 20 (97
+regions); `010406_PD1_PRT.pdf`'s holds 12 of 46 (24 regions, including both
+real leaks).** Re-checking the real, already-shipped, already-`verify`-clean
+020415 output for the same leak class (16 files: 11 MPR, 5 PRT) found the
+same pattern: **10 of 11 shipped MPR files and 4 of 5 shipped PRT files
+would be held by this check on their page-2 content**, none of which are
+known real leaks -- this check is considerably more sensitive on
+free-response worksheets than on 010406's structured one, an accepted cost
+under the same "a held-back false positive is cheap via the manual queue,
+a shipped leak is not" trade-off bug #7 already established, not something
+this session tuned away. Clearing this for real 020415/010406 output is a
+real, sizeable review-time cost (dozens of manual-queue entries), not
+committed to happen automatically as part of this promotion -- same
+"verified, not automatically re-shipped" posture as every other real-data
+finding in this file.
+
+**The header page is structurally excluded from this check, not just
+observed to pass it.** `consensus._build_groups` never includes a
+packet's own `header_page_index` in any group -- confirmed directly this
+session: across all three real source files, every hold's `page_offset`
+is 1 (or higher), never 0. This isn't luck: the header page's Name/
+Teacher/Group ink is already destroyed unconditionally by `detect_header_
+band`'s own geometry, regardless of whether a match ever succeeds, and
+every packet's own handwritten name there is -- correctly -- always a
+singleton at whatever position it lands (no two students write the same
+name), which would make *every* header page flag under this check for a
+region the pipeline already fully covers by construction. Excluding it
+isn't a weakening; a check that would always fire for a reason already
+handled elsewhere carries no signal.
+
+**Never overridable via `detection_overrides`, matching the existing rule
+for real-finding holds.** `detection_overrides` releases exactly one hold
+reason -- the detection-*confidence* question `detect_header_band` raises
+(see "One of those five holds is human-overridable" above) -- and a
+consensus-ink anomaly is not that: it's a finding of real, anomalous ink
+in the pixels, the same category `find_uncovered_group_words` and
+`verify_no_leaked_names` already are. `run_dispositions`'s new check never
+consults `detection_overrides` at all.
+
+**Resolved by the manual-redaction queue, the same backstop-not-substitute
+posture as the other two queueable holds.** A consensus-ink hold queues
+the drafted attempt exactly like a detection-confidence or uncovered-ink
+hold (`pipeline._queue_for_manual_redaction`), with one addition: the
+flagged bbox itself is persisted into the queue entry's own metadata
+(`flagged_regions`), so `review_app.py`'s manual editor can seed a
+rectangle directly on the flagged ink -- on the *correct page* -- the
+instant a reviewer opens that packet, rather than a reviewer having to
+hunt across the packet's pages for what to cover (`_seed_manual_regions`,
+`_render_manual_editor`'s page selector defaulting to the flagged offset
+and its own warning banner). `pipeline.release_from_manual_queue` gained a
+`flagged_regions_to_verify` parameter: a release is refused (packet stays
+queued, nothing written) unless the human-drawn `extra_page_regions`
+actually overlaps every flagged bbox the packet was held for -- the same
+overlap-based coverage test `find_uncovered_group_words` already uses for
+the Group row, applied here to make "draw a region over the flagged ink"
+the actual, checked resolution path, not merely a plausible-looking one.
+
+**Cost, measured this session: a cold-cache run against all three real
+source files (`010406_PD1_PRT.pdf` 92 pages/46 packets, both Hannel
+files) took 31 seconds total** for the consensus pass alone (rasterize at
+`CONSENSUS_DPI=200` + ECC-align every non-header page against its group's
+reference, then block-density/cluster). This is a whole-group pass
+(computed once per `(worksheet_type, page_offset)` group, not once per
+packet), threaded through `run_dispositions`/`analyze_redaction_holds`/
+`cli.py`/`review_app.py` as a precomputed `consensus_holds` mapping (the
+same pattern `round_labels` already uses) so it's never paid twice in one
+run. **Disk-cached the same way `melredact/ocr.py` keys its own OCR
+cache** -- on the source file's actual content hash, not path/mtime, plus
+page index, ECC reference page, dpi, and block size
+(`consensus._consensus_cache_path`, sharing `ocr.file_content_hash` rather
+than duplicating the hashing logic) -- under `.cache/melredact/consensus/`,
+already covered by the blanket `.cache/` gitignore rule and called out
+explicitly in `data/README.md` (a per-page ink-density grid derived
+directly from a real scan is identifiable positional handwriting data, the
+same sense the OCR word cache already is, even though it isn't the raster
+image itself).
+
+**Rejected alternatives (unchanged from the original diagnostic, carried
+forward verbatim into `consensus.py`'s own module docstring, not
+re-litigated here):** a strict per-pixel "ink in most packets" vote after
+ECC alignment measured 0.29-0.44 Dice overlap even between correctly
+-aligned copies of the identical template (small, smoothly-varying local
+scan distortion, not a global transform error) and flagged 13-36% of a
+single control packet's own ink as false "non-consensus" at a coarse
+20px/7.2pt block. Dense optical flow refinement cut mean pixel error by
+~65% but produces huge (up to 300px) spurious displacements exactly where
+two copies' handwriting differs -- an alignment method that can warp real
+handwriting into agreement would silently erase the very thing this
+module exists to find, so it was rejected outright despite measuring
+better on raw pixel error. Neither was reconsidered as part of this
+promotion -- this session's own instruction was to keep the validated
+16px block grid and density-vs-median vote unchanged, only replacing the
+position-based classification step.
+
+**Tests** (`tests/test_consensus.py`, `tests/test_pipeline.py`, synthetic
+fixture only, `tests.make_fixture.build_consensus_fixture`/
+`build_small_consensus_group_fixture` -- a group of packets sharing one
+page-2 raster template, real filled-rectangle ink rather than rendered
+text so the block-density pattern is deterministic across environments):
+anomalous ink on page 2 is flagged with the page index in the reason;
+ink shared by enough of the group (a synthetic "answer field") is not
+flagged; a group below `CONSENSUS_MIN_GROUP_SIZE` holds nothing from this
+check and the report says so explicitly rather than silently passing;
+the hold is not releasable via `detection_overrides`; drawing a manual
+region over the flagged ink (and only over it -- a region that misses it
+stays refused) releases the packet through `release_from_manual_queue`;
+packets with no anomalous ink (both the shared-answer-ink ones and the
+plain ones) follow the ordinary, unaffected write path.
+
 ## Working preferences
 
 - Calibrate against real measured data, not assumptions — when a
