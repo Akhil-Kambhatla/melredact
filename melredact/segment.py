@@ -352,7 +352,23 @@ def segment_pdf(pdf_path: str | Path) -> SegmentResult:
     page always starts a new packet. A continuation-looking page with no
     open packet (missing page 1) becomes its own flagged, orphaned packet
     rather than being silently merged into whatever came before or dropped.
-    Nothing here infers a page count that isn't printed on the page."""
+    Nothing here infers a page count that isn't printed on the page.
+
+    `open_pdf` (see pdfio.py) already normalizes every confidently-
+    classifiable page to upright before this function ever sees it (see
+    melredact/orientation.py) -- is_header_page/read_footer below need no
+    rotation-awareness of their own. A page orientation couldn't be
+    confidently determined for, though, is left exactly as found (never a
+    guessed rotation) and is instead surfaced here as a packet `issues`
+    entry naming the page -- the same "abstain and flag" treatment an
+    unreadable footer already gets, not a new hold mechanism. Whichever
+    packet ends up containing that page (however segmentation reads its
+    now-possibly-garbled header/footer content) is held back by the
+    existing "packet with unresolved issues is refused" rule in
+    pipeline.run_dispositions -- no separate code path needed."""
+    from melredact.orientation import unresolved_page_indices
+
+    unresolved = set(unresolved_page_indices(pdf_path))
     with open_pdf(pdf_path) as pdf:
         pages_info = [(idx, is_header_page(page), read_footer(page)) for idx, page in enumerate(pdf.pages)]
 
@@ -441,4 +457,14 @@ def segment_pdf(pdf_path: str | Path) -> SegmentResult:
             )
 
     close_current()
+
+    if unresolved:
+        for packet in packets:
+            bad_pages = sorted(unresolved.intersection(packet.page_indices))
+            for idx in bad_pages:
+                packet.issues.append(
+                    f"page {idx}: orientation could not be confidently determined, held for human review "
+                    "rather than processed at a guessed rotation"
+                )
+
     return SegmentResult(packets=packets, page_count=len(pages_info))

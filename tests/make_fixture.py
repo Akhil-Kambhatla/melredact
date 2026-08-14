@@ -157,11 +157,43 @@ def render_header_image(
     return img
 
 
+_CONTINUATION_FILLER_LINES = [
+    "Please answer the following questions about the passage above.",
+    "1. What evidence supports the main claim in the passage?",
+    "2. Explain in your own words why this topic matters to you.",
+    "3. Circle the response that best matches your own view below.",
+]
+
+
 def render_continuation_image(*, worksheet_type: str, page_marker: str, body: str = "") -> Image.Image:
+    """Body-page background: `body` (or the "(continued)" default) is drawn
+    as the packet's own extractable content, invisible-text-layer-matched
+    (see _build_packets_pdf's InvisibleText(body, ...) callers -- this
+    string is what page.chars-based extraction returns, unaffected by
+    anything below). The filler lines under it exist purely to make this
+    page's *rendered raster* look like a real worksheet body page rather
+    than a near-blank one -- melredact.orientation's whole-page cardinal-
+    orientation classifier needs real visual content to judge confidently
+    (see config.py's ORIENTATION_MIN_SCORE docstring: a genuinely sparse
+    page scores ~0.26, the same range as a blank one), and every real
+    continuation page this project has ever measured (see CLAUDE.md's
+    rotation-audit section, 176 real pages) has substantially more on it
+    than a single short line -- the original bare "(continued)" placeholder
+    under-represented real body-page density, not orientation.py over-
+    reacting to it. Purely decorative: drawn as ordinary (non-invisible)
+    ink with no matching InvisibleText entry, so it is never picked up by
+    the fast page.chars extraction path every synthetic-fixture test
+    already relies on, and has no effect on any assertion about what a
+    packet's own body text says."""
     w, h = int(_px(PAGE_WIDTH_PT)), int(_px(PAGE_HEIGHT_PT))
     img = Image.new("RGB", (w, h), "white")
     draw = ImageDraw.Draw(img)
     draw.text((_px(45), _px(40)), body or "(continued)", fill=BORDER_COLOR, font=_font(10))
+    y = 70
+    for line in _CONTINUATION_FILLER_LINES:
+        draw.text((_px(45), _px(y)), line, fill=BORDER_COLOR, font=_font(9))
+        y += 22
+    draw.rectangle([_px(45), _px(y + 15), _px(566), _px(y + 90)], outline=BORDER_COLOR, width=max(1, int(_px(1.5))))
     _draw_footer(draw, worksheet_type, page_marker)
     return img
 
@@ -615,13 +647,42 @@ CONSENSUS_ANOMALY_BOX = (400.0, 500.0, 430.0, 520.0)
 
 
 def _consensus_page2_image(page_marker: str, rects: list[tuple[float, float, float, float]]) -> Image.Image:
+    """`rects` are this specific packet's own test ink -- deliberately kept
+    minimal and precisely positioned, since consensus.py's block-density
+    voting is calibrated against exact real coordinates (see every
+    CONSENSUS_*_BOX/ZONE constant's own docstring). Every consensus fixture
+    page also gets a fixed "printed template" band drawn identically
+    (content and position) below every real test box's own y-range but
+    above FOOTER_BAND_TOP -- see `_CONSENSUS_TEMPLATE_BAND_TOP` -- purely so
+    the rendered page has enough visual structure for melredact.
+    orientation's whole-page cardinal classifier to judge confidently (a
+    near-blank page scores ~0.26, the same range as a genuinely blank one --
+    see config.py's ORIENTATION_MIN_SCORE). Drawn identically across every
+    packet in a group, this becomes shared template ink under consensus.
+    py's own block-median voting (exactly like the footer text already is),
+    never a per-packet anomaly -- it does not change any held/not-held
+    expectation any existing test already calibrates against."""
     w, h = int(_px(PAGE_WIDTH_PT)), int(_px(PAGE_HEIGHT_PT))
     img = Image.new("RGB", (w, h), "white")
     draw = ImageDraw.Draw(img)
     for left, top, right, bottom in rects:
         draw.rectangle([_px(left), _px(top), _px(right), _px(bottom)], fill=INK_COLOR)
+    band_top = _CONSENSUS_TEMPLATE_BAND_TOP
+    draw.text((_px(45), _px(band_top)), "Please show your work for the response above.", fill=BORDER_COLOR, font=_font(9))
+    draw.text((_px(45), _px(band_top + 20)), "Explain your reasoning in the space provided below.", fill=BORDER_COLOR, font=_font(9))
+    draw.rectangle(
+        [_px(45), _px(band_top + 45), _px(566), _px(band_top + 90)], outline=BORDER_COLOR, width=max(1, int(_px(1.5)))
+    )
     _draw_footer(draw, CONSENSUS_WORKSHEET_TYPE, page_marker)
     return img
+
+
+# Below every real CONSENSUS_*_BOX/ZONE coordinate this file defines (max
+# y=520, CONSENSUS_ANOMALY_BOX), above FOOTER_BAND_TOP (700) -- a safe band
+# no test box ever occupies, so the template content here can never be
+# mistaken for (or interfere with the block-density math around) an actual
+# test region.
+_CONSENSUS_TEMPLATE_BAND_TOP = 600.0
 
 
 @dataclass

@@ -43,6 +43,19 @@ applies uniformly rather than needing to be remembered at each call site.
 affected-or-not check is one `pdfplumber.open` pass (the same cost the
 plain call already paid), and an unaffected file never touches `pikepdf`
 or the cache at all.
+
+**Chained with page-orientation normalization, 2026-08-14 (see
+`melredact/orientation.py`).** `open_pdf` resolves the xref/trailer repair
+first (this module's own job, unchanged), then hands that resolved path to
+`orientation.normalize_pdf` before ever calling `pdfplumber.open` on it --
+so every caller of `open_pdf` sees a file where every confidently-
+classifiable page is already upright, with no rotation-awareness of its
+own needed anywhere downstream. `resolved_source_path` is the public split
+of the repair step alone, used by `orientation.orientation_for` so a
+caller with only the *original* source path in scope (e.g.
+`segment.segment_pdf`, which never opens the file directly) can look up
+the identical, already-cached per-page orientation result `open_pdf`
+itself produced when it opened the same file.
 """
 
 from __future__ import annotations
@@ -81,6 +94,19 @@ def _repaired_copy(path: Path) -> Path:
     return out_path
 
 
+def resolved_source_path(path: str | Path) -> Path:
+    """The concrete file `open_pdf` would actually read from -- the
+    xref/trailer-repaired copy when `path` needs it, else `path` itself
+    unchanged. Public so `orientation.orientation_for` can look up the
+    same, already-cached per-page orientation result `open_pdf` produced
+    for this exact file, without a caller that only has the *original*
+    path (segment.segment_pdf) needing to re-derive the repair step."""
+    path = Path(path)
+    if _needs_repair(path):
+        return _repaired_copy(path)
+    return path
+
+
 def open_pdf(path: str | Path) -> pdfplumber.PDF:
     """Drop-in replacement for `pdfplumber.open(path)` everywhere this
     codebase opens a real, caller-supplied PDF -- see the module
@@ -88,9 +114,12 @@ def open_pdf(path: str | Path) -> pdfplumber.PDF:
     `pdfplumber.PDF` (a context manager, used the same way
     `pdfplumber.open(...)` already was at every call site this replaces),
     reading from a disk-cached, pikepdf-normalized copy only when the
-    original actually needs it.
+    original actually needs it -- and, as of 2026-08-14, also chained
+    through `orientation.normalize_pdf` so every page is upright before a
+    single downstream module ever sees it (see module docstring).
     """
-    path = Path(path)
-    if _needs_repair(path):
-        path = _repaired_copy(path)
-    return pdfplumber.open(path)
+    from melredact.orientation import normalize_pdf
+
+    resolved = resolved_source_path(path)
+    result = normalize_pdf(resolved)
+    return pdfplumber.open(result.normalized_path)

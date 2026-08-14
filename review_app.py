@@ -33,29 +33,31 @@ import time
 from pathlib import Path
 
 import streamlit as st
-import streamlit.elements.image as _st_image_module
 from PIL import Image, ImageDraw
 
-if not hasattr(_st_image_module, "image_to_url"):
-    # streamlit-drawable-canvas 0.9.3's own st_canvas() calls
-    # streamlit.elements.image.image_to_url(image, width, clamp, channels,
-    # output_format, image_id) -- a function this streamlit version moved
-    # to streamlit.elements.lib.image_utils and rewrote to take a
-    # LayoutConfig instead of a bare pixel width as its second argument.
-    # Shimmed here (module-level, before importing st_canvas) rather than
-    # patched in the installed package, the same "route around an upstream
-    # parser gap without touching our own data" posture pdfio.py's open_pdf
-    # already takes for a pdfplumber/pdfminer.six incompatibility -- see
-    # CLAUDE.md. Guarded on hasattr so this becomes a no-op the moment
-    # streamlit-drawable-canvas ships its own fix for a newer Streamlit.
-    from streamlit.elements.lib.image_utils import image_to_url as _image_to_url
-    from streamlit.elements.lib.layout_utils import LayoutConfig as _LayoutConfig
-
-    def _image_to_url_compat(image, width, clamp, channels, output_format, image_id):
-        return _image_to_url(image, _LayoutConfig(width=width), clamp, channels, output_format, image_id)
-
-    _st_image_module.image_to_url = _image_to_url_compat
-
+# streamlit-drawable-canvas 0.9.3 (the package originally wired in here) was
+# broken against this project's installed Streamlit (1.59) two ways at
+# once, not just the AttributeError a version-shim could route around: its
+# own st_canvas() called streamlit.elements.image.image_to_url(image,
+# width, ...) -- a function this Streamlit version moved and rewrote to
+# take a LayoutConfig instead of a bare pixel width -- AND its bundled
+# frontend JS (a pre-2023 build against an old streamlit-component-lib) no
+# longer completed the newer Streamlit's iframe component handshake
+# reliably enough for fabric.js's own mouse/drag event wiring to attach --
+# observed directly as "Draw a new box"/"Move / resize" doing nothing at
+# all, not a crash. The first half was patchable with a version shim (and
+# was, in an earlier session); the second is a frontend bundle problem a
+# Python-side shim cannot reach. Switched to `streamlit-drawable-canvas-
+# fix` (PyPI, same `streamlit_drawable_canvas` import path, a maintained
+# fork whose whole purpose is tracking newer Streamlit releases -- pinned
+# to `streamlit>=1.49.0` in its own metadata, bracketing this project's
+# 1.59) instead of hand-patching either problem here: it already imports
+# image_to_url/LayoutConfig from their current real locations, and ships
+# its own rebuilt frontend bundle (confirmed different from 0.9.3's, not
+# just re-packaged) that responds to draw/resize again. Same "route around
+# an upstream incompatibility rather than patch our own code around it"
+# posture pdfio.py's open_pdf already takes for a pdfplumber/pdfminer.six
+# gap -- see CLAUDE.md.
 from streamlit_drawable_canvas import st_canvas
 
 from melredact.blocks import (

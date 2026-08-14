@@ -586,7 +586,12 @@ class _PdfWriter:
         page.Contents = self.pdf.make_indirect(pikepdf.Stream(self.pdf, b"\n".join(parts) + b"\n"))
 
     def save(self, path: str | Path) -> None:
-        self.pdf.save(path)
+        # deterministic_id=True: pikepdf's default /ID is derived partly
+        # from non-content entropy, so two calls producing byte-identical
+        # pages could still disagree on /ID alone -- found via a flaky
+        # byte-comparison test (test_no_manual_geometry_follows_the_
+        # existing_automatic_path_unchanged), not assumed.
+        self.pdf.save(path, deterministic_id=True)
 
 
 @dataclass

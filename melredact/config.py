@@ -494,3 +494,39 @@ CONSENSUS_WRITING_ZONE_DILATION_PT: dict[str, float] = {}
 CONSENSUS_WRITING_ZONE_DILATION_DEFAULT_PT = 23.0
 CONSENSUS_WRITING_ZONE_MIN_SHARE: dict[str, int] = {}
 CONSENSUS_WRITING_ZONE_MIN_SHARE_DEFAULT = 2
+
+# --- Page orientation normalization ---
+# See melredact/orientation.py's module docstring for the full design.
+# Cheap on purpose: PaddleOCR's dedicated DocImgOrientationClassification
+# submodule (not the full detect+recognize pipeline) classifies a whole
+# page's cardinal orientation (0/90/180/270) in ~0.02s once loaded, so this
+# doesn't need a high-resolution render the way OCR word extraction does.
+ORIENTATION_DETECT_DPI = 100
+
+# Measured directly against 176 real pages across all three real source
+# files (Hannel MPR PD2.pdf, Hannel PRT PD2.pdf, 010406_PD1_PRT.pdf, see
+# CLAUDE.md's rotation-audit section): every real page with actual content
+# -- upright or genuinely rotated 90/180/270 -- classified at 0.91-0.93
+# confidence, regardless of correctness (the classifier's own score isn't a
+# fine-grained confidence gradient, it's closer to "did I see a real page"
+# at all). A blank/near-blank page scored 0.26. 0.6 sits with wide margin
+# below the real-content band and wide margin above the blank-page score,
+# so it separates "this page has real, classifiable content" from "this
+# page has nothing for the classifier to go on" (e.g. was already garbled
+# by an upstream problem, or is genuinely blank) -- exactly the case that
+# must hold for a human rather than guess.
+ORIENTATION_MIN_SCORE = 0.6
+
+# Ceiling past which a page's residual skew (after cardinal correction, or
+# on an already-upright page) is no longer trusted to the existing
+# corner-based border/anchor detection without a human looking at it.
+# Existing evidence, not a new assumption: test_redact.py's own
+# test_redaction_box_covers_name_ink_across_a_range_of_skews already proves
+# the redaction box covers real name ink across tilts up to 24pt of drop
+# across the header's ~536pt width (~2.56 degrees), and real measured skew
+# across all 176 real pages (same three files) never exceeded 1.48 degrees
+# (mean well under 0.2 degrees on every file). 3.0 sits just past the
+# already-validated/tested ceiling, with real data nowhere near it -- this
+# is a safety backstop for a page shaped unlike anything in the real
+# dataset, not a response to skew actually being a problem there.
+ORIENTATION_MAX_TOLERATED_SKEW_DEG = 3.0

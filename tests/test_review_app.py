@@ -2,10 +2,15 @@ import json
 import sys
 from pathlib import Path
 
+import pdfplumber
 import pytest
 from streamlit.testing.v1 import AppTest
 
+import review_app
+from melredact.config import RENDER_DPI_FINAL
 from melredact.pipeline import packet_tag
+from melredact.redact import redact_packet, verify_no_leaked_names
+from melredact.roster import load_roster
 from melredact.segment import segment_pdf
 from tests.make_fixture import PACKETS, build_footer_edge_case_fixture, build_main_fixture
 
@@ -378,3 +383,88 @@ def test_issue_flagged_packet_blocks_sid_confirmation(tmp_path):
     at.radio[0].set_value("Not on roster (no consent)").run()
     confirm_btn = next(b for b in at.button if b.label == "Confirm decision")
     assert not confirm_btn.disabled
+
+
+@pytest.mark.parametrize("dpi", [100, 150, 300])
+def test_canvas_rect_bbox_round_trip_at_multiple_dpis(dpi):
+    """_bbox_to_canvas_rect (page points -> canvas pixel-space fabric.js
+    rect) and _canvas_rect_to_bbox (its inverse) must round-trip exactly at
+    any DPI the editor might render the background image at -- the drag-
+    corner editor renders at review_app.DPI (RENDER_DPI_PREVIEW, 150) while
+    the real redaction that consumes the resulting bbox runs at
+    RENDER_DPI_FINAL (300); the conversion has to be correct at both, not
+    just whichever one happens to be exercised by an end-to-end test."""
+    original = (38.0, 58.0, 300.0, 148.0)
+    rect = review_app._bbox_to_canvas_rect(original, dpi)
+    recovered = review_app._canvas_rect_to_bbox(rect, dpi)
+    for a, b in zip(original, recovered):
+        assert a == pytest.approx(b, abs=1e-6)
+
+
+def test_canvas_rect_to_bbox_folds_in_scalex_scaley_for_a_resized_object():
+    """fabric.js reports a corner-dragged resize as scaleX/scaleY factors
+    on top of the object's original width/height, not as new width/height
+    values -- _canvas_rect_to_bbox must fold both in, or a reviewer
+    resizing an existing box (as opposed to drawing a new one) would
+    silently redact the box's ORIGINAL, unresized extent."""
+    dpi = 150
+    scale = dpi / 72.0
+    obj = {
+        "left": 38.0 * scale,
+        "top": 58.0 * scale,
+        "width": 100.0 * scale,
+        "height": 20.0 * scale,
+        "scaleX": 2.0,  # dragged twice as wide
+        "scaleY": 1.5,  # and 1.5x as tall
+    }
+    bbox = review_app._canvas_rect_to_bbox(obj, dpi)
+    assert bbox == pytest.approx((38.0, 58.0, 38.0 + 200.0, 58.0 + 30.0), abs=1e-6)
+
+
+def test_canvas_drawn_rectangle_at_a_different_render_scale_redacts_the_intended_region(main_fixture, tmp_path):
+    """End-to-end proof that a box drawn on the editor's own preview-scale
+    canvas (review_app.DPI, 150) still redacts the correct region once fed
+    into the real redaction, which rasterizes at a DIFFERENT dpi
+    (RENDER_DPI_FINAL, 300) -- exactly the "canvas rendered at a different
+    scale than its PDF page size" case. Simulates the fabric.js object
+    st_canvas would return for a box a reviewer dragged over the header's
+    known Name/Teacher/Group column (AppTest cannot drive the canvas
+    component's own drag interaction -- see the manual-queue test above for
+    why every test here works this way), converts it with
+    _canvas_rect_to_bbox at the editor's own DPI, and applies it as
+    redact_packet's header_bbox_override at a different DPI entirely."""
+    packet = next(p for p in segment_pdf(main_fixture.pdf_path).packets if p.header_page_index == 0)
+    roster = load_roster(main_fixture.roster_path, infer_period_from=main_fixture.pdf_path)
+
+    with pdfplumber.open(main_fixture.pdf_path) as pdf:
+        page = pdf.pages[0]
+        preview_width, preview_height = page.to_image(resolution=review_app.DPI).original.size
+    assert (preview_width, preview_height) != (612, 792)  # genuinely a different pixel scale than the PDF's own points
+
+    # A generous box covering the whole left header column at the editor's
+    # own preview DPI, as fabric.js's canvas_result.json_data would report
+    # it (pixel-space left/top/width/height, no resize applied).
+    drawn_rect_obj = {
+        "type": "rect",
+        "left": 30.0 * (review_app.DPI / 72.0),
+        "top": 55.0 * (review_app.DPI / 72.0),
+        "width": 370.0 * (review_app.DPI / 72.0),
+        "height": 95.0 * (review_app.DPI / 72.0),
+        "scaleX": 1,
+        "scaleY": 1,
+    }
+    bbox = review_app._canvas_rect_to_bbox(drawn_rect_obj, review_app.DPI)
+
+    out_path = tmp_path / "canvas_redacted.pdf"
+    result = redact_packet(
+        main_fixture.pdf_path,
+        packet,
+        out_path,
+        dpi=RENDER_DPI_FINAL,
+        stamp_lines=["SID: 0204150201", "PD: 02"],
+        header_bbox_override=(bbox, bbox),
+    )
+    assert result.band is not None
+
+    findings = verify_no_leaked_names(out_path, roster)
+    assert findings == [], f"box drawn at DPI {review_app.DPI} failed to redact under real DPI {RENDER_DPI_FINAL}: {findings}"

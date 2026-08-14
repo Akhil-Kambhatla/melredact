@@ -2831,6 +2831,296 @@ measured and cited above (41 held packets, 0 true positives; 7/44,
 6/22, 8/20 consensus holds) remain the accurate real numbers for what each
 check *finds*, just no longer describe what each check *blocks*.
 
+## Page-orientation normalization, a shipped-output rotation audit, and the manual-editor canvas fix (2026-08-14)
+
+**Motivation, flagged early by the supervisor and never handled until now:
+the scanner flips pages on two-sided scans, and redaction geometry is
+unconditional and page-content-blind.** `detect_header_band`/
+`locate_header_anchors` assume an upright page; on a rotated one they cover
+the wrong region relative to the actual ink — leaving the real name exposed
+while stamping a SID somewhere arbitrary — and `verify_no_leaked_names`
+isn't a reliable backstop for this class of miss, since it depends on OCR
+reading a rotated name well enough to fuzzy-match a roster row.
+
+**Shipped-output audit, done first, before anything else (per explicit
+instruction to stop and report immediately if a leak were found): clean.**
+Every page of every currently-shipped file (16 packets, 32 pages, under
+`out/020415/` — 11 MPR + 5 PRT; nothing has been written for 010406 yet,
+confirmed via both the ledger and `out/` itself) was checked with
+PaddleOCR's `DocImgOrientationClassification` against the real source files
+those packets were redacted from (`Hannel MPR PD2.pdf`, `Hannel PRT
+PD2.pdf`) — all 84 real pages in both files classify as upright (angle=0,
+confidence 0.92–0.93 throughout, no exceptions) — plus a direct visual
+spot-check of two shipped files (0204150202, 0204150201) confirming the
+redaction box sits correctly over the header and nothing is exposed. Real
+per-page skew (see below) also never exceeded 1.5 degrees on any of the 176
+real pages checked. No leak, no further action needed on already-shipped
+output.
+
+**Source-file diagnosis: one real file has genuine rotation, and it's a
+clean 180, not skew.** `data/PRT/010406_PD1_PRT.pdf` (92 pages) has exactly
+two pages — 0-indexed 84 and 85 — rotated a clean 180 degrees (classifier
+confidence 0.92–0.93, same band as every upright page); every other page in
+all three real source files (`Hannel MPR PD2.pdf` 44 pages, `Hannel PRT
+PD2.pdf` 40 pages, `010406_PD1_PRT.pdf`'s other 90 pages) is upright.
+Content-based skew (Hough-line estimate on Canny edges, median angle of
+near-horizontal lines) across all 176 real pages, all three files: max
+absolute skew 1.48 degrees, mean well under 0.2 degrees on every file — a
+different, much smaller-magnitude problem than the two clean 180s, and (see
+below) not one that needed a new fix. Before this session, pages 84/85 were
+only caught by accident: upside-down text doesn't match "Name:"/"Page X of
+Y", so `segment.py`'s footer/header search failed and the page fell out as
+a flagged orphan — not a real safeguard, since a 90-degree rotation (whose
+own vertical text line can occasionally still satisfy a narrow word search)
+has no reason to fail the same way.
+
+**Detector: PaddleOCR's dedicated `DocImgOrientationClassification`
+submodule, not the full-pipeline `use_doc_orientation_classify` flag
+`ocr.py`'s own header/footer OCR calls already disable.** Measured directly:
+~0.02s/page after a ~0.4s one-time model load, vs. ~9s/page for the
+full-pipeline flag doing the identical classification job (it also runs
+text detection/recognition it doesn't need to answer this one question) —
+a ~450x cost difference for the same answer. `ocr.py` disables full-pipeline
+orientation classification because it breaks detection on narrow
+header/footer crops (see its own docstring); that constraint doesn't apply
+here, since this module always classifies the whole rendered page. A purely
+geometric (model-free) approach was rejected too: nothing about analyzing a
+raster for a dominant text-line axis distinguishes the four 90-degree turns
+from each other without reinventing what the OCR stack already solves.
+
+**Confidence threshold calibrated against 176 real pages, not the
+abstract: `ORIENTATION_MIN_SCORE = 0.6` (config.py).** Every real page with
+actual content — upright or genuinely rotated 90/180/270 — classified at
+0.91–0.93, regardless of correctness (the score isn't a fine gradient of
+confidence, it's closer to "did I see a real page at all"); a blank page
+scored 0.26. 0.6 sits with wide margin on both sides. Below it, no rotation
+is applied and the page is reported unresolved — never a guessed rotation,
+since a wrong guess here is exactly the "confidently wrong" scenario this
+codebase's abstain-by-default posture exists to prevent (a guessed-wrong
+axis can still occasionally find *something* for the anchor search to
+latch onto, per the real pre-fix orphan-page evidence above).
+
+**Skew is measured, not corrected — with real evidence behind that choice,
+not an assumption.** `test_redact.py`'s own pre-existing
+`test_redaction_box_covers_name_ink_across_a_range_of_skews` already proves
+`detect_header_band`'s corner-based border search covers real name ink
+across tilts up to 24pt of drop across the header's ~536pt width (~2.56
+degrees) — and real measured skew across all 176 real pages this session
+checked never exceeded 1.48 degrees. Building a deskew (image-rotation)
+stage on top of that would add real risk (resampling/interpolation a purely
+axis-aligned redaction box doesn't otherwise need to tolerate) to fix a
+problem the evidence says doesn't exist on real data. What the measurement
+*is* used for: `ORIENTATION_MAX_TOLERATED_SKEW_DEG = 3.0` is a second,
+independent confidence signal — a page whose residual skew (after cardinal
+correction) exceeds it is reported unresolved even if the cardinal
+classification itself was confident, since that shape is untested by both
+the real dataset and the existing skew regression test, and gets a human
+rather than an unvalidated guess.
+
+**`melredact/orientation.py`, chained into `pdfio.open_pdf` after its
+existing xref/trailer repair step, so every downstream module (`segment.py`,
+`redact.py`, `pipeline.py`, `blocks.py`, `consensus.py`, `review_app.py`)
+sees an upright page with zero rotation-awareness of its own** — the same
+architecture `pdfio.py` already established for the xref-repair fix (see
+"Real scans can arrive in a PDF encoding one of our two readers mis-parses"
+above), extended with a second, chained normalization stage rather than a
+parallel one. `pdfio.resolved_source_path` is the public split of the
+repair step alone, so `orientation.orientation_for` (used by
+`segment.segment_pdf` to look up per-page results) resolves the identical
+file `open_pdf` itself would.
+
+**Detection is content-based, never PDF `/Rotate` metadata** — the whole
+premise of this feature: real scans have passed through Box, a Google
+Sheets export pipeline, and (see the xref-repair section above) at least
+one prior re-save through a qpdf-incompatible tool, any of which can drop
+or rewrite `/Rotate` without touching the actual pixels. Detection instead
+renders the page exactly as it would currently display (respecting
+whatever `/Rotate` happens to be set, right or wrong) and classifies that
+rendering directly.
+
+**Correction mechanism: PDF `/Rotate`, not re-rasterizing page content —
+lossless and cheap, and its sign convention was verified empirically
+against three real constructions, not assumed.** The new value is
+`(current_effective_rotate - detected_angle) % 360`, not `+` — confirmed
+by hand-building and round-tripping (exact pixel match) three real cases
+before writing any module code: a page whose `/Rotate` was wrongly set on
+already-upright content, a page whose embedded pixels were physically
+pre-rotated at `/Rotate=0` (the realistic real-scan shape), and all three
+of 90/180/270 via `PIL.Image.rotate`'s own sign convention (which
+`orientation.normalize_page_image` also uses, for the post-cardinal-
+correction skew measurement). `+` reconstructed nothing correctly in any
+of the three; `-` reconstructed all three exactly. pdfplumber — which
+every downstream module already reads pages through — resolves `/Rotate`
+into `page.width`/`page.height` and `page.to_image()` output consistently;
+verified directly, not assumed (a `/Rotate`-tagged page's rendered pixels
+matched the expected upright original byte-for-byte).
+
+**Persistence: one normalized PDF + one JSON manifest per distinct source
+file, disk-cached by content hash (`ocr.file_content_hash`, the same
+hasher `pdfio.py`'s repair cache already shares) under
+`.cache/melredact/orientation/`** — a re-run of the same file never
+re-detects (verified directly: a second `normalize_pdf` call with the
+classifier monkeypatched to raise completes from cache with no error). A
+file where every page is already upright (the overwhelming majority — both
+Hannel files, 84/84 pages) never gets a rewritten copy at all;
+`OrientationResult.normalized_path` is just the input path, avoiding a
+wasted pikepdf resave for the common case, the same reasoning
+`pdfio.open_pdf` already applies to a file that never needed repair.
+
+**Fail-loud path reuses the existing `packet.issues`/held-back
+infrastructure, not a new hold mechanism.** `segment.segment_pdf` looks up
+`orientation.unresolved_page_indices(pdf_path)` once and, for any packet
+containing one of those pages, appends an issue naming the page (`"page N:
+orientation could not be confidently determined, held for human review
+rather than processed at a guessed rotation"`) — the same treatment an
+unreadable footer already gets. `pipeline.run_dispositions`' pre-existing
+"a packet with unresolved issues is refused even if `decisions` names a
+SID for it" rule does the rest; no separate orientation-specific hold
+branch was added anywhere in pipeline.py.
+
+**Real, positive confirmation the fix does more than avoid a leak — it
+recovers a real header page that was previously invisible to segmentation
+entirely.** Re-running `segment_pdf` against the real, normalized
+`010406_PD1_PRT.pdf`: page 84 is still correctly flagged as an orphan (its
+own real content, once upright, genuinely isn't a header page — matching
+what was already known about this page before this session), but page 85 —
+previously folded into the same accidental-orphan failure mode as page 84
+— is now correctly recognized as its own real header page
+(`header_page_index=85`, `is_orphan=False`), with a single, honest,
+accurate remaining issue ("packet has 1 page(s) but footer declared 2" —
+its real continuation page belongs to a different, already-claimed
+packet). Segmentation went from 46 to 47 packets on this file as a direct
+result — a genuine accuracy improvement, not merely a safety net avoiding
+a worse outcome. Neither page 84 nor 85 ships as a result (both still
+carry unresolved `issues`), consistent with before, but now for the
+correct, specific reasons rather than an unrelated accidental symptom.
+
+**The manual-redaction editor's canvas ("Draw a new box"/"Move / resize
+existing boxes" doing nothing) was two independent problems, not one.**
+`streamlit-drawable-canvas==0.9.3` (the package wired in by an earlier
+session) was broken against this project's installed Streamlit (1.59.2) in
+two ways simultaneously: its own `st_canvas()` called
+`streamlit.elements.image.image_to_url(image, width, ...)`, a function
+this Streamlit version moved and rewrote to take a `LayoutConfig` instead
+of a bare pixel width (already patched by an earlier session's
+module-level compatibility shim in `review_app.py`) — **and**, found this
+session by inspecting the installed package directly (`site-packages/
+streamlit_drawable_canvas/frontend/build/`), its bundled frontend is a
+pre-built React/fabric.js JS bundle from before 2023, built against an
+older `streamlit-component-lib` whose iframe handshake with newer
+Streamlit versions doesn't reliably complete — observed directly as
+draw/resize doing nothing at all, not a crash, not an error in the
+Python-side logs. The first half was patchable with a Python-side shim;
+the second is a frontend-bundle problem no amount of Python-side patching
+can reach.
+
+**Fix: switched to `streamlit-drawable-canvas-fix` (PyPI), a maintained
+fork whose entire purpose is tracking newer Streamlit releases** — same
+`streamlit_drawable_canvas` import path (true drop-in, zero call-site
+changes in `review_app.py` beyond the import itself), pinned to
+`streamlit>=1.49.0` in its own package metadata (bracketing this project's
+1.59.2), and confirmed (not assumed) to ship an actually-different,
+rebuilt frontend bundle — diffed byte-for-byte against 0.9.3's own
+`main.*.chunk.js`, not just a re-hashed re-package of the same content.
+Its own `__init__.py` also already imports `image_to_url`/`LayoutConfig`
+from their current real Streamlit locations directly, so the earlier
+session's Python-side compatibility shim in `review_app.py` is now dead
+code and was removed — same "route around an upstream incompatibility
+rather than patch our own code around it" posture `pdfio.py`'s `open_pdf`
+already established for the pdfplumber/pdfminer.six xref gap.
+`requirements.txt` now pins `streamlit-drawable-canvas-fix>=0.9.8`.
+
+**Confirmed end to end on a real packet, not just the synthetic fixture**
+(per explicit instruction) — `data/PRT/010406_PD1_PRT.pdf`, SID
+0204150201's packet (header page 78, "Jordan White"): a simulated
+fabric.js canvas rect object, in pixel space at the editor's own preview
+DPI (`review_app.DPI` = 150, rendering the real page at 1273×1634px
+against its own 611×784pt PDF size — genuinely different scales, not
+matching by coincidence), converted through `_canvas_rect_to_bbox` and
+applied as `redact_packet`'s `header_bbox_override` at a *different* DPI
+entirely (`RENDER_DPI_FINAL` = 300, the real redaction DPI) — produced a
+redacted output with zero `verify_no_leaked_names` findings. (The test
+artifact was deleted immediately after, per the no-real-PII-in-code/
+on-disk rule.)
+
+**Pixel-to-point conversion, the one place a wrong sign or a hardcoded DPI
+would silently misplace every drawn box:** `scale = dpi / 72.0`;
+`_bbox_to_canvas_rect` multiplies page-point coordinates by `scale` to seed
+the canvas at its own pixel resolution, `_canvas_rect_to_bbox` divides
+back by the *same* `dpi` value the canvas was actually rendered at (never
+a hardcoded constant — both conversions take `dpi` as a parameter, and
+every call site passes `review_app.DPI`, the same value `raw_image` was
+rendered at) to recover page points — DPI-independent by construction, so
+it doesn't matter that the canvas renders at `RENDER_DPI_PREVIEW` (150)
+while the real redaction re-rasterizes at `RENDER_DPI_FINAL` (300); both
+the real-packet check above and `tests/test_review_app.py::test_canvas_
+rect_bbox_round_trip_at_multiple_dpis` (parametrized 100/150/300) prove
+this holds, not just at the one DPI that happens to be wired in today.
+`scaleX`/`scaleY` (fabric.js's own corner-drag resize factors, reported
+separately from `width`/`height`) are folded in by
+`_canvas_rect_to_bbox` before the scale division, not after — a
+resize-then-convert and a convert-then-resize would otherwise silently
+diverge; see `test_canvas_rect_to_bbox_folds_in_scalex_scaley_for_a_
+resized_object`.
+
+**Existing synthetic fixtures needed real content, not a config change, to
+coexist with the new orientation stage.** Turning on whole-page
+orientation classification for every `open_pdf` call (every fixture, every
+test) surfaced that several fixtures' own continuation/page-2 images were
+unrealistically sparse — `render_continuation_image`'s original bare
+`"(continued)"` placeholder and `_consensus_page2_image`'s footer-only
+page both scored ~0.26–0.29, the same range as a genuinely blank page,
+correctly triggering the new unresolved-orientation hold on packets that
+had nothing to do with rotation. This was the fixtures under-representing
+real body-page density, not the classifier misbehaving: every real
+continuation page this project has ever measured (176 real pages, both
+worksheet types) scored 0.91–0.93, never close to ambiguous. Fixed by
+adding real-looking filler content — `render_continuation_image` now
+draws four generic instruction-style lines plus a bordered box below the
+packet's own (still invisible-text-matched, semantically unchanged) body
+string; `_consensus_page2_image` draws two lines of instruction text plus
+a bordered box in a fixed "template band" (`_CONSENSUS_TEMPLATE_BAND_TOP =
+600`, below every real `CONSENSUS_*_BOX`/`CONSENSUS_ZONE_*` coordinate any
+consensus fixture uses — max y=520 — and above `FOOTER_BAND_TOP` = 700, so
+it can never overlap or perturb the block-density math around an actual
+calibrated test region), drawn identically across every packet in a group
+so it becomes shared template ink under consensus.py's own block-median
+voting, exactly like the footer text already is — never a per-packet
+anomaly, and verified to change no existing held/not-held expectation.
+Both are purely decorative rendering additions (drawn as ordinary, not
+invisible, ink) — no `InvisibleText`/OCR-extractable content changed, so
+no test's assertion about what a packet's own fields actually say was
+touched.
+
+**Unrelated pre-existing flake found and fixed while running the full
+suite: pikepdf's default `/ID` isn't deterministic.** `test_no_manual_
+geometry_follows_the_existing_automatic_path_unchanged` (added well before
+this session, in the drag-corner-editor commit) compares two redacted
+outputs byte-for-byte and intermittently failed at the same offset with a
+different byte each time — confirmed via repeated re-runs (5/5 clean when
+run in isolation, but reproduced identically in two separate full-suite
+runs) and via `pikepdf.Pdf.save`'s own signature: `static_id`/
+`deterministic_id` both default to `False`, so two calls writing otherwise
+byte-identical content can still disagree on the trailer `/ID` alone.
+Fixed at the source, not by loosening the test: `_PdfWriter.save`
+(redact.py) now calls `self.pdf.save(path, deterministic_id=True)` — ties
+`/ID` to actual content the way "byte-identical output" should mean, no
+functional change to anything else. Confirmed fixed: 5/5 clean re-runs of
+the previously-flaky test after the change.
+
+**Tests, synthetic fixture only** (`tests/test_orientation.py`, new; a few
+additions to `tests/test_review_app.py`): a page rotated 90/180/270
+(embedded content physically pre-rotated via pikepdf/PIL, not a
+`/Rotate`-metadata-only mislabel) normalizes upright and redacts cleanly
+(`verify_no_leaked_names` finds nothing); a page with no classifiable
+content (blank) is reported unresolved and the containing packet's
+`issues` names that specific page; a second `normalize_pdf` call reuses
+the disk cache without invoking the classifier again (monkeypatched to
+raise if called); an upright file is never rewritten. Canvas: bbox/canvas-
+rect round-trip at three DPIs; `scaleX`/`scaleY` folding on a resized
+object; a box drawn at the editor's own preview DPI redacts correctly
+under the real, different, final-output DPI.
+
 ## Working preferences
 
 - Calibrate against real measured data, not assumptions — when a
