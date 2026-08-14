@@ -84,19 +84,39 @@ def test_preflight_reports_rotation_unsegmentable_and_no_match_packets(tmp_path)
     assert orphan.issues
 
     no_match_packets = [p for p in report.packets if not p.is_orphan and not p.has_plausible_match]
-    assert len(no_match_packets) == 1
-    assert no_match_packets[0].n_pages == 1  # packet C: the single-page "Zzyzx Qorvath" packet
-    assert not no_match_packets[0].blocked  # a genuinely segmentable packet, just not on the roster
+    assert len(no_match_packets) == 2  # packet C ("Zzyzx Qorvath") and packet D ("Riley Osei")
+    clean_no_match = next(p for p in no_match_packets if p.n_pages == 1)
+    assert not clean_no_match.blocked  # a genuinely segmentable packet, just not on the roster
 
-    # Both the rotated (unconfirmed) packet and the orphan packet block
-    # processing outright; the no-plausible-match packet does not (it's a
-    # normal, fully segmentable packet -- just not on the roster).
-    assert report.n_cannot_process >= 2
+    # Packet D: header reads fine, but its continuation page's own footer
+    # is unreadable -- blocked, but neither an orphan, a page-count
+    # mismatch, nor an orientation issue (see build_preflight_fixture's
+    # own docstring: found via a real preflight run, this used to fall
+    # through every itemized section while still correctly counting
+    # toward the verdict).
+    oriented_tags = {f.packet_tag for f in report.orientation_flags if f.packet_tag is not None}
+    other_blocked = [
+        p
+        for p in report.packets
+        if p.blocked and not p.is_orphan and not p.page_count_mismatch and p.packet_tag not in oriented_tags
+    ]
+    assert len(other_blocked) == 1
+    assert other_blocked[0].n_pages == 2
+    assert not other_blocked[0].page_count_mismatch
+    assert any("unreadable footer" in i for i in other_blocked[0].issues)
+
+    # The rotated (unconfirmed) packet, the orphan packet, and packet D all
+    # block processing outright; the no-plausible-match packets do not on
+    # their own (both are normal, fully segmentable packets -- just not on
+    # the roster).
+    assert report.n_cannot_process == 3
 
     text = format_preflight_report(report)
     assert "rotated 180" in text
     assert "Unsegmentable packets: 1" in text
     assert "no plausible roster match" in text
+    assert "Other blocked packets: 1" in text
+    assert other_blocked[0].packet_tag in text
 
 
 def test_preflight_populates_the_same_cache_the_real_run_reads(tmp_path, monkeypatch):

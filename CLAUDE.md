@@ -3794,22 +3794,81 @@ file, the same end-to-end guarantee the existing 180°-rotation pipeline
 tests already prove, now proven through the new preview/apply session-state
 functions specifically rather than a direct `_set_page_rotation` call).
 
+### `preflight` run against the real `010406_PD1_PRT.pdf`, a stray orientation override found and cleared, and one more report gap it exposed
+
+**First real run, later the same day: `python -m melredact.cli preflight
+--pdf data/PRT/010406_PD1_PRT.pdf --roster data/teacher_codes/010406.csv
+--out out --decisions decisions`, warm cache, 11.9s.** Before trusting the
+output, it disagreed with this file's own already-documented round-grouping
+result (see "A round segment" above: three rounds, 2026-03/20,
+2026-02/19, 2025-10/7) — this run reported only **two** rounds (2026-03/20,
+2026-02/26), with the October 2025 round gone entirely, and packet
+`010406_PD1_PRT_p078` (previously a normal, cleanly-matched packet — see
+the round-scoped-claiming pilot's own "Jordan white" line) now reporting as
+an unreadable-footer orphan.
+
+**Root-caused, not assumed: `decisions/010406_PD1_PRT.orientation.json`
+contained `{"78": 90}`** — a rotation override for page 78 that appears
+nowhere in this file's own history. Confirmed the cause directly by
+re-running preflight with `--decisions` pointed at an empty directory: the
+real, documented three-round result (2026-03/20, 2026-02/19, 2025-10/7, 0
+disagreeing in every group) came back exactly, and packet `_p078` read as a
+normal 2-page packet again. Forcing a 90° rotation onto a page that didn't
+need one broke that page's own footer read, which cascaded into
+`group_into_rounds`'s boundary-confirmation logic silently absorbing the
+October run into February instead of recognizing it as its own group — a
+real demonstration of exactly the risk `orientation.py`'s detect-and-ask
+design exists to prevent (see that module's own docstring: a wrong rotation
+"can still occasionally find *something* for the anchor search to latch
+onto"), just surfacing one level up, in round grouping rather than
+matching. Cleared via `pipeline.save_orientation_overrides(pdf_path, {},
+decisions_dir=...)` — the same function `review_app.py`'s own Reset button
+calls — not a hand-edited file. Re-running preflight afterward reproduced
+the documented three-round result exactly, and dropped from 4 to 3
+cannot-process packets (the two real orphans — `_p056`, `_p084`/`_p085`,
+both already documented above — plus one more, below) and from 14 to 15
+clean packets, confirmed by the numbers, not assumed to have recovered.
+
+**That same real run exposed a genuine gap in `format_preflight_report`,
+not a data problem: a blocked packet (`010406_PD1_PRT_p086`, an unreadable
+footer on its own *continuation* page, header page unaffected) counted
+correctly toward the verdict's `cannot_process` total but had nowhere in
+the printed report naming which packet or why** — neither an orphan
+(it has a real header) nor a page-count mismatch (nothing declared to
+disagree with) nor an orientation issue, so it fell through every existing
+itemized section. Fixed: a new "Other blocked packets" section
+(`format_preflight_report`) lists any `blocked` packet not already covered
+by the unsegmentable, page-count-mismatch, or orientation sections above
+it — deliberately excluding packets already named in the orientation
+section too (an orientation-pending packet is *also* `blocked`, and would
+otherwise show up redundantly in both places). Regression test: `tests.
+make_fixture.build_preflight_fixture` gained a fourth packet ("Riley
+Osei" — header fine, continuation page's own footer marker empty) built
+directly from this real finding, and `tests/test_preflight.py::
+test_preflight_reports_rotation_unsegmentable_and_no_match_packets` now
+asserts it's the sole entry in "Other blocked packets" and that
+`n_cannot_process` exactly equals the sum of every itemized category (no
+silent gap between an accurate count and an exhaustive listing).
+
 ### What this session did not do
 
 Did not change `redact.py`'s detection geometry, `match.py`'s scoring, or
 `consensus.py`'s two-pass algorithm — `consensus.py`'s own cache-key
 stability was found already correct by inspection, not modified. Did not
-enable deletion for any run. Did not process any real file — every
-measurement and test in this section is against the synthetic fixture
-(`tests/make_fixture.py`), including the one fixture deliberately built to
-force real OCR (`build_rotated_page_copy(..., degrees=0)`, which strips a
-page's native text layer without actually rotating it). `preflight` and the
-rotation-performance fix are both verified against synthetic data only;
-running `preflight` against `010406`'s or `020415`'s real files, and
-measuring the real before/after rotation timing on a real packet, is real,
-useful follow-up work this session didn't do — CLAUDE.md's own repeated
-"verified, not automatically re-shipped" posture applies here too: these
-tools are ready to use, not yet used against real data.
+enable deletion for any run. The `preflight` command and the rotation-
+performance fix were originally verified against synthetic data only, then
+run once against the real `010406_PD1_PRT.pdf` the same day (see above) —
+read-only throughout: nothing was written to `out/010406/...`, `decisions/
+010406_PD1_PRT.json` (the actual per-packet decisions), or the ledger;
+the only real-data artifacts this produced are `out/.diagnostics/
+010406_PD1_PRT_preflight/contact_sheet.png` (a labelled contact sheet of
+flagged real pages, left in place — this is the feature's own intended,
+persistent output, not a one-off inspection render to clean up after,
+unlike every other real-page render this file documents) and the cleared
+orientation-overrides sidecar above. Measuring the real before/after
+rotation timing on a real packet (as opposed to the synthetic-fixture
+timing already measured above) is still real, useful follow-up work this
+session didn't do.
 
 ## Working preferences
 

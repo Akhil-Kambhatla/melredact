@@ -1775,6 +1775,26 @@ def format_preflight_report(report: PreflightReport) -> str:
     for p in unsegmentable:
         lines.append(f"    {p.packet_tag}: {'; '.join(p.issues)}")
 
+    # A packet can be blocked (has segmentation issues) for a reason
+    # neither an orphan nor a page-count mismatch already itemizes above --
+    # e.g. an unreadable footer on a continuation page whose header page
+    # read fine (found on a real file, 2026-08-14: a continuation page's
+    # own footer unreadable mid-packet, not the header page's). Without
+    # this, such a packet still correctly counted toward `n_cannot_
+    # process` in the verdict below, but had nowhere in the printed report
+    # naming *which* packet or why -- a silent gap between an accurate
+    # count and an exhaustive listing.
+    oriented_tags = {f.packet_tag for f in report.orientation_flags if f.packet_tag is not None}
+    other_blocked = [
+        p
+        for p in report.packets
+        if p.blocked and not p.is_orphan and not p.page_count_mismatch and p.packet_tag not in oriented_tags
+    ]
+    if other_blocked:
+        lines.append(f"\nOther blocked packets: {len(other_blocked)}")
+        for p in other_blocked:
+            lines.append(f"    {p.packet_tag}: {'; '.join(p.issues)}")
+
     lines.append(
         f"\nVerdict: {report.n_clean} would process cleanly, {report.n_needs_editor} would need a human in "
         f"the editor, {report.n_cannot_process} cannot be processed without a fix"

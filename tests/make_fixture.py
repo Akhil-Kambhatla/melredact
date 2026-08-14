@@ -648,6 +648,13 @@ def build_preflight_fixture(out_dir: Path) -> tuple[Path, Path]:
     - packet C ("Zzyzx Qorvath", page 3): a normal, fully segmentable
       packet whose name matches nothing on the small roster below -- "no
       plausible match", not a structural problem.
+    - packet D ("Riley Osei", pages 4-5): header page reads fine, but its
+      own *continuation* page's footer marker is unreadable -- blocked,
+      but neither an orphan nor a page-count mismatch (found via a real
+      preflight run against data/PRT/010406_PD1_PRT.pdf, 2026-08-14: a
+      continuation page's own footer unreadable mid-packet, which the
+      report's "Unsegmentable packets"/"Page-count vs. footer" sections
+      didn't itemize even though it correctly counted toward the verdict).
 
     Returns (pdf_path, roster_path); the roster has exactly one entry,
     Jordan Ames, matching packet A only."""
@@ -692,6 +699,13 @@ def build_preflight_fixture(out_dir: Path) -> tuple[Path, Path]:
 
     # Packet C: normal, single page, but the name matches nothing below.
     builder.add_page(*header_page("Zzyzx Qorvath", "Page 1 of 1"))
+
+    # Packet D: header reads fine, but the continuation page's own footer
+    # marker is unreadable -- blocked, but neither an orphan (it has a
+    # real header) nor a page-count mismatch (there's no declared total to
+    # disagree with, since the header's own footer never claimed one).
+    builder.add_page(*header_page("Riley Osei", "Page 1 of 2"))
+    builder.add_page(*continuation_page(""))
 
     builder.save(pdf_path)
     _write_roster_csv(roster_path, [("0204150201", "Ames", "Jordan")])
