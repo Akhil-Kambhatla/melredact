@@ -210,13 +210,16 @@ def _build_vertical_overflow_pdf(tmp_path):
     return pdf_path, roster_path, sid, overflow_top_pt
 
 
-def test_manual_queue_panel_lists_a_queued_packet_and_can_release_it(tmp_path):
-    """End-to-end through the review UI: a packet 14-style vertical
-    overflow gets auto-held (see pipeline.py/test_pipeline.py), lands in
-    the manual-redaction queue, and shows up in review_app.py's own queue
-    editor with a working release path -- releasing with a corrected
-    region that actually covers the overflow ink must write the file and
-    clear the queue; the panel must not be a dead end.
+def test_manual_queue_panel_lists_a_queued_packet_and_can_release_it(tmp_path, monkeypatch):
+    """End-to-end through the review UI: a packet held for detection
+    confidence (forced here via monkeypatch -- find_uncovered_group_words'
+    own finding no longer queues anything on its own, see CLAUDE.md's "From
+    detection-gates-workflow to human-reviews-everything" section, so this
+    no longer reaches the queue via the packet-14 vertical-overflow shape
+    alone) lands in the manual-redaction queue and shows up in
+    review_app.py's own queue editor with a working release path --
+    releasing with a corrected region must write the file and clear the
+    queue; the panel must not be a dead end.
 
     AppTest drives real Streamlit widgets but not the drawable-canvas
     component's own drag interaction (a third-party iframe, not something
@@ -229,6 +232,8 @@ def test_manual_queue_panel_lists_a_queued_packet_and_can_release_it(tmp_path):
     queue already proves at the pipeline.py level -- this test's own job is
     proving the *UI* actually reaches release_from_manual_queue with it,
     not re-proving the redaction geometry itself."""
+    import dataclasses
+
     from melredact.blocks import round_label
     from melredact.config import GROUP_ANCHOR, HEADER_BAND_FALLBACK
     from melredact.pipeline import list_manual_queue, output_path, run_dispositions
@@ -243,7 +248,20 @@ def test_manual_queue_panel_lists_a_queued_packet_and_can_release_it(tmp_path):
     roster = load_roster(roster_path)
     seg = _segment_pdf(pdf_path)
     tag = packet_tag(pdf_path, seg.packets[0])
-    run_dispositions(pdf_path, seg, {tag: sid}, roster, out_dir=out_dir)
+
+    import melredact.pipeline as pipeline_mod
+
+    real_redact_packet = pipeline_mod._redact_packet
+
+    def fake_undetected_band(*args, **kwargs):
+        result = real_redact_packet(*args, **kwargs)
+        if packet_tag(pdf_path, args[1]) == tag:
+            return dataclasses.replace(result, band=dataclasses.replace(result.band, detected=False))
+        return result
+
+    with monkeypatch.context() as mp:
+        mp.setattr(pipeline_mod, "_redact_packet", fake_undetected_band)
+        run_dispositions(pdf_path, seg, {tag: sid}, roster, out_dir=out_dir)
     assert len(list_manual_queue(out_dir)) == 1
 
     corrected_band = HeaderBand(
@@ -290,6 +308,56 @@ def test_manual_queue_panel_lists_a_queued_packet_and_can_release_it(tmp_path):
         out_dir, entry, seg.packets[0].worksheet_type, round_label=round_label("10/03/2025")
     ).exists()
     assert list_manual_queue(out_dir) == []
+
+
+def test_edit_redaction_reachable_for_a_non_held_packet_and_resolves_by_name(main_fixture, tmp_path):
+    """The editor is reachable for ANY packet, not just one an automated
+    check held (see CLAUDE.md's "Make the editor reachable for any packet"
+    section) -- opening it on an ordinary, never-held packet, applying with
+    the automatically-seeded geometry unchanged (AppTest can't simulate a
+    canvas drag, so this is exactly the "one glance and a confirm" common
+    case), must write the same clean output the automatic path would have,
+    record the decision (editing IS the review decision), and never accept
+    a typed SID anywhere in the process."""
+    import json
+
+    from melredact.blocks import round_label
+    from melredact.pipeline import list_manual_queue, output_path
+    from melredact.roster import load_roster
+
+    out_dir = tmp_path / "out"
+    decisions_dir = tmp_path / "decisions"
+    at = _launch(main_fixture.pdf_path, main_fixture.roster_path, out_dir, decisions_dir)
+
+    tag = "packets_p000"  # clean_match -- never held by any check
+    at.selectbox[0].set_value(tag).run()
+
+    edit_expanders = [e for e in at.expander if "Edit redaction" in e.label]
+    assert edit_expanders, "the editor must be reachable for a packet that was never held"
+    assert "currently held" not in edit_expanders[0].label
+
+    assert not any(w.key == f"mq_sid_{tag}" for w in at.text_input), "no widget anywhere accepts a raw SID"
+    name_input = at.text_input(key=f"mq_name_{tag}")
+    roster = load_roster(main_fixture.roster_path, infer_period_from=main_fixture.pdf_path)
+    sid = main_fixture.expected_auto_assign_sid["clean_match"]
+    assert name_input.value == roster.by_sid[sid].full_name  # pre-filled from the live decision preview
+
+    apply_btn = next(b for b in at.button if b.key == f"mq_apply_{tag}")
+    assert not apply_btn.disabled
+    apply_btn.click().run()
+    assert not at.exception
+
+    entry = roster.by_sid[sid]
+    packet = next(
+        p for p in segment_pdf(main_fixture.pdf_path).packets if packet_tag(main_fixture.pdf_path, p) == tag
+    )
+    expected_path = output_path(out_dir, entry, packet.worksheet_type, round_label=round_label("10/03/2025"))
+    assert expected_path.exists()
+    assert list_manual_queue(out_dir) == [], "a never-held packet must never end up in the manual queue"
+
+    decisions_file = decisions_dir / f"{Path(main_fixture.pdf_path).stem}.json"
+    saved = json.loads(decisions_file.read_text())
+    assert saved[tag] == sid, "applying a manual edit must record the decision, same as Confirm decision would"
 
 
 def test_issue_flagged_packet_blocks_sid_confirmation(tmp_path):

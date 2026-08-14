@@ -2628,6 +2628,209 @@ other real-data finding in this file. The real numbers above come from
 `cli.py analyze`/`run_dispositions` call) against the real source PDFs, not
 from any write to `out/`, `decisions/`, or the ledger.
 
+## From detection-gates-workflow to human-reviews-everything (2026-08-14)
+
+**Why: each new leak variant this project found got its own automatic
+detector, and each detector needed its own real-data calibration session
+— the group-row overflow fix, the vertical-overflow fix, the consensus-ink
+detector and its two follow-up recalibrations, all in this same file.
+Students write in unpredictable places on paper, so that enumeration does
+not terminate.** The reviewer already looks at every packet before
+anything is written (see "Non-negotiable design decisions" — abstain and
+flag, never silently guess). So the manual editor, not a new detector,
+should be the general answer to "a student wrote somewhere the automatic
+geometry doesn't reach" — and detection should mostly *inform* the human
+rather than *gate* the workflow. This session made that shift concrete in
+three ways: the editor is reachable for any packet, not just a held one;
+`find_uncovered_group_words`'s finding is now advisory, not a hold; and a
+per-run summary reports how often manual editing and the advisory actually
+get used, so that judgment can be revisited with real usage data instead
+of guessed at again.
+
+**The editor is reachable from the normal review flow, for any packet.**
+`review_app.py`'s `_render_packet` now renders an "✏️ Edit redaction
+(manual)" expander for every packet, held or not — placed after the
+ordinary Decision radio/Confirm buttons so it reads as an opt-in advanced
+path, not something that competes with the one-click "looks right,
+confirm" flow that covers the overwhelming majority of packets. It calls
+the same `_render_manual_editor` the manual-redaction queue panel already
+used, generalized to take an optional `default_sid` (the packet's live
+decision-preview candidate, not a queue entry's fixed sid) and an optional
+`flagged_regions` (populated only when this exact packet_tag also happens
+to be sitting in the manual queue right now, via `list_manual_queue`). The
+automatic geometry (`_seed_manual_regions`, unchanged) is always seeded as
+the starting rectangles, so the common case — automatic detection already
+got it right — is one glance at the live preview and a single Apply click,
+not a from-scratch drawing exercise. Applying always goes through
+`pipeline.release_from_manual_queue` (a no-op to clear a queue entry that
+doesn't exist, for a packet that was never queued), immediately preceded
+by `_confirm` so the decision is recorded whether or not the release
+itself succeeds — this is what keeps "present in `out/`" iff "has a
+confirmed decision" true (see "Packet identity and the decisions store")
+even for a packet a reviewer decided entirely through the editor, never
+through the ordinary radio+Confirm flow. Test:
+`test_edit_redaction_reachable_for_a_non_held_packet_and_resolves_by_name`
+(`tests/test_review_app.py`) — opens the editor for `packets_p000` (never
+held by anything), applies with the seeded geometry unchanged, and checks
+the output lands at the same natural path the automatic path would have
+used and the decision was recorded.
+
+**Every page of the packet is shown, tabbed, in the editor.** The page
+selector (`st.selectbox`, already present before this session for the
+manual-queue-only editor) now doubles as the general per-packet page tab
+strip: each page keeps its own independent list of rectangles in
+`st.session_state`, so a stray name on page 3 is exactly as reachable as
+page 1's header — a reviewer does not need a detector to route them to the
+right page, only to look. Redaction on a non-header page works exactly the
+same destructive way the header page's own rectangles already did before
+this session (`redact_packet`'s `extra_page_regions` parameter, added
+alongside the original drag-corner editor — see "A drag-corner editor for
+the manual-redaction queue" above): an opaque box painted on the raster
+plus every word overlapping the region dropped from the kept text layer,
+never pixelation or an overlay. Test:
+`test_page_3_region_redacts_page_3_and_leaves_other_pages_unchanged`
+(`tests/test_pipeline.py`) — a fresh 3-page fixture (page 1 header, page 2
+plain continuation, page 3 carrying its own extra handwritten name) proves
+a region on page 3 specifically redacts page 3 and leaves both page 1 and
+page 2 byte-identical to the automatic path's own output.
+
+**`find_uncovered_group_words` is now advisory, not a hold — the function
+and its own regression fixtures are unchanged, only the consequence of a
+non-empty result changed.** Evidence: real-data measurement (see "Teacher
+010406 roster reissue" and "Consensus-ink: registration tolerance..."
+above) found this check holding back roughly 20% of real packets on two
+teachers — rendering every one of 41 examined held packets confirmed the
+flagged ink was printed body text near the header border (the printed
+"1. Please work on this individually:" instruction, a printed
+title/table-border rule), never genuine uncovered handwriting. Zero true
+positives across 41 real cases is not a threshold-tuning problem the way
+the consensus-ink check's writing-zone mask was (see that section above)
+— there is no fixed slack past the header border that reliably separates
+"real overflow ink" from "safe printed text" on real data (the check's own
+docstring already documents this: printed body text can start as little
+as +1.92pt below the header border on some pages). Meanwhile, the reviewer
+now looks at every page of every packet via the editor above regardless of
+whether this check fires — so a geometric proof with a 0/41 real-world
+true-positive rate is more useful as something to point a reviewer's eyes
+at than as a gate nothing on real data can ever cleanly pass.
+
+`redact.find_uncovered_group_words` itself is byte-for-byte unchanged, and
+so are its three regression fixtures for bugs 4, 6, and 7
+(`test_group_row_overflow_past_column_split_is_fully_redacted`,
+`test_band_bottom_anchor_excludes_body_text_the_self_relative_window_missed`,
+`test_group_row_vertical_overflow_below_the_header_border_is_not_silently_
+missed`, all still in `tests/test_redact.py`, all still passing unmodified)
+— the detection logic stays correct, proven by the exact same fixtures;
+only what a non-empty result *means* to `run_dispositions`/
+`release_from_manual_queue` changed. `RedactResult.uncovered_group_words`
+is unchanged; `DispositionResult`/`ManualReleaseResult` both gained an
+`advisory_uncovered_words` field carrying the same finding without
+queueing the packet or blocking the write — never overridable via
+`detection_overrides`, since there is no longer a hold there to override.
+`review_app.py`'s editor draws each advisory word's own box as an orange
+outline (`_advisory_outline_image`, never filled, never confused with the
+red redaction boxes) computed live against whatever geometry is currently
+drawn (`find_uncovered_group_words` called directly against the header
+page's own OCR'd words), so a reviewer sees it update as they drag boxes,
+optional to act on. Tests: `test_vertical_group_row_overflow_is_advisory_
+not_held`, `test_manual_header_region_with_uncovered_ink_still_releases_
+as_advisory`, `test_detection_override_releases_despite_an_uncovered_ink_
+advisory` (all `tests/test_pipeline.py`) — the real packet-14 shape (and a
+forced synthetic case) now writes cleanly with the finding carried onto
+the result, never held or queued.
+
+**The consensus-ink writing-zone check stays a real, non-overridable hold
+— it has a genuine true-positive record nothing else caught, and a low
+false-positive rate on the file it matters most for.** Unlike uncovered-
+group-row-ink, this check actually caught two real leaks
+(`010406_PD1_PRT_p026` "Brian Lu", `010406_PD1_PRT_p034` "Ollie Maduro" —
+see "A leak class verify_no_leaked_names cannot catch" above) that no
+other check — not `find_uncovered_group_words` (header-page-only, this
+leak class is on continuation pages), not `verify_no_leaked_names` (Maduro
+was never on the roster, so there's no roster token to compare against) —
+could have caught at all. And after the registration-tolerance and
+writing-zone-mask fixes (see "Consensus-ink: registration tolerance..."
+above), its real false-positive rate on 010406 — the file both real leaks
+came from — is low (7 of 44 real packets held, most of the residual a
+confirmed genuine stray mark or further printed-text noise, not a
+structural miscalibration the way the uncovered-ink check's 0/41 record
+was). A check with a real record of catching leaks nothing else can, on
+the exact file class it was built for, earns staying a hard gate; a check
+with a 0/41 real true-positive rate does not. `run_dispositions` and
+`release_from_manual_queue` are unchanged for this check — still never
+consulted by `detection_overrides`, still resolvable only by drawing a
+region that actually overlaps every flagged bbox
+(`flagged_regions_to_verify`'s overlap test, unchanged). Tests (unchanged,
+still passing): `test_consensus_hold_is_held_back_end_to_end`,
+`test_consensus_hold_is_not_releasable_via_detection_overrides`,
+`test_consensus_hold_is_queued_and_released_by_drawing_a_manual_region_
+over_the_flagged_ink` (`tests/test_pipeline.py`).
+
+**`verify_no_leaked_names` is unchanged and still runs unconditionally on
+every written file, automatic or manually edited geometry alike** — the
+one check this session never touched, on purpose. `release_from_manual_
+queue` still calls it after every redaction attempt and still refuses to
+write (leaving the packet queued) on any finding, regardless of who
+supplied the geometry. Test: `test_manual_queue_release_with_a_geometry_
+that_still_leaks_the_name_stays_queued` (`tests/test_pipeline.py`) — a
+`header_bbox_override` too small to reach the real Name ink leaves it
+sitting in the kept text layer, and release is refused with the packet
+left queued, proving the human-supplied-geometry path still can't ship a
+real leak no matter how a reviewer draws it.
+
+**A per-run summary reports geometry provenance and advisory volume, so
+the advisory's own value can be measured rather than assumed.**
+`DispositionResult`/`ManualReleaseResult` both gained a `geometry_source`
+field (`"automatic"` — the default, unchanged for every packet nobody has
+ever manually edited — or `"manual"`, set whenever a write applied a
+stored correction from `manual_geometry`/`release_from_manual_queue`).
+`cli.py run`'s summary gained a `geometry: N automatic, M manually edited
+-- K write(s) carried an uncovered-ink advisory` line, and each per-file
+`wrote` line gets a `[manual geometry]`/`[advisory: ...]` suffix when
+applicable; `review_app.py`'s sidebar shows the same counts after "Run
+redaction pipeline". The explicit point of this line: if `K` (advisory
+count) tracks real manual edits over many runs, the advisory is earning
+its place; if it fires on nearly every write regardless of whether a
+reviewer ever acts on it, that's a signal to drop it entirely rather than
+carry a check nobody uses. `HoldAnalysis`'s own `uncovered_ink_hold` field
+was renamed `uncovered_ink_advisory` to match (`analyze_redaction_holds`/
+`format_hold_analysis_report`, `cli.py analyze`) — it no longer gates the
+consensus/leak checks below it in the precedence chain, and is excluded
+from `HoldAnalysis.clean`'s definition (a packet with only an advisory
+finding is still "clean" in the sense that a real run ships it without
+intervention).
+
+**The editor is built to stay usable across a real multi-dozen-packet
+sitting.** `review_app.py` now times each page render it performs
+(`time.perf_counter()` around every `_page_image` call, both in
+`_render_packet`'s own header preview and in `_render_manual_editor`) and
+shows it as a caption (e.g. "Packet rendered in 42 ms (cached)") — a
+direct, on-screen answer to "is this session getting slow" rather than a
+reviewer having to guess from feel. `_prefetch_next_packet`, called once
+per `main()` run right after the current packet finishes rendering, calls
+`_page_image` for every page of the *next* packet in the selector order —
+since `_page_image` is both `st.cache_data`-cached and disk-cached (see
+"OCR is disk-cached" above and `CACHE_DIR`), this means the next packet's
+pages are already rendered and cached by the time a reviewer actually
+clicks Next, not paid for live after the click. This is a best-effort
+shape, not true background prefetching: Streamlit reruns synchronously
+end-to-end, so the prefetch cost is paid during the *current* packet's own
+script run (after that packet's own content is already computed), not on
+a separate thread — the honest trade-off available without introducing a
+worker process into a tool whose entire job is being a thin, inspectable
+review UI. A page that fails to prefetch (caught and swallowed) simply
+renders live, on demand, when the reviewer actually reaches it — prefetch
+failure must never break the packet currently on screen.
+
+**Nothing about this session's own real-data findings (the 020415/010406
+uncovered-ink hold rates, the 010406 consensus-ink true positives) was
+re-measured against the new advisory-only behavior** — the underlying
+`find_uncovered_group_words`/consensus checks are unchanged, only their
+consequence in `run_dispositions` changed, so the finding rates already
+measured and cited above (41 held packets, 0 true positives; 7/44,
+6/22, 8/20 consensus holds) remain the accurate real numbers for what each
+check *finds*, just no longer describe what each check *blocks*.
+
 ## Working preferences
 
 - Calibrate against real measured data, not assumptions — when a

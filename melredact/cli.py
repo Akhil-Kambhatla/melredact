@@ -314,10 +314,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
     deletion_skipped = [r for r in results if r.deletion_skipped]
 
     collided = [r for r in written if r.collision_note]
+    manual_geometry_writes = [r for r in written if r.geometry_source == "manual"]
+    advisory_writes = [r for r in written if r.advisory_uncovered_words]
 
     for r in written:
         note = f"  ({r.reason})" if r.reason else ""
-        print(f"wrote   {r.out_path}{note}")
+        geom_note = "  [manual geometry]" if r.geometry_source == "manual" else ""
+        advisory_note = f"  [advisory: {len(r.advisory_uncovered_words)} uncovered-ink word(s)]" if r.advisory_uncovered_words else ""
+        print(f"wrote   {r.out_path}{note}{geom_note}{advisory_note}")
     for r in collided:
         print(f"COLLISION AVOIDED for {r.packet_tag}: {r.collision_note}")
     for r in deleted:
@@ -336,6 +340,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
         f"{len(held_back)} held back for review, {len(consent_held)} consent-held (no SID), "
         f"{len(pending)} still pending review"
         + (f", {len(deletion_skipped)} deletion(s) skipped (--no-delete)" if deletion_skipped else "")
+    )
+    # Geometry provenance + advisory volume, per this run -- see CLAUDE.md's
+    # "From detection-gates-workflow to human-reviews-everything" section:
+    # whether the uncovered-ink advisory is actually earning its place (real
+    # manual edits track it) or is noise (fires on nearly every write
+    # regardless) is exactly what this line is for.
+    print(
+        f"geometry: {len(written) - len(manual_geometry_writes)} automatic, {len(manual_geometry_writes)} "
+        f"manually edited -- {len(advisory_writes)} write(s) carried an uncovered-ink advisory"
     )
     return 1 if held_back else 0
 

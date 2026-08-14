@@ -99,6 +99,26 @@ noting the override, so it's visible in review_app.py's and cli.py's
 output, not silently indistinguishable from a clean, confidently-detected
 write.
 
+**find_uncovered_group_words' finding is advisory, not a hold (2026-08-14).**
+Real-data evidence, gathered while sizing up review_app.py's general
+per-packet editor (see its own module docstring): across 41 real packets
+this check held back on two teachers (020415, 010406), rendering every
+single flagged region confirmed it was printed body text near the header
+border -- zero genuine uncovered handwriting. Meanwhile, the reviewer now
+opens every packet's own multi-page editor regardless of whether this
+check fires (see CLAUDE.md's "From detection-gates-workflow to human-
+reviews-everything" section) -- a geometric proof with a 0/41 real-world
+true-positive rate is more useful as something to point the reviewer's
+eyes at than as a gate nothing on real data can ever cleanly pass. A
+non-empty `redact_result.uncovered_group_words` is carried onto the
+written `DispositionResult`/`ManualReleaseResult` as `advisory_uncovered_
+words`; it never queues the packet, never blocks a write, and is never
+consulted by `detection_overrides` (there is nothing to override -- it was
+never a hold to begin with). The other three unconditional checks
+(detection confidence, consensus-ink anomaly, verify_no_leaked_names) are
+completely unaffected by this change and still hold exactly as documented
+below.
+
 Packet identity across runs of the *same* source PDF is grounded in the
 packet's first physical page index (see `packet_tag`), not its position in
 the packets list (shifts if an earlier packet's page count changes) or a
@@ -445,6 +465,11 @@ class ManualReleaseResult:
     released: bool
     out_path: Path | None = None
     reason: str | None = None
+    # Advisory only, same as DispositionResult.advisory_uncovered_words --
+    # never refuses a release on its own (see CLAUDE.md's "From detection-
+    # gates-workflow to human-reviews-everything" section).
+    advisory_uncovered_words: list = field(default_factory=list)
+    geometry_source: str = "manual"
 
 
 def release_from_manual_queue(
@@ -541,14 +566,13 @@ def release_from_manual_queue(
         header_bbox_override=header_bbox_override,
         extra_page_regions=extra_page_regions,
     )
-    if redact_result.uncovered_group_words:
-        out_path.unlink()
-        return ManualReleaseResult(
-            packet_tag=tag,
-            sid=sid,
-            released=False,
-            reason=f"still uncovered group-row ink with this geometry: {redact_result.uncovered_group_words}",
-        )
+    # find_uncovered_group_words' finding is advisory only here too, same
+    # as run_dispositions -- see CLAUDE.md's "From detection-gates-workflow
+    # to human-reviews-everything" section. A human is drawing this exact
+    # geometry by hand and looking at the live preview while doing it; a
+    # geometric proof that's zero-for-41 on real held packets shouldn't
+    # refuse to release what the reviewer just confirmed by eye.
+    advisory_uncovered_words = redact_result.uncovered_group_words
     if flagged_regions_to_verify:
         drawn = extra_page_regions or {}
         still_uncovered = [
@@ -585,7 +609,14 @@ def release_from_manual_queue(
             extra_page_regions=extra_page_regions,
             decisions_dir=decisions_dir,
         )
-    return ManualReleaseResult(packet_tag=tag, sid=sid, released=True, out_path=out_path, reason=collision_note)
+    return ManualReleaseResult(
+        packet_tag=tag,
+        sid=sid,
+        released=True,
+        out_path=out_path,
+        reason=collision_note,
+        advisory_uncovered_words=advisory_uncovered_words,
+    )
 
 
 def decisions_path(pdf_path: str | Path, decisions_dir: Path = DECISIONS_DIR) -> Path:
@@ -769,14 +800,23 @@ class HoldAnalysis:
     packet_tag: str
     round_label: str
     detection_hold: bool = False
-    uncovered_ink_hold: bool = False
+    # Advisory only, since 2026-08-14 -- see run_dispositions'
+    # `advisory_uncovered_words` field and CLAUDE.md's "From detection-
+    # gates-workflow to human-reviews-everything" section. Never part of
+    # `clean`'s gating and never gates the consensus/leak checks below it.
+    uncovered_ink_advisory: bool = False
     consensus_hold: bool = False
     leak_hold: bool = False
     reason: str | None = None
 
     @property
     def clean(self) -> bool:
-        return not (self.detection_hold or self.uncovered_ink_hold or self.consensus_hold or self.leak_hold)
+        # uncovered_ink_advisory deliberately excluded -- it no longer
+        # holds a packet back (see run_dispositions), so a packet with
+        # only an advisory finding and nothing else is still "clean" in
+        # the sense that a real run would ship it without human
+        # intervention.
+        return not (self.detection_hold or self.consensus_hold or self.leak_hold)
 
 
 def analyze_redaction_holds(
@@ -790,14 +830,14 @@ def analyze_redaction_holds(
     flatten: bool = False,
 ) -> list[HoldAnalysis]:
     """Read-only redaction analysis: reports which of run_dispositions'
-    four unconditional per-packet checks (detection confidence, uncovered
-    group-row ink, consensus-ink anomaly, verify_no_leaked_names) each
-    packet would trigger, or that it would pass cleanly, WITHOUT ever
-    writing to out_dir, touching decisions, the ledger, or the
+    three unconditional per-packet HOLDS (detection confidence, consensus-
+    ink anomaly, verify_no_leaked_names) each packet would trigger, or that
+    it would pass cleanly, plus whether find_uncovered_group_words'
+    ADVISORY (non-blocking since 2026-08-14, see CLAUDE.md) fires -- all
+    WITHOUT ever writing to out_dir, touching decisions, the ledger, or the
     manual-redaction queue, or deleting anything. Exists so a real,
-    never-before-processed file (see CLAUDE.md's bug #7 trade-off, and its
-    own finding that the trade-off fires far more broadly on real data than
-    first measured) can be sized up before committing to a real run.
+    never-before-processed file (see CLAUDE.md's bug #7 trade-off history)
+    can be sized up before committing to a real run.
 
     Each packet's own redaction is drafted to a scratch file inside a
     TemporaryDirectory removed the instant this function returns -- the
@@ -806,13 +846,15 @@ def analyze_redaction_holds(
     ran, without ever leaving a file sitting on disk anywhere.
 
     Mirrors run_dispositions' own hold precedence exactly -- detection
-    confidence checked first, then uncovered-ink, then consensus-ink
-    anomaly, then a full verify_no_leaked_names pass, each gating the next
-    the same way run_dispositions' `continue`s do -- rather than checking
-    all four independently, so a packet reported here as "held for
-    detection confidence" is the same packet a real run (absent a
-    detection_overrides entry for it) would actually hold for that reason,
-    not a looser union of every check that happens to fire on it.
+    confidence checked first, then consensus-ink anomaly, then a full
+    verify_no_leaked_names pass, each gating the next the same way
+    run_dispositions' `continue`s do -- rather than checking all three
+    independently, so a packet reported here as "held for detection
+    confidence" is the same packet a real run (absent a detection_
+    overrides entry for it) would actually hold for that reason, not a
+    looser union of every check that happens to fire on it. The uncovered-
+    ink advisory is recorded independently of this precedence chain, since
+    it never gates anything.
 
     `consensus_holds` (see consensus.analyze_consensus_anomalies) is
     computed once for the whole file, the same way `round_labels` already
@@ -841,12 +883,11 @@ def analyze_redaction_holds(
             redact_result = _redact_packet(pdf_path, packet, scratch_path, dpi=dpi, flatten=flatten)
             analysis = HoldAnalysis(packet_tag=tag, round_label=labels.get(tag, UNDATED_ROUND))
             tag_holds = consensus.get(tag, [])
+            if redact_result.uncovered_group_words:
+                analysis.uncovered_ink_advisory = True
             if redact_result.band is not None and not redact_result.band.detected:
                 analysis.detection_hold = True
                 analysis.reason = f"header border not confidently detected: {redact_result.band}"
-            elif redact_result.uncovered_group_words:
-                analysis.uncovered_ink_hold = True
-                analysis.reason = f"uncovered group-row ink: {redact_result.uncovered_group_words}"
             elif tag_holds:
                 analysis.consensus_hold = True
                 analysis.reason = "; ".join(h.reason for h in tag_holds)
@@ -873,14 +914,14 @@ def format_hold_analysis_report(results: list[HoldAnalysis]) -> str:
     for label in sorted(by_round):
         group = by_round[label]
         n_detection = sum(1 for r in group if r.detection_hold)
-        n_ink = sum(1 for r in group if r.uncovered_ink_hold)
+        n_ink = sum(1 for r in group if r.uncovered_ink_advisory)
         n_consensus = sum(1 for r in group if r.consensus_hold)
         n_leak = sum(1 for r in group if r.leak_hold)
         n_clean = sum(1 for r in group if r.clean)
         lines.append(
             f"  {label}: {len(group)} packet(s) -- {n_clean} clean, {n_detection} detection-confidence "
-            f"hold(s), {n_ink} uncovered-ink hold(s), {n_consensus} consensus-ink anomaly hold(s), "
-            f"{n_leak} leak hold(s)"
+            f"hold(s), {n_consensus} consensus-ink anomaly hold(s), {n_leak} leak hold(s), "
+            f"{n_ink} carrying a non-blocking uncovered-ink advisory"
         )
     return "\n".join(lines)
 
@@ -932,6 +973,30 @@ class DispositionResult:
     # deleted/pending/held_back/consent_hold) rather than let it go
     # silently unreported.
     deletion_skipped: bool = False
+    # find_uncovered_group_words' own finding, carried onto a WRITTEN
+    # result rather than gating it (2026-08-14 -- see CLAUDE.md's "From
+    # detection-gates-workflow to human-reviews-everything" section).
+    # Real-data evidence: across 41 real packets this check held back on
+    # two teachers, every single one was printed body text near the
+    # header border, zero genuine uncovered handwriting -- and the
+    # reviewer now looks at every page of every packet regardless (see
+    # review_app.py's per-packet editor), so a false-positive-prone
+    # geometric proof is more useful as something to point the reviewer's
+    # eyes at than as a gate nothing can ever pass through cleanly on real
+    # data. Non-empty means the same finding find_uncovered_group_words
+    # always produced; it just no longer holds the packet back on its own
+    # (a consensus-ink anomaly or a verify_no_leaked_names finding still
+    # does -- this is the only one of the four unconditional checks this
+    # applies to).
+    advisory_uncovered_words: list = field(default_factory=list)
+    # "manual" when this write applied a stored correction from
+    # `manual_geometry` (see load_manual_geometry/save_manual_geometry) --
+    # a human has, at some point, opened review_app.py's editor for this
+    # exact packet_tag and the geometry they left behind is what produced
+    # this file. "automatic" (the default) covers every packet nobody has
+    # ever manually edited -- the overwhelming majority. Purely for the
+    # per-run summary (see cli.py/review_app.py); never affects behavior.
+    geometry_source: str = "automatic"
 
 
 def run_dispositions(
@@ -1167,19 +1232,19 @@ def run_dispositions(
                 results.append(DispositionResult(packet_tag=tag, sid=sid, pending=False, held_back=True, reason=reason))
                 continue
             detection_note = f"shipped despite undetected header border (human-approved override): {redact_result.band}"
-        if redact_result.uncovered_group_words:
-            # Geometric proof (see find_uncovered_group_words) that the
-            # redaction rectangles didn't actually cover real Group-row
-            # ink -- independent of, and checked before, the text-based
-            # verify pass below, since this is exactly the class of leak
-            # (real ink, OCR-garbled into a non-matching token) that a
-            # text check alone can miss. Never overridable, detection
-            # override or not: this is a finding of actual uncovered ink in
-            # the pixels, not a confidence question about the geometry.
-            reason = f"uncovered group-row ink: {redact_result.uncovered_group_words}"
-            _queue_for_manual_redaction(out_dir, pdf_path, tag, sid, packet.worksheet_type, reason, out_path)
-            results.append(DispositionResult(packet_tag=tag, sid=sid, pending=False, held_back=True, reason=reason))
-            continue
+        # find_uncovered_group_words' finding is advisory only, not a hold
+        # (2026-08-14 -- see CLAUDE.md's "From detection-gates-workflow to
+        # human-reviews-everything" section). Real-data evidence: across 41
+        # real packets this check held back on two teachers (020415,
+        # 010406), every single one was printed body text near the header
+        # border -- zero genuine uncovered handwriting -- and the reviewer
+        # now looks at every page of every packet via review_app.py's
+        # per-packet editor regardless of whether this check fires. Carried
+        # onto the written result (DispositionResult.advisory_uncovered_
+        # words) so a reviewer or a per-run summary can still see it; it no
+        # longer queues the packet or blocks the write the way a consensus-
+        # ink or verify_no_leaked_names finding still does.
+        advisory_uncovered_words = redact_result.uncovered_group_words
         tag_consensus_holds = consensus_holds.get(tag, [])
         if tag_consensus_holds:
             # Template-agnostic handwriting on a non-header page that only
@@ -1224,6 +1289,8 @@ def run_dispositions(
                 out_path=out_path,
                 reason=detection_note,
                 collision_note=collision_note,
+                advisory_uncovered_words=advisory_uncovered_words,
+                geometry_source="manual" if geometry_kwargs else "automatic",
             )
         )
 

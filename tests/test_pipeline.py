@@ -364,7 +364,7 @@ def test_analyze_redaction_holds_agrees_with_a_real_run_for_a_clean_packet(main_
     analysis = next(r for r in results if r.packet_tag == tag)
     assert analysis.clean
     assert not analysis.detection_hold
-    assert not analysis.uncovered_ink_hold
+    assert not analysis.uncovered_ink_advisory
     assert not analysis.leak_hold
 
     sid = _sid_for(roster, "Jordan Ames")
@@ -703,14 +703,18 @@ def test_detection_override_releases_the_hold_and_writes_the_packet(
     assert "override" in result.reason
 
 
-def test_detection_override_does_not_release_an_uncovered_ink_hold(
+def test_detection_override_releases_despite_an_uncovered_ink_advisory(
     main_fixture, segmented, roster, tmp_path, monkeypatch
 ):
-    """The boundary the fix must not cross: a detection-confidence override
-    only ever answers "is the border confidently located", never "did
-    anything actually leak". A packet that also has real uncovered
-    group-row ink must stay held back even when a human has approved the
-    detection-confidence override for it."""
+    """find_uncovered_group_words' finding is advisory only (2026-08-14,
+    see CLAUDE.md) -- a packet approved for release from the detection-
+    confidence hold must still write even when it also carries an
+    uncovered-ink finding, with that finding surfaced as an advisory on the
+    written result rather than blocking it. (Formerly this scenario stayed
+    held back, back when uncovered-ink was itself a hold; the detection-
+    confidence-vs-verify_no_leaked_names boundary this test used to also
+    guard is still covered separately by
+    test_detection_override_does_not_release_a_verify_leak_hold below.)"""
     import dataclasses
 
     import melredact.pipeline as pipeline_mod
@@ -719,7 +723,7 @@ def test_detection_override_does_not_release_an_uncovered_ink_hold(
     bad_packet = segmented.packets[0]
     bad_tag = packet_tag(main_fixture.pdf_path, bad_packet)
 
-    def fake_undetected_band_with_leak(*args, **kwargs):
+    def fake_undetected_band_with_advisory(*args, **kwargs):
         result = real_redact_packet(*args, **kwargs)
         if packet_tag(main_fixture.pdf_path, args[1]) == bad_tag:
             fake_word = {"text": "Leaked", "x0": 0, "x1": 10, "top": 0, "bottom": 10}
@@ -730,7 +734,7 @@ def test_detection_override_does_not_release_an_uncovered_ink_hold(
             )
         return result
 
-    monkeypatch.setattr(pipeline_mod, "_redact_packet", fake_undetected_band_with_leak)
+    monkeypatch.setattr(pipeline_mod, "_redact_packet", fake_undetected_band_with_advisory)
 
     sid = _sid_for(roster, "Jordan Ames")
     out_dir = tmp_path / "out"
@@ -745,9 +749,11 @@ def test_detection_override_does_not_release_an_uncovered_ink_hold(
     )
 
     result = next(r for r in results if r.packet_tag == bad_tag)
-    assert result.held_back
-    assert result.out_path is None
-    assert "uncovered group-row ink" in result.reason
+    assert not result.held_back
+    assert result.out_path is not None
+    assert result.out_path.exists()
+    assert "override" in result.reason
+    assert result.advisory_uncovered_words
 
 
 def test_detection_override_does_not_release_a_verify_leak_hold(
@@ -859,15 +865,20 @@ def _build_packet14_style_fixture(tmp_path):
     return pdf_path, roster, seg, tag, sid, overflow_top_pt
 
 
-def test_vertical_group_row_overflow_is_auto_held_not_shipped_as_clean(tmp_path):
-    """End-to-end proof for the real PRT packet 14 bug: a packet whose
-    Group-row ink overflows past the header's own detected border must
-    never be written as if clean. This runs the real segment_pdf ->
-    run_dispositions path against a decided packet -- no monkeypatching --
-    the same path a real reviewer's approval goes through, to prove the
-    fix actually reaches run_dispositions and not just find_uncovered_
-    group_words in isolation (see tests/test_redact.py for that unit-level
-    proof)."""
+def test_vertical_group_row_overflow_is_advisory_not_held(tmp_path):
+    """2026-08-14: find_uncovered_group_words' finding is advisory, not a
+    hold (see CLAUDE.md's "From detection-gates-workflow to human-reviews-
+    everything" section -- real-data evidence found zero true positives
+    across 41 real held packets on two teachers, and the reviewer now looks
+    at every page of every packet regardless via review_app.py's per-packet
+    editor). The real PRT packet 14 shape -- Group-row ink overflowing past
+    the header's own detected border -- must still be *flagged*
+    (find_uncovered_group_words itself is unchanged, see test_redact.py's
+    own unit-level regression fixtures for bugs 4/6/7), but it must no
+    longer hold the packet back or queue it: this runs the real
+    segment_pdf -> run_dispositions path against a decided packet -- no
+    monkeypatching -- the same path a real reviewer's approval goes
+    through."""
     from melredact.pipeline import list_manual_queue, output_path
 
     pdf_path, roster, seg, tag, sid, _ = _build_packet14_style_fixture(tmp_path)
@@ -875,71 +886,119 @@ def test_vertical_group_row_overflow_is_auto_held_not_shipped_as_clean(tmp_path)
     results = run_dispositions(pdf_path, seg, {tag: sid}, roster, out_dir=out_dir, dpi=DPI)
     result = next(r for r in results if r.packet_tag == tag)
 
-    assert result.held_back, "vertical group-row overflow must hold the packet back, not ship it as clean"
-    assert "uncovered group-row ink" in result.reason
-    assert result.out_path is None
+    assert not result.held_back, result.reason
+    assert result.out_path is not None
+    assert result.out_path.exists()
+    assert result.advisory_uncovered_words, "the finding itself must still fire -- only its consequence changed"
+    assert result.geometry_source == "automatic"
 
-    # Nothing is present at the real, servable out/ path -- the held-back
-    # draft only exists in the manual-redaction queue, never in out/ itself.
     entry = roster.by_sid[sid]
-    assert not output_path(out_dir, entry, seg.packets[0].worksheet_type, round_label=FIXTURE_ROUND).exists()
-    queued = list_manual_queue(out_dir)
-    assert len(queued) == 1
-    assert queued[0]["packet_tag"] == tag
-    assert queued[0]["sid"] == sid
-    assert "uncovered group-row ink" in queued[0]["reason"]
+    expected_path = output_path(out_dir, entry, seg.packets[0].worksheet_type, round_label=FIXTURE_ROUND)
+    assert result.out_path == expected_path
+    assert list_manual_queue(out_dir) == [], "an advisory finding must never land the packet in the manual queue"
 
 
-def test_manual_queue_release_with_a_corrected_band_writes_and_clears_the_queue(tmp_path):
-    """The backstop working as intended: a human looks at the queued
-    packet 14-style draft, supplies a corrected band whose bottom actually
-    reaches past the overflow ink, and release_from_manual_queue re-checks
-    coverage with that geometry before writing anything -- since it now
-    passes, the file lands in the real out/ tree and the queue entry is
-    cleared."""
+def _detection_hold_fake(pdf_path, bad_tag):
+    """Returns a `_redact_packet` replacement that forces run_dispositions'
+    undetected-header-border hold for exactly `bad_tag`, regardless of what
+    the real detector found -- the reusable pattern the detection_override
+    tests above already use, factored out here so the manual-queue release
+    tests below (which need a genuinely queueable hold, now that
+    uncovered-ink no longer queues anything -- see CLAUDE.md) can force one
+    without depending on the packet14 overflow fixture at all. Apply via
+    `with monkeypatch.context() as mp: mp.setattr(pipeline_mod,
+    "_redact_packet", fake)` so it's active only for the call that needs
+    the forced hold, never for a later release_from_manual_queue call that
+    should see the real, unpatched redact_packet."""
+    import dataclasses
+
+    import melredact.pipeline as pipeline_mod
+
+    real_redact_packet = pipeline_mod._redact_packet
+
+    def fake_undetected_band(*args, **kwargs):
+        result = real_redact_packet(*args, **kwargs)
+        if packet_tag(pdf_path, args[1]) == bad_tag:
+            return dataclasses.replace(result, band=dataclasses.replace(result.band, detected=False))
+        return result
+
+    return fake_undetected_band
+
+
+def test_manual_queue_release_with_a_corrected_band_writes_and_clears_the_queue(
+    main_fixture, segmented, roster, tmp_path, monkeypatch
+):
+    """The backstop working as intended: a packet is genuinely held for
+    detection confidence (forced here, since real-data-informed
+    find_uncovered_group_words no longer queues anything on its own -- see
+    CLAUDE.md), a human supplies a corrected band, and release_from_
+    manual_queue re-checks the packet before writing anything -- since it
+    now passes, the file lands in the real out/ tree and the queue entry
+    is cleared."""
     from melredact.pipeline import list_manual_queue, output_path, release_from_manual_queue
     from melredact.redact import HeaderBand
 
-    pdf_path, roster, seg, tag, sid, overflow_top_pt = _build_packet14_style_fixture(tmp_path)
+    bad_packet = segmented.packets[0]
+    bad_tag = packet_tag(main_fixture.pdf_path, bad_packet)
+    sid = _sid_for(roster, "Jordan Ames")
     out_dir = tmp_path / "out"
-    run_dispositions(pdf_path, seg, {tag: sid}, roster, out_dir=out_dir, dpi=DPI)
+
+    import melredact.pipeline as pipeline_mod
+
+    with monkeypatch.context() as mp:
+        mp.setattr(pipeline_mod, "_redact_packet", _detection_hold_fake(main_fixture.pdf_path, bad_tag))
+        run_dispositions(main_fixture.pdf_path, segmented, {bad_tag: sid}, roster, out_dir=out_dir, dpi=DPI)
     assert len(list_manual_queue(out_dir)) == 1
 
-    corrected_band = HeaderBand(left=38, top=58, right=574, bottom=overflow_top_pt + 20, detected=True)
-    release = release_from_manual_queue(pdf_path, seg.packets[0], tag, sid, roster, corrected_band, out_dir=out_dir, dpi=DPI)
+    corrected_band = HeaderBand(left=38, top=58, right=574, bottom=148, detected=True)
+    release = release_from_manual_queue(
+        main_fixture.pdf_path, bad_packet, bad_tag, sid, roster, corrected_band, out_dir=out_dir, dpi=DPI
+    )
 
     assert release.released, release.reason
     entry = roster.by_sid[sid]
-    expected_path = output_path(out_dir, entry, seg.packets[0].worksheet_type, round_label=FIXTURE_ROUND)
+    expected_path = output_path(out_dir, entry, bad_packet.worksheet_type, round_label=FIXTURE_ROUND)
     assert release.out_path == expected_path
     assert expected_path.exists()
     assert list_manual_queue(out_dir) == []
 
 
-def test_manual_queue_release_with_a_still_insufficient_band_stays_queued(tmp_path):
+def test_manual_queue_release_with_a_geometry_that_still_leaks_the_name_stays_queued(
+    main_fixture, segmented, roster, tmp_path, monkeypatch
+):
     """The boundary that keeps this a backstop, not an override: a human
-    can supply a *wrong* corrected band too (e.g. one that still doesn't
-    reach the overflow ink) -- release_from_manual_queue must refuse to
-    write anything in that case and leave the packet queued, since the
-    coverage check, not the human's say-so alone, is what actually gates a
-    write."""
+    can supply geometry that still fails an unconditional check -- here,
+    verify_no_leaked_names, since a header_bbox_override too small to
+    reach the real Name ink leaves it sitting in the kept text layer.
+    release_from_manual_queue must refuse to write anything in that case
+    and leave the packet queued -- the automated check, not the human's
+    say-so alone, is what actually gates a write (see CLAUDE.md's "Keep
+    verify unchanged and unconditional" -- this is exactly that guarantee,
+    exercised through the manual-editor release path)."""
     from melredact.pipeline import list_manual_queue, output_path, release_from_manual_queue
-    from melredact.redact import HeaderBand
 
-    pdf_path, roster, seg, tag, sid, overflow_top_pt = _build_packet14_style_fixture(tmp_path)
+    bad_packet = segmented.packets[0]
+    bad_tag = packet_tag(main_fixture.pdf_path, bad_packet)
+    sid = _sid_for(roster, "Jordan Ames")
     out_dir = tmp_path / "out"
-    run_dispositions(pdf_path, seg, {tag: sid}, roster, out_dir=out_dir, dpi=DPI)
+
+    import melredact.pipeline as pipeline_mod
+
+    with monkeypatch.context() as mp:
+        mp.setattr(pipeline_mod, "_redact_packet", _detection_hold_fake(main_fixture.pdf_path, bad_tag))
+        run_dispositions(main_fixture.pdf_path, segmented, {bad_tag: sid}, roster, out_dir=out_dir, dpi=DPI)
     assert len(list_manual_queue(out_dir)) == 1
 
-    still_short_band = HeaderBand(left=38, top=58, right=574, bottom=overflow_top_pt - 5, detected=True)
+    tiny = (0.0, 0.0, 1.0, 1.0)
     release = release_from_manual_queue(
-        pdf_path, seg.packets[0], tag, sid, roster, still_short_band, out_dir=out_dir, dpi=DPI
+        main_fixture.pdf_path, bad_packet, bad_tag, sid, roster, None,
+        out_dir=out_dir, dpi=DPI, header_bbox_override=(tiny, tiny),
     )
 
     assert not release.released
-    assert "uncovered group-row ink" in release.reason
+    assert "leaks" in release.reason
     entry = roster.by_sid[sid]
-    assert not output_path(out_dir, entry, seg.packets[0].worksheet_type, round_label=FIXTURE_ROUND).exists()
+    assert not output_path(out_dir, entry, bad_packet.worksheet_type, round_label=FIXTURE_ROUND).exists()
     assert len(list_manual_queue(out_dir)) == 1
 
 
@@ -1021,6 +1080,7 @@ def test_manual_header_region_releases_the_packet_with_the_same_output_shape_as_
         out_dir=out_dir, dpi=DPI, header_bbox_override=header_bbox_override,
     )
     assert release.released, release.reason
+    assert release.geometry_source == "manual"
     entry = roster.by_sid[sid]
     expected_path = output_path(out_dir, entry, seg.packets[0].worksheet_type, round_label=FIXTURE_ROUND)
     assert release.out_path == expected_path
@@ -1029,19 +1089,22 @@ def test_manual_header_region_releases_the_packet_with_the_same_output_shape_as_
     assert verify_no_leaked_names(expected_path, roster) == []
 
 
-def test_manual_header_region_that_leaves_ink_uncovered_keeps_packet_held(tmp_path):
-    """A manually-drawn region that still doesn't reach the real overflow
-    ink must be refused exactly like a bad band correction -- the editor
-    supplies geometry, it never gets to skip the coverage check just
-    because a human drew it."""
+def test_manual_header_region_with_uncovered_ink_still_releases_as_advisory(tmp_path):
+    """2026-08-14: find_uncovered_group_words' finding is advisory, not a
+    hold (see CLAUDE.md). A manually-drawn region that still doesn't reach
+    the real overflow ink must still release the packet -- the finding is
+    carried onto the result (ManualReleaseResult.advisory_uncovered_words),
+    not used to refuse the write. This also demonstrates the editor is
+    reachable for a packet that was never held/queued in the first place
+    -- release_from_manual_queue is called here directly against a packet
+    fresh out of segment_pdf, no prior run_dispositions call at all (see
+    CLAUDE.md's "Make the editor reachable for any packet" section)."""
     from melredact.config import GROUP_ANCHOR
-    from melredact.pipeline import list_manual_queue, release_from_manual_queue
+    from melredact.pipeline import list_manual_queue, output_path, release_from_manual_queue
     from melredact.redact import HeaderBand, redact_bboxes_for_band
 
     pdf_path, roster, seg, tag, sid, overflow_top_pt = _build_packet14_style_fixture(tmp_path)
     out_dir = tmp_path / "out"
-    run_dispositions(pdf_path, seg, {tag: sid}, roster, out_dir=out_dir, dpi=DPI)
-    assert len(list_manual_queue(out_dir)) == 1
 
     still_short_band = HeaderBand(left=38, top=58, right=574, bottom=overflow_top_pt - 5, detected=True)
     header_bbox_override = redact_bboxes_for_band(still_short_band, GROUP_ANCHOR["top"])
@@ -1050,11 +1113,13 @@ def test_manual_header_region_that_leaves_ink_uncovered_keeps_packet_held(tmp_pa
         pdf_path, seg.packets[0], tag, sid, roster, None,
         out_dir=out_dir, dpi=DPI, header_bbox_override=header_bbox_override,
     )
-    assert not release.released
-    assert "uncovered group-row ink" in release.reason
+    assert release.released, release.reason
+    assert release.advisory_uncovered_words, "the finding must still be surfaced, just no longer blocking"
     entry = roster.by_sid[sid]
-    assert not output_path(out_dir, entry, seg.packets[0].worksheet_type, round_label=FIXTURE_ROUND).exists()
-    assert len(list_manual_queue(out_dir)) == 1
+    expected_path = output_path(out_dir, entry, seg.packets[0].worksheet_type, round_label=FIXTURE_ROUND)
+    assert release.out_path == expected_path
+    assert expected_path.exists()
+    assert list_manual_queue(out_dir) == []
 
 
 def test_page_2_region_redacts_page_2_and_leaves_page_1_unchanged(tmp_path):
@@ -1090,6 +1155,106 @@ def test_page_2_region_redacts_page_2_and_leaves_page_1_unchanged(tmp_path):
     assert "lee" not in edited_page2_text.lower()
 
 
+def _build_three_page_page3_name_fixture(tmp_path):
+    """Same shape as _build_two_page_page2_name_fixture, one page deeper:
+    a clean header page (page 1), a plain continuation (page 2), and a
+    third page carrying its own extra handwritten name -- proves the
+    editor (see CLAUDE.md's "Show every page of the packet in the editor"
+    section) reaches a page beyond the first continuation page too, not
+    just page 2 specifically. Fictional names throughout, never real
+    student PII."""
+    from melredact.config import FOOTER_WORKSHEET_TYPE, GROUP_ANCHOR
+    from tests.make_fixture import InvisibleText, PdfBuilder, _write_roster_csv, render_continuation_image, render_header_image
+
+    page1_img = render_header_image(
+        name_text="Taylor Kim",
+        teacher_text="Hannel",
+        group_text="",
+        date_text="10/03/2025",
+        period_text="02",
+        worksheet_type="PRT (01/2024)",
+        page_marker="Page 1 of 3",
+        shade_blank_rows=False,
+    )
+    page2_img = render_continuation_image(worksheet_type="PRT (01/2024)", page_marker="Page 2 of 3", body="(continued)")
+    page3_extra_name = "Casey Diaz"
+    page3_extra_top = 130.0
+    page3_extra_x = 90.0
+    page3_img = render_continuation_image(worksheet_type="PRT (01/2024)", page_marker="Page 3 of 3", body="(continued)")
+
+    page1_items = [
+        InvisibleText("Name:", GROUP_ANCHOR["x0"], 68, 9),
+        InvisibleText("Taylor Kim", 150, 68),
+        InvisibleText("Group members, if any:", GROUP_ANCHOR["x0"], GROUP_ANCHOR["top"], 9),
+        InvisibleText("10/03/2025", 450, 68),
+        InvisibleText("02", 450, 87),
+        InvisibleText("PRT 01 2024", FOOTER_WORKSHEET_TYPE["x0"], FOOTER_WORKSHEET_TYPE["top"], 9),
+        InvisibleText("Page 1 of 3", 513, 747, 9),
+    ]
+    page2_items = [
+        InvisibleText("(continued)", 45, 40),
+        InvisibleText("PRT 01 2024", FOOTER_WORKSHEET_TYPE["x0"], FOOTER_WORKSHEET_TYPE["top"], 9),
+        InvisibleText("Page 2 of 3", 513, 747, 9),
+    ]
+    page3_items = [
+        InvisibleText("(continued)", 45, 40),
+        InvisibleText(page3_extra_name, page3_extra_x, page3_extra_top),
+        InvisibleText("PRT 01 2024", FOOTER_WORKSHEET_TYPE["x0"], FOOTER_WORKSHEET_TYPE["top"], 9),
+        InvisibleText("Page 3 of 3", 513, 747, 9),
+    ]
+    builder = PdfBuilder()
+    builder.add_page(page1_img, page1_items)
+    builder.add_page(page2_img, page2_items)
+    builder.add_page(page3_img, page3_items)
+    pdf_path = tmp_path / "page3name.pdf"
+    builder.save(pdf_path)
+
+    sid = "0204159904"
+    roster_path = tmp_path / "roster.csv"
+    _write_roster_csv(roster_path, [(sid, "Kim", "Taylor"), ("0204159905", "Diaz", "Casey")])
+    roster = load_roster(roster_path)
+    seg = segment_pdf(pdf_path)
+    tag = packet_tag(pdf_path, seg.packets[0])
+    return pdf_path, roster, seg, tag, sid, page3_extra_name, page3_extra_top, page3_extra_x
+
+
+def test_page_3_region_redacts_page_3_and_leaves_other_pages_unchanged(tmp_path):
+    """extra_page_regions must reach a page two continuation pages deep,
+    not just an immediate page 2 -- redacting a name on page 3 must not
+    perturb page 1's or page 2's own output at all (see CLAUDE.md's "Show
+    every page of the packet in the editor" section)."""
+    from melredact.redact import redact_packet
+
+    pdf_path, roster, seg, tag, sid, extra_name, extra_top, extra_x = _build_three_page_page3_name_fixture(tmp_path)
+    packet = seg.packets[0]
+    assert packet.n_pages == 3
+
+    baseline_path = tmp_path / "baseline.pdf"
+    redact_packet(pdf_path, packet, baseline_path, dpi=DPI)
+    import pdfplumber
+
+    with pdfplumber.open(baseline_path) as pdf:
+        baseline_page1_text = pdf.pages[0].extract_text() or ""
+        baseline_page2_text = pdf.pages[1].extract_text() or ""
+        baseline_page3_text = pdf.pages[2].extract_text() or ""
+    assert "diaz" in baseline_page3_text.lower(), "fixture sanity: the extra name must survive when no page-3 region is given"
+
+    page3_bbox = (extra_x - 10, extra_top - 5, extra_x + 200, extra_top + 15)
+    edited_path = tmp_path / "edited.pdf"
+    result = redact_packet(pdf_path, packet, edited_path, dpi=DPI, extra_page_regions={2: [page3_bbox]})
+    assert result.uncovered_group_words == []
+
+    with pdfplumber.open(edited_path) as pdf:
+        edited_page1_text = pdf.pages[0].extract_text() or ""
+        edited_page2_text = pdf.pages[1].extract_text() or ""
+        edited_page3_text = pdf.pages[2].extract_text() or ""
+
+    assert edited_page1_text == baseline_page1_text, "page 1 must be byte-identical to the automatic path's own output"
+    assert edited_page2_text == baseline_page2_text, "page 2 must be byte-identical to the automatic path's own output"
+    assert "diaz" not in edited_page3_text.lower()
+    assert "casey" not in edited_page3_text.lower()
+
+
 def test_reviewer_cannot_supply_a_sid_directly_only_a_name_resolved_through_roster(main_fixture, roster):
     """filter_roster_by_name is the ONLY function review_app.py's manual
     editor (and its pre-existing roster-search expander) uses to turn a
@@ -1107,7 +1272,9 @@ def test_reviewer_cannot_supply_a_sid_directly_only_a_name_resolved_through_rost
 
 
 def test_stored_manual_geometry_reproduces_on_rerun(tmp_path):
-    """A packet a human has already corrected once must reproduce the same
+    """A packet a human has already edited once (via the general editor --
+    see CLAUDE.md's "Make the editor reachable for any packet" section,
+    this packet was never held/queued at all) must reproduce the same
     clean write on a later run without being re-queued or redrawn -- see
     pipeline.py's `manual_geometry` parameter and `save_manual_geometry`."""
     from melredact.config import GROUP_ANCHOR
@@ -1117,8 +1284,6 @@ def test_stored_manual_geometry_reproduces_on_rerun(tmp_path):
     pdf_path, roster, seg, tag, sid, overflow_top_pt = _build_packet14_style_fixture(tmp_path)
     out_dir = tmp_path / "out"
     decisions_dir = tmp_path / "decisions"
-    run_dispositions(pdf_path, seg, {tag: sid}, roster, out_dir=out_dir, dpi=DPI)
-    assert len(list_manual_queue(out_dir)) == 1
 
     corrected_band = HeaderBand(left=38, top=58, right=574, bottom=overflow_top_pt + 20, detected=True)
     header_bbox_override = redact_bboxes_for_band(corrected_band, GROUP_ANCHOR["top"])
@@ -1144,6 +1309,7 @@ def test_stored_manual_geometry_reproduces_on_rerun(tmp_path):
     assert not result.held_back, result.reason
     assert result.out_path == expected_path
     assert expected_path.exists()
+    assert result.geometry_source == "manual"
     assert list_manual_queue(out_dir) == []
 
 
@@ -1166,6 +1332,7 @@ def test_no_manual_geometry_follows_the_existing_automatic_path_unchanged(main_f
     result_a = next(r for r in results_a if r.packet_tag == tag)
     result_b = next(r for r in results_b if r.packet_tag == tag)
     assert not result_a.held_back and not result_b.held_back
+    assert result_a.geometry_source == result_b.geometry_source == "automatic"
     assert result_a.out_path.read_bytes() == result_b.out_path.read_bytes()
 
 

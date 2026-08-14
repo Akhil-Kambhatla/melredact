@@ -29,11 +29,12 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import sys
+import time
 from pathlib import Path
 
 import streamlit as st
 import streamlit.elements.image as _st_image_module
-from PIL import Image
+from PIL import Image, ImageDraw
 
 if not hasattr(_st_image_module, "image_to_url"):
     # streamlit-drawable-canvas 0.9.3's own st_canvas() calls
@@ -74,7 +75,7 @@ from melredact.blocks import (
     round_labels_by_tag,
     save_resolved_block_record,
 )
-from melredact.config import CACHE_DIR, MIN_MARGIN, MIN_SCORE, RENDER_DPI_PREVIEW
+from melredact.config import CACHE_DIR, HEADER_SEARCH_MAX_TOP, MIN_MARGIN, MIN_SCORE, RENDER_DPI_PREVIEW
 from melredact.consensus import ConsensusAnalysis, analyze_consensus_anomalies, format_consensus_report
 from melredact.match import assign_all
 from melredact.pdfio import open_pdf
@@ -95,12 +96,13 @@ from melredact.pipeline import (
 from melredact.redact import (
     Bbox,
     detect_header_band,
+    find_uncovered_group_words,
     redact_bboxes_for_band,
     render_redaction_preview,
     render_region_preview,
 )
 from melredact.roster import Roster, RosterError, filter_roster_by_name, infer_period_from_filename, load_roster
-from melredact.segment import Packet, SegmentResult, extract_header_fields, header_row_height, segment_pdf
+from melredact.segment import Packet, SegmentResult, extract_header_fields, header_row_height, page_words, segment_pdf
 
 DPI = RENDER_DPI_PREVIEW
 
@@ -222,6 +224,19 @@ def _header_fields(pdf_path: str, page_index: int):
 
 
 @st.cache_data(show_spinner=False)
+def _header_words(pdf_path: str, page_index: int):
+    """Cached wrapper around segment.page_words for the header band only --
+    the raw word list find_uncovered_group_words needs to compute the live
+    uncovered-ink advisory as a reviewer drags boxes in the manual editor
+    (see _render_manual_editor). Same disk-cached OCR call segment.py's own
+    field extraction already makes (see CLAUDE.md's "OCR is disk-cached"
+    section), just also cached in memory across Streamlit reruns."""
+    with open_pdf(pdf_path) as pdf:
+        page = pdf.pages[page_index]
+        return page_words(page, (0, 0, page.width, HEADER_SEARCH_MAX_TOP))
+
+
+@st.cache_data(show_spinner=False)
 def _page_image(pdf_path: str, page_index: int, dpi: int) -> Image.Image:
     cache_file = Path(CACHE_DIR) / Path(pdf_path).stem / f"page_{page_index:04d}_{dpi}.png"
     if cache_file.exists():
@@ -339,11 +354,25 @@ def _render_sidebar(
             overridden = [r for r in written if r.reason]
             collided = [r for r in written if r.collision_note]
             deletion_skipped = [r for r in results if r.deletion_skipped]
+            n_manual = sum(1 for r in written if r.geometry_source == "manual")
+            n_advisory = sum(1 for r in written if r.advisory_uncovered_words)
             st.sidebar.success(
                 f"{len(written)} written ({len(collided)} collision(s) avoided), {deleted} deleted, "
                 f"{len(held_back)} held back for review, {len(consent_held)} consent-held (no SID), "
                 f"{pending} still pending review"
                 + (f", {len(deletion_skipped)} deletion(s) skipped (disabled)" if deletion_skipped else "")
+            )
+            # Geometry provenance + advisory volume, per this run -- see
+            # CLAUDE.md's "Make a per-run summary" section. Answers whether
+            # the uncovered-ink advisory (see pipeline.py's
+            # advisory_uncovered_words) is actually earning its place or
+            # should be dropped entirely: if n_advisory tracks real manual
+            # edits over many runs, it's doing something; if it fires on
+            # nearly every write regardless, it's noise a reviewer has
+            # learned to ignore, same as the old hold's false-positive rate.
+            st.sidebar.write(
+                f"Geometry: {len(written) - n_manual} automatic, {n_manual} manually edited -- "
+                f"{n_advisory} write(s) carried an uncovered-ink advisory"
             )
             for r in collided:
                 # A different packet's output already claimed this packet's
@@ -464,6 +493,27 @@ def _canvas_rect_to_bbox(obj: dict, dpi: int) -> Bbox:
     return (left / scale, top / scale, (left + width) / scale, (top + height) / scale)
 
 
+def _advisory_outline_image(image: Image.Image, words: list, dpi: int) -> Image.Image:
+    """Non-destructive: outlines (never fills) each advisory word's own box
+    on a copy of `image`, so a reviewer can see exactly what find_
+    uncovered_group_words flagged without it blocking anything (see
+    pipeline.py's `advisory_uncovered_words` -- 2026-08-14, this check no
+    longer holds a packet back, see CLAUDE.md). Orange, not the redaction
+    boxes' red, so the two are never visually confused."""
+    if not words:
+        return image
+    preview = image.copy()
+    draw = ImageDraw.Draw(preview)
+    scale = dpi / 72.0
+    for w in words:
+        draw.rectangle(
+            [w["x0"] * scale, w["top"] * scale, w["x1"] * scale, w["bottom"] * scale],
+            outline=(255, 140, 0),
+            width=3,
+        )
+    return preview
+
+
 def _seed_manual_regions(
     args: argparse.Namespace, packet: Packet, flagged_regions: dict[str, list] | None = None
 ) -> dict[int, list[Bbox]]:
@@ -500,28 +550,50 @@ def _render_manual_editor(
     roster: Roster,
     packet: Packet,
     tag: str,
-    sid: str,
+    *,
+    default_sid: str | None = None,
     flagged_regions: dict[str, list] | None = None,
 ) -> None:
-    """One queued packet's editor: original page on the left, live redacted
-    result on the right, both at DPI (see review_app.py's own DPI
-    constant). A reviewer drags the corners of the seeded rectangles (see
-    `_seed_manual_regions`) or draws new ones on any page of the packet --
-    a header and a page-2 name are separate regions, so the page selector
-    defaults to page 1 (or the flagged consensus-ink page, when this hold
-    is a consensus-ink anomaly -- see below) but nothing stops a reviewer
-    from switching pages and adding a region there too.
+    """The drag-corner redaction editor, reachable for ANY packet -- not
+    just one the automated checks held back (see CLAUDE.md's "From
+    detection-gates-workflow to human-reviews-everything" section: every
+    new leak variant used to get its own automatic detector; this editor is
+    the general answer instead, since a human already looks at every
+    packet before anything ships). `_render_packet`'s own "Edit redaction"
+    expander opens this with `flagged_regions=None` for an ordinary packet;
+    `_render_manual_queue` opens it with the queue entry's own
+    `flagged_regions` for a packet an automated check actually held.
 
-    Applying goes through `pipeline.release_from_manual_queue`, which
-    re-runs the real redaction and every unconditional check
-    (find_uncovered_group_words, the consensus-ink coverage re-check when
-    `flagged_regions` is set, verify_no_leaked_names) against exactly this
-    geometry -- a region that still leaves ink uncovered keeps the packet
-    held, the editor supplies geometry, it never bypasses any check. A
+    Original page on the left, live redacted result on the right, both at
+    DPI (see review_app.py's own DPI constant). A reviewer drags the
+    corners of the seeded rectangles (see `_seed_manual_regions`, which
+    seeds the header page's own automatically-detected boxes so the common
+    case is nudging what detection already proposed, not drawing from
+    nothing) or draws new ones on any page of the packet -- the page
+    selector below acts as a tab strip, one page at a time, each with its
+    own independent rectangles, so a stray name on page 3 is exactly as
+    reachable as page 1's header.
+
+    find_uncovered_group_words' own finding is shown as an orange advisory
+    outline on the header page (see `_advisory_outline_image`) -- it no
+    longer blocks anything (2026-08-14, see CLAUDE.md), so drawing over it
+    is optional, but the editor still points a reviewer's eyes at it.
+
+    Applying always goes through `pipeline.release_from_manual_queue`
+    (regardless of whether this packet was ever queued -- it's a no-op to
+    clear a queue entry that doesn't exist), which re-runs the real
+    redaction and the checks that still gate a write (consensus-ink
+    coverage when `flagged_regions` is set, verify_no_leaked_names) against
+    exactly this geometry. The decision itself is recorded via `_confirm`
+    right alongside the release, whether or not the release actually
+    succeeds -- this is what keeps "present in out/" iff "has a confirmed
+    decision" true (see pipeline.py's module docstring) even for a packet
+    that was never separately run through "Confirm decision" first; editing
+    and applying a redaction IS the review decision for that packet. A
     reviewer resolves the student by typing their NAME (see
     `filter_roster_by_name`) -- there is no field anywhere in this editor
-    that accepts a SID directly, since a mistyped digit would be a
-    silently wrong assignment nothing downstream could catch."""
+    that accepts a SID directly, since a mistyped digit would be a silently
+    wrong assignment nothing downstream could catch."""
     regions_key = f"mq_regions_{tag}"
     if regions_key not in st.session_state:
         st.session_state[regions_key] = _seed_manual_regions(args, packet, flagged_regions)
@@ -548,7 +620,10 @@ def _render_manual_editor(
 
     current_boxes = regions.get(page_offset, [])
     page_idx = packet.page_indices[page_offset]
+    render_start = time.perf_counter()
     raw_image = _page_image(args.pdf_path, page_idx, DPI)
+    render_elapsed = time.perf_counter() - render_start
+    st.caption(f"Page rendered in {render_elapsed * 1000:.0f} ms" + (" (cached)" if render_elapsed < 0.05 else ""))
 
     mode_label = st.radio(
         "Tool",
@@ -580,16 +655,27 @@ def _render_manual_editor(
         current_boxes = [_canvas_rect_to_bbox(o, DPI) for o in objs]
         regions[page_offset] = current_boxes
 
+    header_bbox_override: tuple[Bbox, Bbox] | None = None
+    if page_offset == header_offset and len(current_boxes) >= 2:
+        header_bbox_override = (current_boxes[0], current_boxes[1])
+    elif page_offset == header_offset and len(current_boxes) == 1:
+        header_bbox_override = (current_boxes[0], current_boxes[0])
+
+    advisory_words: list = []
+    if page_offset == header_offset and header_bbox_override is not None:
+        header_fields = _header_fields(args.pdf_path, page_idx)
+        header_words = _header_words(args.pdf_path, page_idx)
+        advisory_words = find_uncovered_group_words(
+            header_words, header_fields.anchors, header_bbox_override[0], header_bbox_override[1]
+        )
+
     with col_preview:
         st.caption("Redacted result (live preview)")
-        stamp_lines = _stamp_lines_for(sid, roster) if sid in roster else None
+        stamp_lines = _stamp_lines_for(default_sid, roster) if default_sid in roster else None
         if page_offset == header_offset:
-            if len(current_boxes) == 0:
+            if header_bbox_override is None:
                 st.image(raw_image, caption="No regions drawn yet on the header page")
             else:
-                header_bbox_override = (
-                    (current_boxes[0], current_boxes[1]) if len(current_boxes) >= 2 else (current_boxes[0], current_boxes[0])
-                )
                 preview_image, _ = render_redaction_preview(
                     raw_image, dpi=DPI, stamp_lines=stamp_lines, header_bbox_override=header_bbox_override
                 )
@@ -598,8 +684,21 @@ def _render_manual_editor(
             preview_image = render_region_preview(raw_image, dpi=DPI, bboxes=current_boxes)
             st.image(preview_image, caption="Preview with your drawn regions" if current_boxes else "No regions drawn on this page")
 
+    if advisory_words:
+        st.warning(
+            f"Advisory (not blocking): find_uncovered_group_words flagged {len(advisory_words)} word(s) "
+            "near the Group row your drawn boxes don't cover -- outlined in orange below. Real-data "
+            "evidence says this is usually printed body text near the header border, not missed "
+            "handwriting (see CLAUDE.md), so it no longer holds the packet -- but take a look before "
+            "applying."
+        )
+        st.image(
+            _advisory_outline_image(raw_image, advisory_words, DPI),
+            caption="Advisory: possible uncovered ink (orange outline, not blocking)",
+        )
+
     st.write("Resolve the student by name — never by typing a SID directly:")
-    default_query = roster.by_sid[sid].full_name if sid in roster else ""
+    default_query = roster.by_sid[default_sid].full_name if default_sid in roster else ""
     name_query = st.text_input("Student name", value=default_query, key=f"mq_name_{tag}")
     matches = filter_roster_by_name(roster, name_query)
     resolved_sid: str | None = None
@@ -623,13 +722,13 @@ def _render_manual_editor(
 
     apply_disabled = resolved_sid is None or not worksheet_type_value.strip()
     if st.button("Apply manual redaction", type="primary", key=f"mq_apply_{tag}", disabled=apply_disabled):
-        header_bbox_override: tuple[Bbox, Bbox] | None = None
+        final_header_bbox_override: tuple[Bbox, Bbox] | None = None
         extra_page_regions: dict[int, list[Bbox]] = {}
         for offset, boxes in regions.items():
             if not boxes:
                 continue
             if offset == header_offset:
-                header_bbox_override = (boxes[0], boxes[1]) if len(boxes) >= 2 else (boxes[0], boxes[0])
+                final_header_bbox_override = (boxes[0], boxes[1]) if len(boxes) >= 2 else (boxes[0], boxes[0])
             else:
                 extra_page_regions[offset] = boxes
 
@@ -637,6 +736,12 @@ def _render_manual_editor(
         if worksheet_type_value.strip() != (packet.worksheet_type or ""):
             packet_for_release = dataclasses.replace(packet, worksheet_type=worksheet_type_value.strip())
 
+        # Drawing and applying a redaction IS the review decision for this
+        # packet -- record it the same way "Confirm decision" would,
+        # whether or not the release below actually succeeds, so this
+        # packet is never left silently un-decided just because a reviewer
+        # used the editor instead of the ordinary radio+Confirm flow.
+        _confirm(args.pdf_path, args.decisions_dir, tag, resolved_sid)
         result = release_from_manual_queue(
             args.pdf_path,
             packet_for_release,
@@ -646,12 +751,14 @@ def _render_manual_editor(
             None,
             out_dir=Path(args.out_dir),
             decisions_dir=Path(args.decisions_dir),
-            header_bbox_override=header_bbox_override,
+            header_bbox_override=final_header_bbox_override,
             extra_page_regions=extra_page_regions or None,
             flagged_regions_to_verify=flagged_regions,
         )
         if result.released:
             st.success(f"Released {tag} -> {result.out_path}")
+            if result.advisory_uncovered_words:
+                st.info(f"Shipped with {len(result.advisory_uncovered_words)} advisory uncovered-ink region(s) noted.")
             del st.session_state[regions_key]
             st.rerun()
         else:
@@ -691,7 +798,9 @@ def _render_manual_queue(args: argparse.Namespace, roster: Roster, packet_by_tag
                     draft_image = pdf.pages[0].to_image(resolution=DPI).original.convert("RGB")
                 st.image(draft_image, caption="Drafted redaction attempt that was held back -- not safe to ship as is")
 
-            _render_manual_editor(args, roster, packet, tag, sid, flagged_regions=entry.get("flagged_regions"))
+            _render_manual_editor(
+                args, roster, packet, tag, default_sid=sid, flagged_regions=entry.get("flagged_regions")
+            )
 
 
 def _render_packet(
@@ -726,6 +835,7 @@ def _render_packet(
             "confirmed non-consent) overrides this hold."
         )
 
+    selected_sid: str | None = st.session_state.decisions.get(tag)
     if packet.header_page_index is None:
         st.info("No header page for this packet (orphan continuation page).")
         candidate_options: list[tuple[str, str | None]] = []
@@ -752,7 +862,10 @@ def _render_packet(
         selected_label = st.session_state.get(f"decision_{tag}", all_options_preview[default_index_preview][0])
         selected_sid = dict(all_options_preview).get(selected_label, default_sid_preview)
 
+        render_start = time.perf_counter()
         raw_image = _page_image(args.pdf_path, packet.header_page_index, DPI)
+        render_elapsed = time.perf_counter() - render_start
+        st.caption(f"Packet rendered in {render_elapsed * 1000:.0f} ms" + (" (cached)" if render_elapsed < 0.05 else ""))
         stamp_lines = _stamp_lines_for(selected_sid, roster)
         preview_image, band = render_redaction_preview(raw_image, dpi=DPI, anchors=fields.anchors, stamp_lines=stamp_lines)
         if not band.detected:
@@ -850,6 +963,34 @@ def _render_packet(
         st.caption(f"Recorded: {_decision_label(current, roster)}")
     else:
         st.caption("Recorded: pending (not yet reviewed)")
+
+    # Reachable for ANY packet, held or not -- see CLAUDE.md's "From
+    # detection-gates-workflow to human-reviews-everything" section. The
+    # automatic geometry (or, for a currently-queued packet, the flagged
+    # region an automated check held it for) is seeded as the starting
+    # rectangles, so the common case -- automatic detection already got it
+    # right -- is one glance at the preview and a single Apply click, not a
+    # from-scratch drawing exercise. Placed after the ordinary Decision
+    # radio/Confirm buttons rather than before them so this stays an
+    # advanced/fallback path a reviewer opts into, not something that
+    # visually competes with the one-click "looks right, confirm" flow that
+    # covers the overwhelming majority of packets.
+    queued_entry = next(
+        (e for e in list_manual_queue(args.out_dir) if e["pdf_path"] == str(Path(args.pdf_path)) and e["packet_tag"] == tag),
+        None,
+    )
+    expander_label = "✏️ Edit redaction (manual)"
+    if queued_entry is not None:
+        expander_label += " -- currently held: " + queued_entry["reason"]
+    with st.expander(expander_label, expanded=queued_entry is not None):
+        _render_manual_editor(
+            args,
+            roster,
+            packet,
+            tag,
+            default_sid=selected_sid,
+            flagged_regions=queued_entry.get("flagged_regions") if queued_entry is not None else None,
+        )
 
 
 def _resolve_class_period(args: argparse.Namespace) -> int | None:
@@ -1065,6 +1206,34 @@ def main() -> None:
         round_labels,
         output_round_disagreeing,
     )
+    _prefetch_next_packet(args, tags, packet_by_tag, tag)
+
+
+def _prefetch_next_packet(
+    args: argparse.Namespace, tags: list[str], packet_by_tag: dict[str, Packet], current_tag: str
+) -> None:
+    """Renders the next packet's own pages into `_page_image`'s cache
+    (disk-backed, see CACHE_DIR) before this script run ends, so a
+    reviewer clicking Next lands on already-rendered images instead of
+    paying the render cost live -- see CLAUDE.md's "Make the editor fast
+    enough to use 46 times in a sitting" section. Streamlit reruns
+    synchronously, so this doesn't run concurrently with the reviewer's own
+    time on the current packet, but it does mean the *next* click's render
+    cost is paid now, while the current packet is already on screen,
+    rather than after the click -- the only prefetch shape available
+    without introducing a separate worker thread/process. Best-effort:
+    swallowed exceptions here must never break the packet actually on
+    screen, and a page that fails to prefetch just renders live on demand
+    when the reviewer actually gets to it."""
+    i = tags.index(current_tag)
+    if i + 1 >= len(tags):
+        return
+    next_packet = packet_by_tag[tags[i + 1]]
+    try:
+        for page_idx in next_packet.page_indices:
+            _page_image(args.pdf_path, page_idx, DPI)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
