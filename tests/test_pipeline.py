@@ -10,11 +10,13 @@ from melredact.pipeline import (
     format_hold_analysis_report,
     load_decisions,
     load_detection_overrides,
+    load_orientation_overrides,
     output_path,
     packet_tag,
     propose_all,
     run_dispositions,
     save_decisions,
+    save_orientation_overrides,
 )
 from melredact.roster import load_roster
 from melredact.segment import segment_pdf
@@ -665,29 +667,65 @@ def test_undetected_header_border_holds_back_only_that_packet_not_the_whole_run(
     assert good_result.out_path.exists()
 
 
-def test_180_degree_rotated_header_page_redacts_correctly_end_to_end(main_fixture, roster, tmp_path):
+def test_180_degree_rotated_header_page_is_held_pending_confirmation_end_to_end(main_fixture, roster, tmp_path):
+    """Detect-and-ask (2026-08-14, see orientation.py's own module
+    docstring and CLAUDE.md's rotation-audit correction): a confident but
+    unconfirmed nonzero rotation is never auto-applied, even at 180
+    degrees where the old auto-apply design would have silently corrected
+    it. segment_pdf reads the still-rotated page exactly as found, and
+    run_dispositions refuses it via the ordinary "unresolved issues" gate
+    -- no separate hold mechanism needed. See the sibling test below for
+    the human-confirmed path that actually ships."""
+    rotated_path = build_rotated_page_copy(main_fixture.pdf_path, tmp_path, 0, 180, "rotated_180_unconfirmed.pdf")
+
+    seg = segment_pdf(rotated_path)
+    packet_with_page0 = next(p for p in seg.packets if 0 in p.page_indices)
+    assert any("page 0: orientation detected as rotated 180" in i for i in packet_with_page0.issues)
+    assert any("not yet confirmed by a reviewer" in i for i in packet_with_page0.issues)
+
+    tag = packet_tag(rotated_path, packet_with_page0)
+    sid = _sid_for(roster, "Jordan Ames")
+
+    out_dir = tmp_path / "out"
+    results = run_dispositions(rotated_path, seg, {tag: sid}, roster, out_dir=out_dir, dpi=DPI)
+    result = next(r for r in results if r.packet_tag == tag)
+    assert result.held_back
+    assert "orientation detected as rotated 180" in result.reason
+    assert result.out_path is None
+
+
+def test_180_degree_rotated_header_page_redacts_correctly_once_a_human_confirms_the_rotation(
+    main_fixture, roster, tmp_path
+):
     """Regression for the real incident this session audited: two real
     pages in data/PRT/010406_PD1_PRT.pdf are rotated a clean 180 degrees
     by a duplex-scanner flip (see CLAUDE.md's page-orientation section).
     Before orientation normalization existed, detect_header_band/
     locate_header_anchors assumed an upright page and would cover the
-    wrong region on a rotated one. tests/test_orientation.py already
-    proves normalize_pdf + redact_packet handle this correctly in
-    isolation; this proves it through the actual production path
-    (segment_pdf -> run_dispositions), the same path a real run uses,
-    with no monkeypatching."""
-    rotated_path = build_rotated_page_copy(main_fixture.pdf_path, tmp_path, 0, 180, "rotated_180_pipeline.pdf")
+    wrong region on a rotated one. A human's override -- the same shape
+    review_app.py's rotate controls persist via pipeline.save_orientation_
+    overrides -- makes this packet processable and redacts it correctly,
+    through the actual production path (segment_pdf -> run_dispositions),
+    the same path a real run uses, with no monkeypatching."""
+    rotated_path = build_rotated_page_copy(main_fixture.pdf_path, tmp_path, 0, 180, "rotated_180_confirmed.pdf")
+    overrides = {0: 180}
 
-    seg = segment_pdf(rotated_path)
+    save_orientation_overrides(rotated_path, overrides, decisions_dir=tmp_path / "decisions")
+    reloaded = load_orientation_overrides(rotated_path, decisions_dir=tmp_path / "decisions")
+    assert reloaded == overrides
+
+    seg = segment_pdf(rotated_path, orientation_overrides=reloaded)
     header_packet = seg.packets[0]
     assert header_packet.header_page_index == 0
-    assert not any("page 0: orientation" in issue for issue in header_packet.issues)
+    assert not any("orientation" in issue for issue in header_packet.issues)
 
     tag = packet_tag(rotated_path, header_packet)
     sid = _sid_for(roster, "Jordan Ames")
 
     out_dir = tmp_path / "out"
-    results = run_dispositions(rotated_path, seg, {tag: sid}, roster, out_dir=out_dir, dpi=DPI)
+    results = run_dispositions(
+        rotated_path, seg, {tag: sid}, roster, out_dir=out_dir, dpi=DPI, orientation_overrides=reloaded
+    )
     result = next(r for r in results if r.packet_tag == tag)
 
     assert not result.held_back, result.reason
@@ -697,6 +735,35 @@ def test_180_degree_rotated_header_page_redacts_correctly_end_to_end(main_fixtur
     from melredact.redact import verify_no_leaked_names
 
     assert verify_no_leaked_names(result.out_path, roster) == []
+
+
+def test_orientation_override_persists_and_reproduces_on_rerun(main_fixture, tmp_path):
+    """A human's rotation choice, once saved via pipeline.save_orientation_
+    overrides, must reproduce the identical resolved orientation on a
+    later, independent load -- the same "record it once, never ask again"
+    contract detection_overrides/manual_geometry already provide, applied
+    to orientation.py's own sidecar (decisions/<pdf-stem>.orientation.json)."""
+    from melredact.orientation import normalize_pdf
+
+    rotated_path = build_rotated_page_copy(main_fixture.pdf_path, tmp_path, 0, 90, "rotated_90_persist.pdf")
+    decisions_dir = tmp_path / "decisions"
+
+    assert load_orientation_overrides(rotated_path, decisions_dir=decisions_dir) == {}
+    save_orientation_overrides(rotated_path, {0: 90}, decisions_dir=decisions_dir)
+
+    reloaded = load_orientation_overrides(rotated_path, decisions_dir=decisions_dir)
+    assert reloaded == {0: 90}
+
+    first = normalize_pdf(rotated_path, overrides=reloaded)
+    assert first.pages[0].applied_angle == 90
+    assert first.pages[0].source == "human"
+
+    # A completely independent reload of the sidecar (simulating a fresh
+    # `cli.py run`/Streamlit session) must resolve to the exact same thing.
+    second_overrides = load_orientation_overrides(rotated_path, decisions_dir=decisions_dir)
+    second = normalize_pdf(rotated_path, overrides=second_overrides)
+    assert second.pages[0].applied_angle == 90
+    assert second.normalized_path == first.normalized_path
 
 
 def test_detection_override_releases_the_hold_and_writes_the_packet(
@@ -1195,6 +1262,135 @@ def test_page_2_region_redacts_page_2_and_leaves_page_1_unchanged(tmp_path):
     assert edited_page1_text == baseline_page1_text, "page 1 must be byte-identical to the automatic path's own output"
     assert "morgan" not in edited_page2_text.lower()
     assert "lee" not in edited_page2_text.lower()
+
+
+def _build_two_page_two_names_on_page2_fixture(tmp_path):
+    """Same shape as _build_two_page_page2_name_fixture, but page 2 carries
+    TWO extra handwritten names at well-separated positions -- the real
+    shape the manual editor's canvas needs to redact with two independently
+    drawn rectangles on the same page (see the drag-corner editor's own
+    "draw multiple rectangles" requirement), not the one-region-per-page
+    shape every existing extra_page_regions test covers. Fictional names
+    throughout, never real student PII."""
+    from melredact.config import FOOTER_WORKSHEET_TYPE, GROUP_ANCHOR
+    from tests.make_fixture import InvisibleText, PdfBuilder, _write_roster_csv, render_continuation_image, render_header_image
+
+    page1_img = render_header_image(
+        name_text="Jamie Chen",
+        teacher_text="Hannel",
+        group_text="",
+        date_text="10/03/2025",
+        period_text="02",
+        worksheet_type="PRT (01/2024)",
+        page_marker="Page 1 of 2",
+        shade_blank_rows=False,
+    )
+    name_a, top_a, x_a = "Morgan Lee", 120.0, 100.0
+    name_b, top_b, x_b = "Priya Osei", 400.0, 300.0
+    page2_img = render_continuation_image(worksheet_type="PRT (01/2024)", page_marker="Page 2 of 2", body="(continued)")
+
+    page1_items = [
+        InvisibleText("Name:", GROUP_ANCHOR["x0"], 68, 9),
+        InvisibleText("Jamie Chen", 150, 68),
+        InvisibleText("Group members, if any:", GROUP_ANCHOR["x0"], GROUP_ANCHOR["top"], 9),
+        InvisibleText("10/03/2025", 450, 68),
+        InvisibleText("02", 450, 87),
+        InvisibleText("PRT 01 2024", FOOTER_WORKSHEET_TYPE["x0"], FOOTER_WORKSHEET_TYPE["top"], 9),
+        InvisibleText("Page 1 of 2", 513, 747, 9),
+    ]
+    page2_items = [
+        InvisibleText("(continued)", 45, 40),
+        InvisibleText(name_a, x_a, top_a),
+        InvisibleText(name_b, x_b, top_b),
+        InvisibleText("PRT 01 2024", FOOTER_WORKSHEET_TYPE["x0"], FOOTER_WORKSHEET_TYPE["top"], 9),
+        InvisibleText("Page 2 of 2", 513, 747, 9),
+    ]
+    builder = PdfBuilder()
+    builder.add_page(page1_img, page1_items)
+    builder.add_page(page2_img, page2_items)
+    pdf_path = tmp_path / "page2twonames.pdf"
+    builder.save(pdf_path)
+
+    sid = "0204159906"
+    roster_path = tmp_path / "roster.csv"
+    _write_roster_csv(roster_path, [(sid, "Chen", "Jamie"), ("0204159907", "Lee", "Morgan"), ("0204159908", "Osei", "Priya")])
+    roster = load_roster(roster_path)
+    seg = segment_pdf(pdf_path)
+    tag = packet_tag(pdf_path, seg.packets[0])
+    return pdf_path, roster, seg, tag, sid, (name_a, top_a, x_a), (name_b, top_b, x_b)
+
+
+def test_two_rectangles_on_one_page_both_redact_their_intended_regions(tmp_path):
+    """The manual editor draws one fabric.js rect per click-and-drag, and a
+    reviewer draws as many as the page needs -- redact_packet's
+    extra_page_regions already accepts a *list* of Bbox per page offset,
+    but no existing test actually exercises two independently-positioned
+    regions landing on the same page at once. Both names must be gone,
+    and each region must not accidentally cover (or miss) the other's ink."""
+    from melredact.redact import redact_packet, verify_no_leaked_names
+
+    pdf_path, roster, seg, tag, sid, (name_a, top_a, x_a), (name_b, top_b, x_b) = (
+        _build_two_page_two_names_on_page2_fixture(tmp_path)
+    )
+    packet = seg.packets[0]
+
+    bbox_a = (x_a - 10, top_a - 5, x_a + 200, top_a + 15)
+    bbox_b = (x_b - 10, top_b - 5, x_b + 200, top_b + 15)
+    out_path = tmp_path / "redacted.pdf"
+    result = redact_packet(pdf_path, packet, out_path, dpi=DPI, extra_page_regions={1: [bbox_a, bbox_b]})
+    assert result.uncovered_group_words == []
+
+    import pdfplumber
+
+    with pdfplumber.open(out_path) as pdf:
+        page2_text = (pdf.pages[1].extract_text() or "").lower()
+    assert "morgan" not in page2_text
+    assert "lee" not in page2_text
+    assert "priya" not in page2_text
+    assert "osei" not in page2_text
+    assert verify_no_leaked_names(out_path, roster) == []
+
+
+def test_resized_rectangle_redacts_its_new_bounds_not_original(tmp_path):
+    """A reviewer drags a corner handle to enlarge a seeded rectangle so it
+    actually reaches ink past its original bounds -- review_app.py's own
+    _canvas_rect_to_bbox folds fabric.js's scaleX/scaleY into the
+    recovered bbox (see test_canvas_rect_to_bbox_folds_in_scalex_scaley_
+    for_a_resized_object), but nothing end-to-end proves the *redaction*
+    actually uses the resized region rather than silently falling back to
+    the rectangle's own pre-resize width/height. Built so the original,
+    un-resized box (just the name's own first few characters) leaves ink
+    exposed, and only the resized box (scaleX/scaleY > 1, reaching the
+    rest of the word) covers all of it."""
+    import review_app
+    from melredact.redact import redact_packet, verify_no_leaked_names
+
+    pdf_path, roster, seg, tag, sid, extra_name, extra_top, extra_x = _build_two_page_page2_name_fixture(tmp_path)
+    packet = seg.packets[0]
+
+    original_bbox = (extra_x - 10, extra_top - 5, extra_x + 20, extra_top + 15)  # deliberately too narrow to cover "Morgan Lee"
+    baseline_path = tmp_path / "baseline.pdf"
+    redact_packet(pdf_path, packet, baseline_path, dpi=DPI, extra_page_regions={1: [original_bbox]})
+    import pdfplumber
+
+    with pdfplumber.open(baseline_path) as pdf:
+        baseline_text = (pdf.pages[1].extract_text() or "").lower()
+    assert "lee" in baseline_text, "fixture sanity: the original, un-resized bbox must leave part of the name exposed"
+
+    canvas_rect = review_app._bbox_to_canvas_rect(original_bbox, review_app.DPI)
+    canvas_rect["scaleX"] = 5.0
+    canvas_rect["scaleY"] = 2.0
+    resized_bbox = review_app._canvas_rect_to_bbox(canvas_rect, review_app.DPI)
+    assert resized_bbox != original_bbox
+
+    resized_path = tmp_path / "resized.pdf"
+    result = redact_packet(pdf_path, packet, resized_path, dpi=DPI, extra_page_regions={1: [resized_bbox]})
+    assert result.uncovered_group_words == []
+    with pdfplumber.open(resized_path) as pdf:
+        resized_text = (pdf.pages[1].extract_text() or "").lower()
+    assert "morgan" not in resized_text
+    assert "lee" not in resized_text
+    assert verify_no_leaked_names(resized_path, roster) == []
 
 
 def _build_three_page_page3_name_fixture(tmp_path):

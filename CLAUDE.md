@@ -3254,6 +3254,329 @@ as shared fixture infrastructure, since a second test module now needs
 the identical construction — `test_orientation.py`'s own tests are
 otherwise unchanged and still pass.
 
+## Detect-and-ask orientation, a packet-context page stack, and a canvas fix that bakes interactivity into the object JSON (2026-08-14)
+
+**Motivation: the reviewer using the UI against the real October 2025
+010406 round found it unusable in three independent ways** — the
+orientation detector seemed to be guessing wrong on `010406_PD1_PRT.pdf`
+pages p084/p085, there was no way to rotate a page by hand at all (the
+existing rotate controls did nothing), and the manual-redaction canvas
+could draw one box and move it but not resize it or draw a second. All
+three were diagnosed and fixed this session; the first diagnosis produced
+a real correction to the premise it started from, documented plainly
+below rather than glossed over.
+
+### Correction: p084/p085 were not a false positive
+
+**Diagnosed directly, not assumed: rendered both pages at their raw,
+as-scanned orientation and at the detector's corrected orientation, saved
+to `out/.diagnostics/orientation_p084_p085/` for direct inspection
+(deleted after review — a diagnostic render of real scanned pages is
+exactly as identifiable as the scan itself, same posture as every other
+real-page render this file already documents cleaning up after itself).**
+Both raw renders are genuinely, unambiguously upside-down — legible only
+once flipped. `pikepdf` confirms `/Rotate` is `0` on both pages (and on
+their neighbors) in both the original file and the xref-repaired copy —
+no metadata compensation exists anywhere that could make a normal PDF
+viewer show them upright while this pipeline's own raster-based detector
+sees them rotated. The classifier's confidence — 0.9238 (p084) and 0.9252
+(p085) — sits in the exact same 0.91–0.93 band as every one of the other
+174 real pages in this codebase's existing rotation audit, correct ones
+included. The corrected (180°-rotated) render of p085 is a perfectly
+legible, upright header page: Name "Gio Barisciano", Teacher "Talbert",
+Date "10/24/25", Period "1/HR". **The detector was right; these two real
+pages genuinely are rotated 180 degrees**, consistent with this file's own
+earlier-documented finding (see "The 010406 October 2025 round audit..."
+above) that the same two pages hold the already-recovered header page
+`010406_PD1_PRT_p085` and its orphaned continuation `_p084`.
+
+**That finding does not make the requested redesign moot — it's the
+actual reason detect-and-ask is the right design, not detect-and-apply
+with a higher number.** The whole premise of "raise the confidence
+threshold" is that a wrong guess scores lower than a right one. It
+doesn't, on any real page measured so far: p084/p085 (both correct) score
+0.9238/0.9252, and every other real page (also correct, per the existing
+176-page audit) scores 0.91–0.93 too. There is no headroom in that band to
+place a threshold that would separate a right guess from a wrong one —
+raising `ORIENTATION_MIN_SCORE` anywhere within its current gap (0.6 up to
+just under 0.91) changes nothing about which real pages auto-rotate, since
+none of them fall in that range. Derived honestly from the data actually
+available, "a confidence threshold above which auto-apply is safe" has one
+answer for a nonzero rotation: none — the score cannot tell a right guess
+from a wrong one, so a human has to.
+
+### The redesign: three outcomes per page, not two
+
+`melredact/orientation.py` (see its own, substantially rewritten module
+docstring) now resolves each page to one of three outcomes instead of
+auto-applying any confident classification:
+
+1. **`angle == 0` and confident** — nothing to get wrong, proceeds
+   automatically, unchanged from before.
+2. **Confident and `angle != 0`** — held for a human to confirm or
+   correct (`PageOrientation.needs_confirmation`), never silently rotated.
+3. **Not confident at all** (e.g. a blank page, ~0.26 in the real audit)
+   — held with no guess to show, same as before, just now sharing the
+   detect-and-ask vocabulary rather than a separate code path.
+
+Outcomes 2 and 3 both surface as `segment.segment_pdf` `packet.issues`
+entries naming the page — reusing the existing "packet with unresolved
+issues is refused" gate in `pipeline.run_dispositions` rather than
+inventing a parallel hold mechanism, exactly the same "abstain and flag,
+never guess" posture this codebase already applies everywhere else. Their
+wording differs so a reviewer knows which case they're in: outcome 2 names
+the detector's own guessed angle and score ("orientation detected as
+rotated 180° (confidence 0.92) but not yet confirmed by a reviewer -- use
+the rotate control to confirm or correct..."); outcome 3 says the
+orientation "could not be confidently determined" with no guess attached.
+
+**A human's override always wins, for any page — confirming the
+detector's guess, correcting it, or rotating a page the detector never
+flagged at all** (`orientation.resolve_pages`, `PageOrientation.source ==
+"human"`). A human-sourced page skips the skew/confidence checks entirely
+— a person who rotated a page and looked at the result has already made
+the judgment those checks only approximate. Overrides are `dict[page_index
+-> 0/90/180/270]`, persisted to `decisions/<pdf-stem>.orientation.json`
+(`pipeline.orientation_overrides_path`/`load_orientation_overrides`/
+`save_orientation_overrides`, mirroring `overrides_path`/`manual_geometry_
+path`'s existing sidecar pattern exactly — a separate file from
+`decisions_path` itself, same reasoning: that file's `sid | None | absent`
+three-state contract shouldn't carry anything else) so a re-run reproduces
+the exact same correction without asking again.
+
+**Persistence, split into two independently-cached layers so an override
+never forces a re-classification.** The classifier's own raw per-page
+output (`PageDetection`) is cached purely by the source file's content
+hash, as before. The *resolved* result (which combines detections with
+whatever override set was supplied, and — only when a rotation actually
+needs to change — the pikepdf resave) is cached by content hash *plus* a
+fingerprint of the override set (`orientation._overrides_fingerprint`,
+`_cache_paths`), so trying a different override, or clearing one, costs a
+cheap re-resolution and at most one resave, never a re-run of PaddleOCR's
+classifier.
+
+### Threading `orientation_overrides` through the pipeline: plumbing, not an algorithm change
+
+A human's rotation choice has to reach segmentation, OCR, matching, and
+redaction identically, not just a preview — otherwise a page one module
+sees as upright and another still sees as rotated is a real, silent
+cross-module inconsistency (concretely: `consensus.py`'s own `open_pdf`
+call would analyze the wrong physical pixels for a page whose rotation
+`segment.py` already corrected). `pdfio.open_pdf` gained an
+`orientation_overrides: dict[int, int] | None = None` keyword parameter,
+threaded straight to `orientation.normalize_pdf`; every function that ever
+opens a caller-supplied source PDF now accepts and forwards the identical
+parameter, keyword-only with a `None` default so every existing call site
+that doesn't know about it is byte-for-byte unchanged: `segment.
+segment_pdf`, `redact.redact_packet`, `pipeline.propose_all`/
+`_held_match_for_packet`/`_draft_consent_hold_redaction`/`analyze_
+redaction_holds`/`run_dispositions`/`release_from_manual_queue`,
+`blocks.collect_packet_dates`/`collect_packet_rounds`, and — the one
+genuine exception to "don't touch consensus.py" this session made,
+deliberately narrow and called out here rather than silently done —
+`consensus.analyze_consensus_anomalies`, whose *only* change is that one
+new keyword parameter forwarded to its own `open_pdf` call; the two-pass
+block-density/writing-zone algorithm itself (`_analyze_group`, `_build_
+groups`'s own grouping logic) is untouched, and `redact.py`'s automatic
+border-detection geometry and `match.py`'s scoring were not touched at
+all. `segment.read_footer` also gained a small defensive fix needed to make
+this safe: a still-unconfirmed, genuinely 90/270-rotated page has swapped
+physical width/height (a landscape-shaped page where the ordinary
+portrait footer band no longer fits), which previously crashed pdfplumber
+with a negative-area `ValueError` instead of the "unreadable footer"
+outcome that page was always going to produce one way or another —
+`page.height <= FOOTER_BAND_TOP` is now treated as unreadable directly.
+
+### The reviewer UI: a packet-context page stack replaces flat, unlabelled pages
+
+`review_app.py`'s `_render_page_stack` (called at the top of
+`_render_packet`, for every packet, held or not) shows every page of the
+current packet, stacked vertically in packet order, each one labelled
+"Page N of M" alongside the packet's own tag and wrapped in its own
+bordered container — so a reviewer can see which page of which packet
+needs a fix without cross-referencing the sidebar, a separate page
+selector, or anything else on screen. A page the detector is unsure about
+gets a visible `st.warning` banner naming the specific reason (unconfirmed
+guess with its angle/score, or fully unresolved) so the reviewer's eye
+goes there first, without having to scan every page looking for a
+problem — the packet-level ⚠️ status icon in the existing sidebar "All
+packets" list already did the same triage at the packet level; this does
+it at the page level, in context.
+
+Each page gets four buttons — Left 90°, Right 90°, 180°, Reset — that
+compute a new absolute override angle relative to whatever's currently in
+effect (the existing override, or the detector's own `applied_angle` if
+there isn't one yet) and save it via `_set_page_rotation`, which persists
+through `pipeline.save_orientation_overrides` and calls `st.rerun()`.
+Because every cached function this session threaded `orientation_
+overrides` through (`_segment`, `_proposals`, `_consensus`, `_round_data`,
+`_page_image`, `_header_fields`, `_header_words`) is `st.cache_data`-keyed
+on that exact dict, mutating it and rerunning invalidates precisely the
+cache entries that depended on the old orientation — no separate
+cache-clearing step was needed, and the result renders with the new
+rotation applied *immediately*, on the very next script run, the same
+"live, not a fixed placeholder" guarantee the redaction preview already
+gave elsewhere. `_page_image`'s on-disk PNG cache filename now folds in
+the specific page's own override angle (`_ov<angle>` suffix) — without
+that, a rotated page would keep serving the pre-rotation PNG sitting at
+the unchanged path, since nothing else about the filename would have
+differed.
+
+### The canvas fix: bake interactivity into the object JSON, add a reliable delete
+
+**Diagnosed by reading the installed package's own frontend bundle
+(`streamlit_drawable_canvas`'s `main.*.chunk.js`), not by guessing.** The
+component's React effect that reloads the canvas from a new
+`initial_drawing` prop (`M.loadFromJSON(C, ...)`, gated on `isEqual(W, C)`
+against the previously-synced state) runs on every Streamlit rerun that
+changes what geometry Python sends down — which is every rerun after a
+draw/move/resize, since Python always rebuilds `initial_drawing` fresh
+from whatever `current_boxes` the last canvas read-back produced. The
+*tool-mode* effect (`new z[d](M).configureCanvas(...)`, where `d` is the
+current `drawing_mode`) runs in a separate `useEffect` and is what applies
+`selectable`/`evented` to every object via `canvas.forEachObject(...)` —
+but it fires at mount time, synchronously, which can race ahead of the
+*asynchronous* `loadFromJSON` callback that actually populates the canvas
+with the objects this configuration pass is supposed to lock or unlock.
+When the mode-configuration sweep runs over an as-yet-empty canvas, the
+objects that load moments later keep whatever `selectable`/`evented`
+fabric.js's own class defaults fill in (both `true`) instead of whatever
+the *current* tool mode actually calls for — which can leave an existing
+box draggable while "Draw a new box" mode is supposed to have locked it
+(a click meant to start a second new box can instead grab and move the
+first one), and can leave a freshly (re)loaded box without the resize
+controls "Move / resize" mode is supposed to guarantee. Three reported
+symptoms, one shared mechanism, matching this session's own instruction to
+check exactly this.
+
+**Fix: stop depending on that pass's timing at all.** `_bbox_to_canvas_
+rect(bbox, dpi, *, interactive=True)` now bakes `selectable`, `evented`,
+`hasControls`, `hasBorders` (and `lockRotation=True`, so no stray rotation
+handle ever appears — nothing in this editor needs a rotated rectangle)
+directly into every object's own JSON, and `_render_manual_editor` passes
+`interactive=mode_label.startswith("Move")` when building `initial_
+drawing`. The objects are now correctly interactive (or correctly locked)
+the instant they load, regardless of whether the frontend's own
+`configureCanvas` sweep ran before or after `loadFromJSON`'s callback —
+the redundant sweep becomes a no-op confirmation instead of the only
+source of truth. The existing "Draw a new box" / "Move / resize existing
+boxes" radio is unchanged in shape (fabric.js's `rect` drawing mode and
+`transform` mode are genuinely different tools — one draws, the other
+selects/moves/resizes, including the canvas's own native multi-select via
+shift-click or a rubber-band drag over several objects at once — a single
+unified mode isn't how this library works), but its help text now spells
+out explicitly that switching back to "Draw a new box" and dragging again
+adds a second, third, ... rectangle, one per drag.
+
+**A second, Python-driven delete control was added alongside whatever the
+canvas's own gesture does** (its `transform`-mode tool binds a
+double-click on an object to delete it — real, but a gesture no amount of
+Python-side testing can confirm reliably fires in every browser, and
+deleting one specific rectangle out of several is exactly the operation a
+gesture-only affordance is easiest to get wrong on). A `st.selectbox`
+lists every currently-drawn box on the page (index, rounded coordinates)
+next to a "Delete" button that removes it from `regions[page_offset]` and
+reruns — deterministic, testable by inspecting the resulting `regions`
+dict directly, and not dependent on the canvas component's own frontend
+behavior at all.
+
+**Why multiple rectangles matter geometrically, not just as a
+convenience:** the header's own bottom row (Group members) can run the
+full page width when it overflows (see "Two rectangles are redacted per
+header page" above) — a single rectangle either fails to cover the
+overflow or has to cover far more of the page than necessary (swallowing
+the Date/Period column, which is supposed to stay visible) to reach it.
+Two independently-sized and independently-positioned rectangles are the
+correct shape for this header, which is exactly what the automatic path
+(`redact_bboxes_for_band`) already produces and what the editor already
+seeds — this session's fix is about making the *manual* path (drawing a
+third, fourth, ... region, or resizing any of them) actually usable when
+the automatic geometry needs a human correction.
+
+**Frontend interaction still cannot be literally driven from a test, and
+this session didn't pretend otherwise.** Same limitation this file has
+already documented for `streamlit-drawable-canvas-fix`: it's a
+third-party iframe component AppTest cannot simulate a drag inside. Every
+claim above about the *root cause* comes from reading the installed
+package's own bundled JS directly (not guessed), and every claim about
+the *fix* is verified the same way the existing canvas tests already
+verify this component — by constructing the fabric.js object JSON
+directly (as `st_canvas` would return it after a real drag) and feeding it
+through `_canvas_rect_to_bbox` / the real redaction path, never by
+literally clicking in a browser.
+
+**Confirmed end to end against a real packet, not just the synthetic
+fixture, per this session's own instruction — then deleted, per the
+no-real-scan-derived-artifacts-left-on-disk posture already established
+elsewhere in this file.** Using `data/PRT/010406_PD1_PRT.pdf`, SID
+0104060110's real header page (packet `010406_PD1_PRT_p080`, "Logan
+Mack"): two independently-built fabric.js rect objects — one over the
+left Name/Teacher/Group column, one over the full-width Group-row overflow
+strip, at the editor's own preview DPI (150) — were each converted through
+`_canvas_rect_to_bbox` (pixel space at DPI 150) and applied as `redact_
+packet`'s `header_bbox_override` at the real redaction DPI (300, a
+genuinely different scale, not matching by coincidence — the DPI-
+independence this conversion pair already had regression coverage for,
+see `test_canvas_rect_bbox_round_trip_at_multiple_dpis`). The pixel→point
+conversion is `scale = dpi / 72.0; point = pixel / scale`, applied
+per-axis with `scaleX`/`scaleY` folded into `width`/`height` before that
+division — unchanged from the existing, already-tested `_canvas_rect_to_
+bbox`. The resulting redaction covered both regions correctly and produced
+zero `verify_no_leaked_names` findings — proving two separately-specified
+rectangles both convert correctly and both actually get applied by the
+real redaction path, at a rendered size that differs from the PDF page
+size, against real content.
+
+### Tests, synthetic fixture only (never real data)
+
+`tests/test_orientation.py`: `test_confident_nonzero_rotation_is_held_for_
+confirmation_not_auto_applied` (parametrized 90/180/270 — replaces the old
+auto-apply assertion with the new hold, naming the page/angle/score in the
+packet issue), `test_human_confirmed_rotation_is_applied_and_redacted_
+correctly` (parametrized 90/180/270 — the override path that actually
+ships, through `normalize_pdf` -> `segment_pdf` -> `redact_packet`),
+`test_orientation_that_cannot_be_confidently_determined_holds_the_packet_
+naming_the_page` (unchanged assertions, now also checks `needs_
+confirmation` is false for this case), `test_applied_rotation_is_
+persisted_and_reproduces_without_redetecting` (extended to also prove a
+*different* override set does not reuse the first one's resolved-cache
+entry, only the shared detection cache).
+
+`tests/test_pipeline.py`: `test_180_degree_rotated_header_page_is_held_
+pending_confirmation_end_to_end` (replaces the old auto-apply end-to-end
+test — the packet is held, naming the page and angle, through the real
+`segment_pdf` -> `run_dispositions` path), `test_180_degree_rotated_
+header_page_redacts_correctly_once_a_human_confirms_the_rotation` (the
+override path through the same real production path, no monkeypatching),
+`test_orientation_override_persists_and_reproduces_on_rerun` (the
+`decisions/<pdf-stem>.orientation.json` sidecar round-trips through an
+independent reload, mirroring `detection_overrides`/`manual_geometry`'s
+own persistence tests), `test_two_rectangles_on_one_page_both_redact_
+their_intended_regions` (two independently-positioned names on one
+continuation page, both covered, neither region swallowing the other's
+ink), `test_resized_rectangle_redacts_its_new_bounds_not_original` (a
+rectangle too narrow to cover a name at its original bounds, resized via
+`scaleX`/`scaleY` the same way a corner-drag would report it, actually
+redacts the enlarged region — a baseline redaction with the *un-resized*
+box first proves the original bounds really do leave ink exposed, so the
+resized-bounds assertion isn't vacuous).
+
+### What this session did not do
+
+Did not change `redact.py`'s automatic header-border/Group-row detection
+geometry, `match.py`'s scoring, or `consensus.py`'s two-pass detection
+algorithm (registration tolerance, writing-zone mask) — only added the one
+`orientation_overrides` pass-through parameter to `consensus.
+analyze_consensus_anomalies`, called out explicitly above rather than
+folded in silently. Did not enable deletion for any real run, and did not
+regenerate, ship, or delete any real output — `out/.diagnostics/orientation_
+p084_p085/` was used for direct inspection and removed immediately after,
+the same posture every other real-page render in this file already
+documents. Did not resolve `find_uncovered_group_words`'s existing
+advisory status, `010406`'s still-unreviewed real packets, or the
+consensus-ink hold on `010406_PD1_PRT_p078` — all pre-existing, unrelated
+to this session's own scope.
+
 ## Working preferences
 
 - Calibrate against real measured data, not assumptions — when a

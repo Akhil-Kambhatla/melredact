@@ -9,14 +9,67 @@ two-sided scans"). Redaction geometry (`redact.detect_header_band`,
 `segment.locate_header_anchors`) is unconditional and page-content-blind --
 on a rotated page it covers the wrong region relative to the actual ink,
 which both leaves the real name exposed and stamps a SID somewhere
-arbitrary. Before this module, those two pages happened to get caught only
-by accident: upside-down text doesn't match "Name:"/"Page X of Y", so
-segment.py's footer/header search failed and the page fell out as a
-flagged orphan. That is not a real safeguard -- it depends on OCR failing
-in a way that happens to look like a different, unrelated problem, and
-there's no reason a 90-degree rotation (where a header's own vertical text
-line can still coincidentally satisfy a narrow word search) would fail the
-same way.
+arbitrary.
+
+**Detect-and-ask, not detect-and-apply (2026-08-14).** The original version
+of this module auto-applied any confidently-classified rotation
+(`score >= ORIENTATION_MIN_SCORE`) with no human in the loop. Re-diagnosed
+this session after a reviewer flagged pages p084/p085 of the real
+`010406_PD1_PRT.pdf` as a suspected false positive: rendered both pages at
+their raw, as-scanned orientation and at the detector's corrected
+orientation, saved to `out/.diagnostics/orientation_p084_p085/` for direct
+inspection. **Finding: this was not a false positive.** Both pages'
+`/Rotate` is 0 in the source file (no metadata compensation anywhere), the
+raw render is genuinely upside-down (illegible), the classifier's own
+confidence (0.9238/0.9252) sits in the exact same band as every other
+correctly-classified real page in this codebase's 176-page rotation audit,
+and the corrected render is a perfectly legible upright header page --
+"Gio Barisciano", date 10/24/25, teacher Talbert, period 1/HR. The detector
+was right.
+
+That finding is still the reason this module no longer auto-applies a
+nonzero rotation, not a reason to leave it as detect-and-apply: it shows
+there is **no score-based separation available between a confident-and-
+correct rotation and a hypothetical confident-and-wrong one** -- every real
+rotated page measured (these two included) and every real upright page
+land in the identical 0.91-0.93 band. Raising `ORIENTATION_MIN_SCORE`
+anywhere within its current headroom (0.6 up to just under 0.91) would not
+change which real pages auto-apply, since none of them fall in that range
+-- the gap simply isn't where the risk is. Given that, deriving "a
+confidence threshold above which auto-apply is safe" honestly from this
+data yields one answer for any *nonzero* rotation: never auto-apply one
+unreviewed, because the score cannot tell a right guess from a wrong one.
+A page needing zero correction has nothing to get wrong, so that path
+alone stays automatic. This is the literal, data-grounded reading of "a
+detector that silently rotates a page it misread is worse than no
+detector" -- not a specific number, but a structural conclusion the data
+actually supports.
+
+**Design: three outcomes per page, not two.**
+1. `angle == 0` and confident -- nothing to do, proceeds automatically.
+2. Confident and `angle != 0` -- held for a human to confirm or correct
+   (`PageOrientation.needs_confirmation`), never silently rotated. The
+   containing packet's `issues` names the page, the detector's guessed
+   angle, and its score (see `segment.segment_pdf`), so a reviewer sees
+   exactly what to look at and why -- reusing the existing "packet with
+   unresolved issues is refused" gate in `pipeline.run_dispositions`
+   rather than inventing a parallel hold mechanism.
+3. Not confident at all (e.g. a blank/near-blank page, ~0.26 in the real
+   audit) -- held the same way, but with no guess to show, since guessing
+   here is exactly the "confidently wrong" scenario this module exists to
+   avoid, just with no confidence to even be wrong about.
+
+**Human overrides, never applied without a record.** A human can supply
+`overrides: dict[int, int]` (page_index -> one of 0/90/180/270) to
+`normalize_pdf`/`orientation_for` -- this always wins over the detector,
+for ANY page (not just one the detector flagged: a reviewer can rotate a
+page the detector was confident was already upright, if they disagree).
+`review_app.py` persists a human's rotation choice to
+`decisions/<pdf-stem>.orientation.json` (see `pipeline.
+load_orientation_overrides`/`save_orientation_overrides`) so a re-run
+reproduces the exact same correction without asking again -- the
+overrides dict is the *only* record of a human decision here; nothing is
+ever baked into the source file itself.
 
 **Detection is content-based, never PDF `/Rotate` metadata.** Real scans
 arrive from Box after passing through Google Sheets exports, Box's own
@@ -24,9 +77,10 @@ processing, and (see `pdfio.py`) at least one prior re-save through a
 qpdf-incompatible tool -- any of which can drop or rewrite `/Rotate`
 without touching the actual embedded pixels. Trusting it would mean
 trusting a value with no guaranteed relationship to what the page actually
-looks like. Detection instead renders the page exactly as it would
-currently display (respecting whatever `/Rotate` happens to be set, right
-or wrong) and classifies *that*.
+looks like (confirmed directly on the real file: `/Rotate` is 0 on every
+one of pages 83-86, including the two that are genuinely upside-down).
+Detection instead renders the page exactly as it currently displays and
+classifies *that*.
 
 **Detector: PaddleOCR's `DocImgOrientationClassification`, not the
 full-pipeline `use_doc_orientation_classify` flag `ocr.py` already
@@ -38,27 +92,7 @@ dedicated classification-only submodule (no text detection/recognition
 pass) is both the more correct tool for "what angle is this page" and
 dramatically cheaper -- measured directly, ~0.02s/page after a ~0.4s
 one-time model load, versus ~9s/page for a full `PaddleOCR().predict()`
-call with orientation classification enabled. Rejected: reusing the
-full-pipeline `PaddleOCR(...).predict(..., use_doc_orientation_classify=
-True)` (does the same job at ~450x the per-page cost, since it also runs
-text detection/recognition it doesn't need to answer this question), and a
-purely geometric approach (analyzing the raster for a dominant text-line
-axis without a model) which has no way to distinguish the four 90-degree
-turns without additional heuristics the OCR stack already solves.
-
-**Confidence, not a coin flip: `ORIENTATION_MIN_SCORE` (config.py) is
-calibrated against 176 real pages, not the abstract.** See config.py's own
-comment for the real score distribution (0.91-0.93 for any page with real
-content, 0.26 for a blank one) -- the gap is wide, so this is a low-risk
-threshold, but it is still a threshold a genuinely ambiguous or already-
-corrupted page could fall under, and a wrong guess here is exactly the
-scenario CLAUDE.md's "abstain, never guess" posture exists for: guessing a
-cardinal rotation wrong doesn't produce a visibly broken page, it produces
-a *confidently* wrong redaction, since detect_header_band's anchor search
-would then be run against the wrong axis entirely and (per the real
-010406 evidence) can still occasionally find *something* to anchor to.
-Below the threshold, this module applies no rotation at all and reports
-the page unresolved -- see `segment.segment_pdf`'s own handling below.
+call with orientation classification enabled.
 
 **Skew (non-cardinal tilt) is measured, not corrected.** See
 `estimate_skew_deg`'s own docstring and CLAUDE.md's rotation-audit section
@@ -66,55 +100,48 @@ for the real evidence: existing corner-based border/anchor detection
 (`redact.detect_header_band`) is already tested, with a passing regression
 test, across skew up to ~2.56 degrees (24pt of drop across the header's
 own width) -- and real measured skew across all 176 real pages this
-session had access to never exceeded 1.48 degrees. Building a deskew
-(image-rotation) stage on top of that would add real risk (any rotation
-step introduces resampling/interpolation, which a purely axis-aligned
-redaction box does not need to tolerate) to fix a problem the evidence
-says doesn't exist on real data. What this module *does* do with a skew
-measurement is treat it as a second, independent confidence signal: a page
-whose residual skew (after cardinal correction) exceeds
-`ORIENTATION_MAX_TOLERATED_SKEW_DEG` is reported unresolved even if the
-cardinal classification itself was confident -- a shape nothing in the
-real dataset or the existing skew regression test has actually validated,
-so it gets a human rather than an untested guess.
+session had access to never exceeded 1.48 degrees. A page whose residual
+skew (after cardinal correction) exceeds `ORIENTATION_MAX_TOLERATED_SKEW_
+DEG` is held the same way an unconfident classification is -- a shape
+nothing in the real dataset or the existing skew regression test has
+actually validated, so it gets a human rather than an untested guess. A
+human-supplied override skips this check entirely: a person looking
+directly at the rotated result has already made the judgment this check
+exists to approximate.
 
-**Persistence: one normalized PDF + one JSON manifest per distinct source
-file, disk-cached by content hash (`ocr.file_content_hash`, the same
+**Persistence: one normalized PDF + one JSON manifest per (source file,
+override set), disk-cached by the source file's own content hash plus a
+fingerprint of the override set** (`ocr.file_content_hash`, the same
 hasher `pdfio.py`'s own repair cache already shares) -- so re-running the
-same file never re-detects.** A file where every page is already upright
-never gets a rewritten copy at all (`OrientationResult.normalized_path`
-is just the input path) -- there's nothing to normalize, and building a
-redundant pikepdf resave for the common case would cost real time for
-zero benefit, the same reasoning `pdfio.open_pdf` already applies to an
-unaffected file.
+same file with the same overrides never re-detects or re-writes. The raw
+per-page *detections* (the classifier's own output, independent of any
+human override) are cached separately, keyed on content hash alone, so
+supplying or changing an override never forces a re-classification, only
+a cheap re-resolution and (only when a rotation actually needs to change)
+a re-save.
 
 **Correction mechanism: PDF `/Rotate`, not re-rasterizing page content.**
 Setting `/Rotate` is lossless (no resampling of the actual scanned image)
 and cheap (a metadata write, not a re-encode) -- pdfplumber, which every
 downstream module in this codebase already reads pages through, resolves
 `/Rotate` into `page.width`/`page.height` and `page.to_image()` output
-consistently (verified directly: rendering a `/Rotate`-tagged page
-reproduces the expected upright pixels exactly, byte for byte, not just
-approximately). The new value is `(current_effective_rotate -
-detected_angle) % 360`, not `+` -- verified empirically against three real
-mechanisms this session actually built and round-tripped, not assumed:
-(1) a page whose `/Rotate` was wrongly set on already-upright content, (2)
-a page whose embedded pixels were physically pre-rotated at `/Rotate=0`,
-and (3) all three of 90/180/270 via the plain `PIL.Image.rotate` sign
-convention `normalize_page_image` below also uses. `-` was the sign that
-reconstructed the original pixels exactly in every case tested; `+` did
-not.
+consistently. The new value is `(current_effective_rotate -
+detected_angle) % 360`, not `+` -- verified empirically (see git history
+for the three hand-built round-trip cases this was checked against).
 
 Every module in this codebase that opens a caller-supplied source PDF
 already goes through `pdfio.open_pdf` (see that module's own docstring),
-which now chains this module's normalization after its own xref/trailer
+which chains this module's normalization after its own xref/trailer
 repair -- so every downstream stage (`segment.py`, `redact.py`,
 `pipeline.py`, `blocks.py`, `consensus.py`, `review_app.py`) sees an
-upright page with zero code changes of its own, exactly as intended.
+upright page with zero rotation-awareness of its own, as long as it
+threads through whatever `orientation_overrides` dict a human has
+supplied (see `pdfio.open_pdf`'s own parameter).
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -148,27 +175,62 @@ def _engine():
 
 
 @dataclass
+class PageDetection:
+    """The classifier's own raw output for one page -- independent of any
+    human decision, so it can be cached (and reused across different
+    override sets) purely by the source file's content hash."""
+
+    page_index: int
+    angle: int  # 0/90/180/270, the classifier's raw guess -- only meaningful when confident
+    score: float
+    confident: bool  # score >= ORIENTATION_MIN_SCORE
+    skew_deg: float | None  # measured against the hypothetically-corrected image, only when confident
+
+
+@dataclass
 class PageOrientation:
     page_index: int
-    # Rotation actually applied to reach upright, one of 0/90/180/270. 0
-    # when no correction was needed OR when orientation couldn't be
-    # confidently determined (see `confident` -- a caller must check that
-    # flag, not infer "nothing to do" from applied_angle == 0).
-    applied_angle: int
-    confident: bool
+    # The classifier's own guess, independent of whether it was ever
+    # applied or confirmed -- 0 when the classifier wasn't confident at
+    # all (nothing to guess). Always shown to a reviewer alongside `score`
+    # so a hold's reason names both, per the detect-and-ask design.
+    detected_angle: int
     score: float
-    # Residual skew in degrees after cardinal correction, or None when
-    # orientation itself wasn't confident enough to measure skew against
-    # (an unresolved page's skew relative to an unknown axis is meaningless).
+    confident: bool
     skew_deg: float | None
+    # Rotation actually baked into the normalized PDF's /Rotate, one of
+    # 0/90/180/270. 0 both when nothing was needed and when a nonzero
+    # rotation is still pending human confirmation -- callers must check
+    # `resolved`/`needs_confirmation`, never infer "nothing to do" from
+    # applied_angle == 0 alone.
+    applied_angle: int
+    # "auto": angle==0, classifier confident, applied with no human input
+    # (nothing to get wrong). "human": a human explicitly supplied this
+    # page's rotation (confirming the detector's guess, correcting it, or
+    # rotating a page the detector never flagged at all) -- always wins,
+    # always resolved, skew/confidence checks don't apply. "none": neither
+    # of the above -- either a confident nonzero guess awaiting
+    # confirmation, or a classification too weak to guess from at all.
+    source: str
+
+    @property
+    def needs_confirmation(self) -> bool:
+        """True only for the detect-and-ask case: the classifier is
+        confident about a *nonzero* rotation but no human has approved or
+        corrected it yet. False once a human supplies any override for
+        this page (even one that agrees with the detector), since that's
+        no longer merely a guess."""
+        return self.source == "none" and self.confident and self.detected_angle != 0
 
     @property
     def resolved(self) -> bool:
         """False means: don't trust this page's geometry-dependent output
-        at all -- neither the cardinal classification nor (if that was
-        confident) the residual skew measurement cleared their thresholds.
-        `segment.segment_pdf` turns this into a packet-level issue."""
-        if not self.confident:
+        at all. A human-sourced page is always resolved -- a person who
+        rotated it and saw the result has already made the judgment the
+        confidence/skew checks below only approximate."""
+        if self.source == "human":
+            return True
+        if not self.confident or self.needs_confirmation:
             return False
         if self.skew_deg is not None and abs(self.skew_deg) > ORIENTATION_MAX_TOLERATED_SKEW_DEG:
             return False
@@ -181,10 +243,26 @@ class OrientationResult:
     pages: list[PageOrientation]
 
     def unresolved_page_indices(self) -> list[int]:
-        return [p.page_index for p in self.pages if not p.resolved]
+        """Pages that are neither safely resolved nor merely awaiting a
+        confirmation click -- e.g. too ambiguous to even guess from, or
+        confidently upright but too skewed to trust. See `segment.
+        segment_pdf` for how this becomes a packet issue."""
+        return [p.page_index for p in self.pages if not p.resolved and not p.needs_confirmation]
+
+    def pending_confirmation_page_indices(self) -> list[int]:
+        """Pages with a confident, specific, nonzero rotation guess a
+        human hasn't approved yet -- see PageOrientation.needs_
+        confirmation. Kept distinct from unresolved_page_indices so a
+        caller (segment.segment_pdf) can word the packet issue
+        differently: "here's my guess, confirm or correct it" vs. "I
+        can't tell at all"."""
+        return [p.page_index for p in self.pages if p.needs_confirmation]
 
     def rotated_page_indices(self) -> list[int]:
-        return [p.page_index for p in self.pages if p.confident and p.applied_angle != 0]
+        return [p.page_index for p in self.pages if p.source in ("auto", "human") and p.applied_angle != 0]
+
+    def by_page(self) -> dict[int, PageOrientation]:
+        return {p.page_index: p for p in self.pages}
 
 
 def classify_orientation(image: Image.Image) -> tuple[int, float]:
@@ -242,24 +320,101 @@ def normalize_page_image(image: Image.Image, applied_angle: int) -> Image.Image:
     return image.rotate(applied_angle, expand=True)
 
 
-def _cache_paths(source_path: Path) -> tuple[Path, Path]:
+def _overrides_fingerprint(overrides: dict[int, int] | None) -> str:
+    if not overrides:
+        return "auto"
+    items = sorted((int(k), int(v) % 360) for k, v in overrides.items())
+    raw = ",".join(f"{k}:{v}" for k, v in items)
+    return "ov" + hashlib.sha1(raw.encode()).hexdigest()[:16]
+
+
+def _cache_paths(source_path: Path, overrides: dict[int, int] | None) -> tuple[Path, Path, Path]:
+    """(detections_path, resolved_manifest_path, normalized_pdf_path).
+    `detections_path` is keyed on the source file's content hash alone --
+    the classifier's own output never depends on any human override, so
+    it's reusable across every override set tried against this file. The
+    other two are keyed on content hash *and* the override set's own
+    fingerprint, since a different override set can resolve to a
+    genuinely different normalized PDF."""
     from melredact.ocr import file_content_hash
 
     h = file_content_hash(source_path)
-    base = Path(CACHE_DIR) / _CACHE_SUBDIR / h
-    return base.with_suffix(".json"), base.with_suffix(".pdf")
+    base = Path(CACHE_DIR) / _CACHE_SUBDIR
+    detections_path = base / f"{h}.detections.json"
+    resolved_base = base / f"{h}_{_overrides_fingerprint(overrides)}"
+    return detections_path, resolved_base.with_suffix(".json"), resolved_base.with_suffix(".pdf")
 
 
-def _detect_pages(source_path: Path) -> list[PageOrientation]:
-    pages: list[PageOrientation] = []
+def _detect_pages(source_path: Path) -> list[PageDetection]:
+    detections: list[PageDetection] = []
     with pdfplumber.open(source_path) as pdf:
         for idx, page in enumerate(pdf.pages):
             image = page.to_image(resolution=ORIENTATION_DETECT_DPI).original.convert("RGB")
             angle, score = classify_orientation(image)
             confident = score >= ORIENTATION_MIN_SCORE
-            applied = angle if confident else 0
-            skew = estimate_skew_deg(normalize_page_image(image, applied)) if confident else None
-            pages.append(PageOrientation(page_index=idx, applied_angle=applied, confident=confident, score=score, skew_deg=skew))
+            skew = estimate_skew_deg(normalize_page_image(image, angle)) if confident else None
+            detections.append(PageDetection(page_index=idx, angle=angle, score=score, confident=confident, skew_deg=skew))
+    return detections
+
+
+def resolve_pages(detections: list[PageDetection], overrides: dict[int, int] | None) -> list[PageOrientation]:
+    """Combine the classifier's raw output with a human's explicit
+    per-page overrides (page_index -> 0/90/180/270) into the final,
+    detect-and-ask resolution -- see module docstring for the three
+    outcomes. An override always wins, for any page, regardless of what
+    (or whether) the classifier guessed for it."""
+    overrides = overrides or {}
+    pages: list[PageOrientation] = []
+    for d in detections:
+        if d.page_index in overrides:
+            angle = int(overrides[d.page_index]) % 360
+            pages.append(
+                PageOrientation(
+                    page_index=d.page_index,
+                    detected_angle=d.angle if d.confident else 0,
+                    score=d.score,
+                    confident=d.confident,
+                    skew_deg=d.skew_deg,
+                    applied_angle=angle,
+                    source="human",
+                )
+            )
+        elif d.confident and d.angle == 0:
+            pages.append(
+                PageOrientation(
+                    page_index=d.page_index,
+                    detected_angle=0,
+                    score=d.score,
+                    confident=True,
+                    skew_deg=d.skew_deg,
+                    applied_angle=0,
+                    source="auto",
+                )
+            )
+        elif d.confident:
+            pages.append(
+                PageOrientation(
+                    page_index=d.page_index,
+                    detected_angle=d.angle,
+                    score=d.score,
+                    confident=True,
+                    skew_deg=d.skew_deg,
+                    applied_angle=0,
+                    source="none",
+                )
+            )
+        else:
+            pages.append(
+                PageOrientation(
+                    page_index=d.page_index,
+                    detected_angle=0,
+                    score=d.score,
+                    confident=False,
+                    skew_deg=None,
+                    applied_angle=0,
+                    source="none",
+                )
+            )
     return pages
 
 
@@ -267,32 +422,46 @@ def _write_normalized_pdf(source_path: Path, pages: list[PageOrientation], norm_
     norm_path.parent.mkdir(parents=True, exist_ok=True)
     with pikepdf.open(source_path) as pdf:
         for p in pages:
-            if p.confident and p.applied_angle != 0:
+            if p.applied_angle != 0:
                 pdf_page = pdf.pages[p.page_index]
                 current = int(pdf_page.get("/Rotate", 0)) % 360
                 pdf_page.Rotate = (current - p.applied_angle) % 360
         pdf.save(norm_path)
 
 
-def normalize_pdf(source_path: str | Path) -> OrientationResult:
-    """Detect and correct every page's cardinal orientation in
+def normalize_pdf(source_path: str | Path, *, overrides: dict[int, int] | None = None) -> OrientationResult:
+    """Detect and resolve every page's cardinal orientation in
     `source_path` (already resolved through `pdfio.resolved_source_path`
-    by every real caller -- see that module), disk-cached by the source
-    file's own content hash so a second call (a second pipeline stage
-    within one run, or a later `cli.py run`/Streamlit rerun) never
-    re-detects. `source_path` itself is returned as `normalized_path` when
-    no page needed correction -- see module docstring for why this avoids
-    a wasted resave on the common all-upright case.
+    by every real caller -- see that module), disk-cached so a second call
+    with the *same* override set never re-detects or re-writes (see
+    `_cache_paths`). `source_path` itself is returned as `normalized_path`
+    when no page needed a rotation actually applied -- see module
+    docstring for why this avoids a wasted resave on the common
+    all-upright case.
+
+    `overrides` (page_index -> 0/90/180/270) is a human's explicit
+    per-page rotation choice -- see `resolve_pages`. Passing a different
+    override set is cheap even on a cold cache for the *detection* step
+    (that part is cached on content hash alone, unaffected by overrides);
+    only the resolution + (if needed) the pikepdf resave repeat.
     """
     source_path = Path(source_path)
-    manifest_path, norm_path = _cache_paths(source_path)
+    detect_path, manifest_path, norm_path = _cache_paths(source_path, overrides)
+
+    if detect_path.exists():
+        detections = [PageDetection(**d) for d in json.loads(detect_path.read_text())]
+    else:
+        detections = _detect_pages(source_path)
+        detect_path.parent.mkdir(parents=True, exist_ok=True)
+        detect_path.write_text(json.dumps([asdict(d) for d in detections], indent=2))
+
     if manifest_path.exists():
         pages = [PageOrientation(**p) for p in json.loads(manifest_path.read_text())]
         resolved_path = norm_path if norm_path.exists() else source_path
         return OrientationResult(normalized_path=resolved_path, pages=pages)
 
-    pages = _detect_pages(source_path)
-    needs_write = any(p.confident and p.applied_angle != 0 for p in pages)
+    pages = resolve_pages(detections, overrides)
+    needs_write = any(p.applied_angle != 0 for p in pages)
     if needs_write:
         _write_normalized_pdf(source_path, pages, norm_path)
         resolved_path = norm_path
@@ -304,21 +473,28 @@ def normalize_pdf(source_path: str | Path) -> OrientationResult:
     return OrientationResult(normalized_path=resolved_path, pages=pages)
 
 
-def orientation_for(pdf_path: str | Path) -> OrientationResult:
+def orientation_for(pdf_path: str | Path, *, overrides: dict[int, int] | None = None) -> OrientationResult:
     """`normalize_pdf`, resolved from a caller-facing source path the same
     way `pdfio.open_pdf` resolves it (through the xref/trailer repair step
     first) -- so a caller like `segment.segment_pdf`, which only has the
     original path in scope, gets the identical per-page result `open_pdf`
-    already produced (and cached) when it opened the same file."""
+    itself produced (and cached) when it opened the same file with the
+    same overrides."""
     from melredact.pdfio import resolved_source_path
 
-    return normalize_pdf(resolved_source_path(pdf_path))
+    return normalize_pdf(resolved_source_path(pdf_path), overrides=overrides)
 
 
-def unresolved_page_indices(pdf_path: str | Path) -> list[int]:
+def unresolved_page_indices(pdf_path: str | Path, *, overrides: dict[int, int] | None = None) -> list[int]:
     """Page indices (into the original file's own page order -- normalization
     never adds, removes, or reorders pages) whose orientation could not be
-    confidently determined -- see `PageOrientation.resolved`. Empty for the
-    overwhelming majority of files (every page either upright or
-    confidently corrected)."""
-    return orientation_for(pdf_path).unresolved_page_indices()
+    confidently determined at all -- see `OrientationResult.
+    unresolved_page_indices`. Empty for the overwhelming majority of files."""
+    return orientation_for(pdf_path, overrides=overrides).unresolved_page_indices()
+
+
+def pending_confirmation_page_indices(pdf_path: str | Path, *, overrides: dict[int, int] | None = None) -> list[int]:
+    """Page indices with a confident, specific, nonzero rotation guess
+    that no human has approved yet -- see `OrientationResult.
+    pending_confirmation_page_indices`."""
+    return orientation_for(pdf_path, overrides=overrides).pending_confirmation_page_indices()

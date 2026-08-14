@@ -80,6 +80,7 @@ from melredact.blocks import (
 from melredact.config import CACHE_DIR, HEADER_SEARCH_MAX_TOP, MIN_MARGIN, MIN_SCORE, RENDER_DPI_PREVIEW
 from melredact.consensus import ConsensusAnalysis, analyze_consensus_anomalies, format_consensus_report
 from melredact.match import assign_all
+from melredact.orientation import orientation_for
 from melredact.pdfio import open_pdf
 from melredact.pipeline import (
     filter_packets_by_round,
@@ -87,6 +88,7 @@ from melredact.pipeline import (
     load_decisions,
     load_detection_overrides,
     load_manual_geometry,
+    load_orientation_overrides,
     manual_queue_draft_path,
     packet_tag,
     propose_all,
@@ -94,6 +96,7 @@ from melredact.pipeline import (
     run_dispositions,
     save_decisions,
     save_detection_overrides,
+    save_orientation_overrides,
 )
 from melredact.redact import (
     Bbox,
@@ -153,8 +156,19 @@ def _parse_args() -> argparse.Namespace:
 
 
 @st.cache_data(show_spinner="Segmenting PDF into packets...")
-def _segment(pdf_path: str) -> SegmentResult:
-    return segment_pdf(pdf_path)
+def _segment(pdf_path: str, orientation_overrides: dict[int, int]) -> SegmentResult:
+    return segment_pdf(pdf_path, orientation_overrides=orientation_overrides)
+
+
+@st.cache_data(show_spinner=False)
+def _orientation_map(pdf_path: str, orientation_overrides: dict[int, int]) -> dict[int, object]:
+    """page_index -> orientation.PageOrientation for the whole file, so the
+    page-stack UI (see _render_page_stack) can show each page's own
+    detected angle/score/needs-confirmation state without re-deriving it
+    per page render. Cheap regardless: the expensive part (PaddleOCR
+    classification) is disk-cached by content hash in orientation.py
+    itself, unaffected by st.cache_data's own in-memory layer here."""
+    return orientation_for(pdf_path, overrides=orientation_overrides).by_page()
 
 
 def _block_metadata(roster_path: str):
@@ -165,17 +179,17 @@ def _block_metadata(roster_path: str):
 
 
 @st.cache_data(show_spinner="Reading packet dates for block resolution...")
-def _block_resolution(pdf_path: str, class_period: int, roster_path: str) -> BlockResolution:
+def _block_resolution(pdf_path: str, class_period: int, roster_path: str, orientation_overrides: dict[int, int]) -> BlockResolution:
     # roster_path is only here to key the cache correctly if the sidecar
     # ever changes between reruns -- resolve_block itself only reads
     # `metadata`, recomputed fresh by the caller (cheap, see _block_metadata).
     metadata = load_block_metadata(roster_path)
-    dates = collect_packet_dates(pdf_path)
+    dates = collect_packet_dates(pdf_path, orientation_overrides=orientation_overrides)
     return resolve_block(dates, class_period, metadata)
 
 
 @st.cache_data(show_spinner="Reading packet dates for round grouping...")
-def _round_data(pdf_path: str) -> tuple[list, list[RoundGroup]]:
+def _round_data(pdf_path: str, orientation_overrides: dict[int, int]) -> tuple[list, list[RoundGroup]]:
     """(dates, groups) -- computed together and cached once per pdf_path
     (same OCR-cached date-extraction pass as block resolution's own
     _block_resolution, just grouped into contiguous rounds instead of
@@ -183,21 +197,21 @@ def _round_data(pdf_path: str) -> tuple[list, list[RoundGroup]]:
     script (a button click, Prev/Next) doesn't repeat it. See blocks.
     group_into_rounds for the grouping rule; round labelling never
     influences matching, so this is entirely independent of _proposals."""
-    segmented = _segment(pdf_path)
-    dates = collect_packet_dates(pdf_path, segmented=segmented)
+    segmented = _segment(pdf_path, orientation_overrides)
+    dates = collect_packet_dates(pdf_path, segmented=segmented, orientation_overrides=orientation_overrides)
     groups = group_into_rounds(segmented.packets, dates)
     return dates, groups
 
 
 @st.cache_data(show_spinner="Checking for template-agnostic handwriting anomalies (consensus-ink)...")
-def _consensus(pdf_path: str) -> ConsensusAnalysis:
+def _consensus(pdf_path: str, orientation_overrides: dict[int, int]) -> ConsensusAnalysis:
     """Cached the same way _round_data is: the expensive part (whole-group
     rasterize + ECC alignment, see consensus.py) is itself disk-cached per
     (file, page, reference page, dpi, block size), so a warm rerun is
     cheap -- but there's no reason to repeat even the in-memory clustering
     on every Streamlit rerun (a button click, Prev/Next) within one
     session."""
-    return analyze_consensus_anomalies(pdf_path, _segment(pdf_path))
+    return analyze_consensus_anomalies(pdf_path, _segment(pdf_path, orientation_overrides), orientation_overrides=orientation_overrides)
 
 
 @st.cache_data(show_spinner="Loading roster...")
@@ -206,12 +220,15 @@ def _roster(roster_path: str, pdf_path: str, period: str | None) -> Roster:
 
 
 @st.cache_data(show_spinner="Scoring name candidates against the roster...")
-def _proposals(pdf_path: str, roster_path: str, period: str | None):
-    return propose_all(pdf_path, _segment(pdf_path), _roster(roster_path, pdf_path, period))
+def _proposals(pdf_path: str, roster_path: str, period: str | None, orientation_overrides: dict[int, int]):
+    return propose_all(
+        pdf_path, _segment(pdf_path, orientation_overrides), _roster(roster_path, pdf_path, period),
+        orientation_overrides=orientation_overrides,
+    )
 
 
 @st.cache_data(show_spinner=False)
-def _header_fields(pdf_path: str, page_index: int):
+def _header_fields(pdf_path: str, page_index: int, orientation_overrides: dict[int, int]):
     """Cached wrapper around extract_header_fields, keyed by (pdf_path,
     page_index) rather than a pdfplumber Page object (not hashable in a
     way st.cache_data can use) -- opens the pdf fresh, same pattern as
@@ -221,30 +238,37 @@ def _header_fields(pdf_path: str, page_index: int):
     disk cache in place that call is now cheap even on a cold cache, but
     there's no reason to repeat even the in-memory anchor-location work
     on every rerun within one session."""
-    with open_pdf(pdf_path) as pdf:
+    with open_pdf(pdf_path, orientation_overrides=orientation_overrides) as pdf:
         return extract_header_fields(pdf.pages[page_index])
 
 
 @st.cache_data(show_spinner=False)
-def _header_words(pdf_path: str, page_index: int):
+def _header_words(pdf_path: str, page_index: int, orientation_overrides: dict[int, int]):
     """Cached wrapper around segment.page_words for the header band only --
     the raw word list find_uncovered_group_words needs to compute the live
     uncovered-ink advisory as a reviewer drags boxes in the manual editor
     (see _render_manual_editor). Same disk-cached OCR call segment.py's own
     field extraction already makes (see CLAUDE.md's "OCR is disk-cached"
     section), just also cached in memory across Streamlit reruns."""
-    with open_pdf(pdf_path) as pdf:
+    with open_pdf(pdf_path, orientation_overrides=orientation_overrides) as pdf:
         page = pdf.pages[page_index]
         return page_words(page, (0, 0, page.width, HEADER_SEARCH_MAX_TOP))
 
 
 @st.cache_data(show_spinner=False)
-def _page_image(pdf_path: str, page_index: int, dpi: int) -> Image.Image:
-    cache_file = Path(CACHE_DIR) / Path(pdf_path).stem / f"page_{page_index:04d}_{dpi}.png"
+def _page_image(pdf_path: str, page_index: int, dpi: int, orientation_overrides: dict[int, int]) -> Image.Image:
+    """Disk-cached rendered page image. The cache filename folds in this
+    specific page's own override angle (if any) -- without that, rotating
+    a page via the UI's rotate controls (see _render_page_stack) would
+    keep serving the pre-rotation PNG sitting at the same path, since
+    nothing else about the filename would change."""
+    override_angle = orientation_overrides.get(page_index)
+    suffix = f"_ov{override_angle}" if override_angle is not None else ""
+    cache_file = Path(CACHE_DIR) / Path(pdf_path).stem / f"page_{page_index:04d}_{dpi}{suffix}.png"
     if cache_file.exists():
         return Image.open(cache_file).convert("RGB")
     cache_file.parent.mkdir(parents=True, exist_ok=True)
-    with open_pdf(pdf_path) as pdf:
+    with open_pdf(pdf_path, orientation_overrides=orientation_overrides) as pdf:
         image = pdf.pages[page_index].to_image(resolution=dpi).original.convert("RGB")
     image.save(cache_file)
     return image
@@ -276,6 +300,24 @@ def _init_state(pdf_path: str, decisions_dir: str) -> None:
         st.session_state.decisions = load_decisions(pdf_path, decisions_dir=Path(decisions_dir))
     if "detection_overrides" not in st.session_state:
         st.session_state.detection_overrides = load_detection_overrides(pdf_path, decisions_dir=Path(decisions_dir))
+    if "orientation_overrides" not in st.session_state:
+        st.session_state.orientation_overrides = load_orientation_overrides(pdf_path, decisions_dir=Path(decisions_dir))
+
+
+def _set_page_rotation(pdf_path: str, decisions_dir: str, page_index: int, angle: int | None) -> None:
+    """Record (or clear, when `angle` is None) a human's rotation choice
+    for one physical page -- always wins over the detector's own guess for
+    that page (see orientation.py's detect-and-ask design), and persists
+    immediately so a re-run reproduces it without asking again. Every
+    downstream cache (`_segment`, `_proposals`, `_consensus`, `_round_
+    data`, `_page_image`, ...) is keyed on this exact dict, so mutating it
+    and rerunning naturally invalidates every cache entry that depended on
+    the old orientation -- no separate cache-clearing step needed."""
+    if angle is None:
+        st.session_state.orientation_overrides.pop(page_index, None)
+    else:
+        st.session_state.orientation_overrides[page_index] = angle % 360
+    save_orientation_overrides(pdf_path, st.session_state.orientation_overrides, decisions_dir=Path(decisions_dir))
 
 
 def _confirm(pdf_path: str, decisions_dir: str, tag: str, sid: str | None) -> None:
@@ -347,6 +389,7 @@ def _render_sidebar(
                 allow_delete=not disable_deletion,
                 manual_geometry=fresh_manual_geometry,
                 consensus_holds=consensus_holds,
+                orientation_overrides=st.session_state.orientation_overrides,
             )
             written = [r for r in results if r.out_path is not None]
             deleted = sum(1 for r in results if r.deleted_path is not None)
@@ -457,12 +500,31 @@ def _stamp_lines_for(sid: str | None, roster: Roster) -> list[str] | None:
     return [f"SID: {entry.sid}", f"PD: {entry.period_display}"]
 
 
-def _bbox_to_canvas_rect(bbox: Bbox, dpi: int) -> dict:
+def _bbox_to_canvas_rect(bbox: Bbox, dpi: int, *, interactive: bool = True) -> dict:
     """Page-point Bbox -> a fabric.js rect object at canvas (image) pixel
     scale, for `st_canvas`'s `initial_drawing` -- seeds the canvas with
     whatever geometry (automatic detection, or a previously-drawn region)
     already exists for this page, so the common case is nudging an
-    existing box rather than drawing from nothing."""
+    existing box rather than drawing from nothing.
+
+    `interactive` bakes `selectable`/`evented`/`hasControls`/`hasBorders`
+    directly into the object's own JSON, rather than leaving them at
+    fabric.js's class defaults and relying on the canvas component's own
+    `configureCanvas` pass to set them correctly after `initial_drawing`
+    loads. That pass runs synchronously at mount, before the async
+    `loadFromJSON` callback that actually populates the canvas with these
+    objects has necessarily completed -- so on a fresh load its
+    `forEachObject` sweep can run over an empty canvas and never touch the
+    objects this function built at all, leaving them at whatever fabric.js
+    defaults `loadFromJSON` fills in instead. This was the root cause
+    behind three symptoms that looked separate but shared one mechanism:
+    an existing box being draggable while "Draw a new box" mode was
+    supposed to have locked it (which could intercept a click meant to
+    start a *second* new box), and resize controls not reliably appearing
+    on a freshly-loaded box. Baking the flag into the object itself removes
+    the dependency on that pass's timing entirely -- every caller here
+    passes `interactive=True` only while in "Move / resize" mode and
+    `False` while in "Draw a new box" mode (see _render_manual_editor)."""
     scale = dpi / 72.0
     left, top, right, bottom = bbox
     return {
@@ -477,6 +539,11 @@ def _bbox_to_canvas_rect(bbox: Bbox, dpi: int) -> dict:
         "fill": "rgba(255, 0, 0, 0.25)",
         "stroke": "red",
         "strokeWidth": 2,
+        "selectable": interactive,
+        "evented": interactive,
+        "hasControls": interactive,
+        "hasBorders": interactive,
+        "lockRotation": True,
     }
 
 
@@ -534,8 +601,8 @@ def _seed_manual_regions(
     regions: dict[int, list[Bbox]] = {}
     if packet.header_page_index is not None:
         header_offset = packet.page_indices.index(packet.header_page_index)
-        raw_image = _page_image(args.pdf_path, packet.header_page_index, DPI)
-        fields = _header_fields(args.pdf_path, packet.header_page_index)
+        raw_image = _page_image(args.pdf_path, packet.header_page_index, DPI, st.session_state.orientation_overrides)
+        fields = _header_fields(args.pdf_path, packet.header_page_index, st.session_state.orientation_overrides)
         band = detect_header_band(
             raw_image, dpi=DPI, anchors=fields.anchors, row_height=header_row_height(fields.anchors)
         )
@@ -623,7 +690,7 @@ def _render_manual_editor(
     current_boxes = regions.get(page_offset, [])
     page_idx = packet.page_indices[page_offset]
     render_start = time.perf_counter()
-    raw_image = _page_image(args.pdf_path, page_idx, DPI)
+    raw_image = _page_image(args.pdf_path, page_idx, DPI, st.session_state.orientation_overrides)
     render_elapsed = time.perf_counter() - render_start
     st.caption(f"Page rendered in {render_elapsed * 1000:.0f} ms" + (" (cached)" if render_elapsed < 0.05 else ""))
 
@@ -632,11 +699,16 @@ def _render_manual_editor(
         ["Move / resize existing boxes", "Draw a new box"],
         key=f"mq_mode_{tag}_{page_offset}",
         horizontal=True,
+        help="'Draw a new box' adds one rectangle per click-and-drag -- switch tools again and draw "
+        "another to add a second, third, etc. 'Move / resize' drags a box's body to move it, drags a "
+        "corner or edge handle to resize it, and supports the canvas's own multi-select (shift-click, "
+        "or drag a rubber-band over several boxes) to move or resize more than one at once.",
     )
     if st.button("Clear boxes on this page", key=f"mq_clear_{tag}_{page_offset}"):
         regions[page_offset] = []
         current_boxes = []
 
+    interactive = mode_label.startswith("Move")
     col_canvas, col_preview = st.columns(2)
     with col_canvas:
         st.caption(f"Original — page {page_offset + 1}")
@@ -648,14 +720,35 @@ def _render_manual_editor(
             update_streamlit=True,
             height=raw_image.height,
             width=raw_image.width,
-            drawing_mode="transform" if mode_label.startswith("Move") else "rect",
-            initial_drawing={"version": "4.4.0", "objects": [_bbox_to_canvas_rect(b, DPI) for b in current_boxes]},
+            drawing_mode="transform" if interactive else "rect",
+            initial_drawing={
+                "version": "4.4.0",
+                "objects": [_bbox_to_canvas_rect(b, DPI, interactive=interactive) for b in current_boxes],
+            },
             key=f"mq_canvas_{tag}_{page_offset}",
         )
     if canvas_result.json_data is not None:
         objs = [o for o in canvas_result.json_data.get("objects", []) if o.get("type") == "rect"]
         current_boxes = [_canvas_rect_to_bbox(o, DPI) for o in objs]
         regions[page_offset] = current_boxes
+
+    if current_boxes:
+        # A reliable, Python-driven delete, independent of whatever the
+        # canvas component's own delete gesture (double-click an object in
+        # "Move / resize" mode) does or doesn't do in a given browser --
+        # deleting one rectangle out of several is exactly the operation a
+        # gesture-only affordance is easiest to get wrong.
+        del_col1, del_col2 = st.columns([3, 1])
+        del_index = del_col1.selectbox(
+            "Rectangle to delete",
+            options=list(range(len(current_boxes))),
+            format_func=lambda i: f"Box {i + 1}: " + ", ".join(f"{v:.0f}" for v in current_boxes[i]),
+            key=f"mq_delidx_{tag}_{page_offset}",
+        )
+        if del_col2.button("Delete", key=f"mq_delbtn_{tag}_{page_offset}"):
+            del current_boxes[del_index]
+            regions[page_offset] = current_boxes
+            st.rerun()
 
     header_bbox_override: tuple[Bbox, Bbox] | None = None
     if page_offset == header_offset and len(current_boxes) >= 2:
@@ -665,8 +758,8 @@ def _render_manual_editor(
 
     advisory_words: list = []
     if page_offset == header_offset and header_bbox_override is not None:
-        header_fields = _header_fields(args.pdf_path, page_idx)
-        header_words = _header_words(args.pdf_path, page_idx)
+        header_fields = _header_fields(args.pdf_path, page_idx, st.session_state.orientation_overrides)
+        header_words = _header_words(args.pdf_path, page_idx, st.session_state.orientation_overrides)
         advisory_words = find_uncovered_group_words(
             header_words, header_fields.anchors, header_bbox_override[0], header_bbox_override[1]
         )
@@ -756,6 +849,7 @@ def _render_manual_editor(
             header_bbox_override=final_header_bbox_override,
             extra_page_regions=extra_page_regions or None,
             flagged_regions_to_verify=flagged_regions,
+            orientation_overrides=st.session_state.orientation_overrides,
         )
         if result.released:
             st.success(f"Released {tag} -> {result.out_path}")
@@ -805,6 +899,79 @@ def _render_manual_queue(args: argparse.Namespace, roster: Roster, packet_by_tag
             )
 
 
+def _render_page_stack(args: argparse.Namespace, packet: Packet, tag: str) -> None:
+    """Every page of this packet, stacked vertically in packet order, each
+    labelled with its position within the packet ("Page 2 of 2") alongside
+    the packet's own tag -- so a reviewer can see which page of which
+    packet needs a rotation fix without cross-referencing anything else on
+    screen. A page the orientation detector is unsure about (a confident
+    but unconfirmed nonzero rotation guess, or a classification too weak
+    to guess from at all -- see orientation.py's detect-and-ask design)
+    gets a visible warning banner, so the reviewer's eye goes there first
+    rather than having to scan every page looking for a problem.
+
+    Rotating a page here always wins over the detector's own guess (see
+    orientation.resolve_pages) and reaches segmentation, OCR, matching,
+    and redaction identically, not just this preview -- every one of
+    those goes through the same `st.session_state.orientation_overrides`
+    dict via `open_pdf`'s own `orientation_overrides` parameter, and
+    changing that dict naturally invalidates every st.cache_data-wrapped
+    function keyed on it (see `_set_page_rotation`)."""
+    orientation_map = _orientation_map(args.pdf_path, st.session_state.orientation_overrides)
+    st.subheader(f"Pages — packet {tag}")
+    for offset, page_idx in enumerate(packet.page_indices):
+        po = orientation_map.get(page_idx)
+        page_label = f"Page {offset + 1} of {packet.n_pages}"
+        has_override = page_idx in st.session_state.orientation_overrides
+        needs_attention = po is not None and not has_override and (po.needs_confirmation or not po.resolved)
+        with st.container(border=True):
+            title = f"**{tag} — {page_label}**"
+            if has_override:
+                title += "  🔄 rotated by reviewer"
+            st.markdown(title)
+            if needs_attention and po.needs_confirmation:
+                st.warning(
+                    f"⚠️ {page_label}: orientation detected as rotated {po.detected_angle}° "
+                    f"(confidence {po.score:.2f}) but not yet confirmed by a reviewer — use the "
+                    "controls below to confirm this guess or correct it before this page can be "
+                    "processed."
+                )
+            elif needs_attention:
+                st.warning(
+                    f"⚠️ {page_label}: orientation could not be confidently determined "
+                    f"(score {po.score:.2f}) — rotate it by hand below if you can tell which way "
+                    "it should go."
+                )
+            raw_image = _page_image(args.pdf_path, page_idx, DPI, st.session_state.orientation_overrides)
+            st.image(raw_image, width=360)
+
+            current_angle = st.session_state.orientation_overrides.get(
+                page_idx, po.applied_angle if po is not None else 0
+            )
+            rot_cols = st.columns(4)
+            if rot_cols[0].button("⟲ Left 90°", key=f"rot_l_{tag}_{page_idx}"):
+                _set_page_rotation(args.pdf_path, args.decisions_dir, page_idx, current_angle - 90)
+                st.rerun()
+            if rot_cols[1].button("↻ Right 90°", key=f"rot_r_{tag}_{page_idx}"):
+                _set_page_rotation(args.pdf_path, args.decisions_dir, page_idx, current_angle + 90)
+                st.rerun()
+            if rot_cols[2].button("⟳ 180°", key=f"rot_180_{tag}_{page_idx}"):
+                _set_page_rotation(args.pdf_path, args.decisions_dir, page_idx, current_angle + 180)
+                st.rerun()
+            if rot_cols[3].button(
+                "Reset to automatic",
+                key=f"rot_reset_{tag}_{page_idx}",
+                disabled=not has_override,
+            ):
+                _set_page_rotation(args.pdf_path, args.decisions_dir, page_idx, None)
+                st.rerun()
+
+            if has_override:
+                st.caption(f"Reviewer-confirmed rotation: {current_angle}° from as-scanned.")
+            elif po is not None and po.source == "auto" and po.applied_angle == 0:
+                st.caption("Orientation: upright (automatic).")
+
+
 def _render_packet(
     args: argparse.Namespace,
     packet: Packet,
@@ -820,6 +987,8 @@ def _render_packet(
 ) -> None:
     if resolved_block is not None:
         st.caption(f"Approving into: {resolved_block.describe()}")
+
+    _render_page_stack(args, packet, tag)
 
     if packet.issues:
         st.warning(
@@ -842,7 +1011,7 @@ def _render_packet(
         st.info("No header page for this packet (orphan continuation page).")
         candidate_options: list[tuple[str, str | None]] = []
     else:
-        fields = _header_fields(args.pdf_path, packet.header_page_index)
+        fields = _header_fields(args.pdf_path, packet.header_page_index, st.session_state.orientation_overrides)
 
         top5 = proposal.candidates[:5]
         candidate_options = [(_decision_label(c.sid, roster), c.sid) for c in top5]
@@ -865,7 +1034,7 @@ def _render_packet(
         selected_sid = dict(all_options_preview).get(selected_label, default_sid_preview)
 
         render_start = time.perf_counter()
-        raw_image = _page_image(args.pdf_path, packet.header_page_index, DPI)
+        raw_image = _page_image(args.pdf_path, packet.header_page_index, DPI, st.session_state.orientation_overrides)
         render_elapsed = time.perf_counter() - render_start
         st.caption(f"Packet rendered in {render_elapsed * 1000:.0f} ms" + (" (cached)" if render_elapsed < 0.05 else ""))
         stamp_lines = _stamp_lines_for(selected_sid, roster)
@@ -1027,7 +1196,7 @@ def _render_block_gate(args: argparse.Namespace) -> tuple[BlockMeaning, frozense
         )
         return None
 
-    resolution = _block_resolution(args.pdf_path, class_period, args.roster_path)
+    resolution = _block_resolution(args.pdf_path, class_period, args.roster_path, st.session_state.orientation_overrides)
 
     st.header("Block resolution")
     st.code(format_resolution_report(resolution), language=None)
@@ -1096,7 +1265,15 @@ def main() -> None:
         st.error(f"Roster CSV not found: {args.roster_path}")
         return
 
-    segmented = _segment(args.pdf_path)
+    # Orientation overrides (a human's per-page rotation choice, see
+    # orientation.py's detect-and-ask design) have to be in session_state
+    # before the very first segment/round/consensus/propose pass below --
+    # every one of those is keyed on this exact dict, so loading it late
+    # would mean this run's first pass ignores a reviewer's already-
+    # recorded rotation from a prior session.
+    _init_state(args.pdf_path, args.decisions_dir)
+
+    segmented = _segment(args.pdf_path, st.session_state.orientation_overrides)
 
     # Round grouping (see blocks.group_into_rounds) applies to every
     # teacher, unlike the _blocks.json-gated block-resolution feature
@@ -1104,7 +1281,7 @@ def main() -> None:
     # CLAUDE.md's round-segment design deliberately never holds or blocks a
     # packet on its own date disagreeing with its group (see the per-packet
     # warning in _render_packet), so there's nothing here to confirm.
-    round_dates, round_groups = _round_data(args.pdf_path)
+    round_dates, round_groups = _round_data(args.pdf_path, st.session_state.orientation_overrides)
     round_labels = round_labels_by_tag(round_groups)
     output_round_disagreeing = round_disagreeing_tags(round_groups, round_dates)
     st.header("Round grouping")
@@ -1116,7 +1293,7 @@ def main() -> None:
     # redacted regardless of any match. Shown here purely so a reviewer
     # sees what the check found before it gates "Run redaction pipeline"
     # below the same way held_back already does for the other checks.
-    consensus_analysis = _consensus(args.pdf_path)
+    consensus_analysis = _consensus(args.pdf_path, st.session_state.orientation_overrides)
     with st.expander("Consensus-ink anomaly check", expanded=bool(consensus_analysis.holds)):
         st.code(format_consensus_report(consensus_analysis), language=None)
 
@@ -1156,11 +1333,10 @@ def main() -> None:
         st.error(f"Roster error: {exc}")
         return
     session_tags = {packet_tag(args.pdf_path, p) for p in segmented.packets}
-    proposals = [p for p in _proposals(args.pdf_path, args.roster_path, period_for_roster) if p.packet_tag in session_tags]
+    proposals = [p for p in _proposals(args.pdf_path, args.roster_path, period_for_roster, st.session_state.orientation_overrides) if p.packet_tag in session_tags]
     auto_assignments = assign_all(proposals, round_labels=round_labels)
     proposals_by_tag = {p.packet_tag: p for p in proposals}
 
-    _init_state(args.pdf_path, args.decisions_dir)
     _render_sidebar(args, segmented, roster, resolved_block, round_labels, consensus_analysis.holds)
 
     tags = [packet_tag(args.pdf_path, p) for p in segmented.packets]
@@ -1233,7 +1409,7 @@ def _prefetch_next_packet(
     next_packet = packet_by_tag[tags[i + 1]]
     try:
         for page_idx in next_packet.page_indices:
-            _page_image(args.pdf_path, page_idx, DPI)
+            _page_image(args.pdf_path, page_idx, DPI, st.session_state.orientation_overrides)
     except Exception:
         pass
 

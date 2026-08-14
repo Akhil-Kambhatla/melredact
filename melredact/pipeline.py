@@ -488,6 +488,7 @@ def release_from_manual_queue(
     extra_page_regions: dict[int, list[Bbox]] | None = None,
     flagged_regions_to_verify: dict[int, list[Bbox]] | None = None,
     decisions_dir: str | Path = DECISIONS_DIR,
+    orientation_overrides: dict[int, int] | None = None,
 ) -> ManualReleaseResult:
     """The human side of the manual-redaction queue: re-redacts `packet`
     using a human-supplied, corrected `band_override` instead of whatever
@@ -550,7 +551,9 @@ def release_from_manual_queue(
     entry = roster.by_sid[sid]
     topic = topic_from_filename(pdf_path)
     if round_label is None:
-        round_label = round_labels_by_tag(collect_packet_rounds(pdf_path)).get(tag, UNDATED_ROUND)
+        round_label = round_labels_by_tag(
+            collect_packet_rounds(pdf_path, orientation_overrides=orientation_overrides)
+        ).get(tag, UNDATED_ROUND)
     ledger = _load_ledger(out_dir, pdf_path)
     out_path, collision_note = _claim_output_path(ledger, tag, out_dir, entry, packet.worksheet_type, topic, round_label)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -565,6 +568,7 @@ def release_from_manual_queue(
         band_override=band_override,
         header_bbox_override=header_bbox_override,
         extra_page_regions=extra_page_regions,
+        orientation_overrides=orientation_overrides,
     )
     # find_uncovered_group_words' finding is advisory only here too, same
     # as run_dispositions -- see CLAUDE.md's "From detection-gates-workflow
@@ -748,15 +752,52 @@ def save_manual_geometry(
     path.write_text(json.dumps(all_geometry, indent=2, sort_keys=True))
 
 
-def propose_all(pdf_path: str | Path, segmented: SegmentResult, roster: Roster) -> list[MatchProposal]:
+def orientation_overrides_path(pdf_path: str | Path, decisions_dir: Path = DECISIONS_DIR) -> Path:
+    """Where a human's per-page rotation choice is recorded -- see
+    orientation.py's detect-and-ask design and review_app.py's rotate
+    controls. A separate file from decisions_path, same reasoning as
+    overrides_path/manual_geometry_path: decisions' sid|None|absent
+    three-state contract shouldn't also carry this. Keyed by page_index
+    (int, JSON-serialized as a string key) -> applied angle
+    (0/90/180/270), always winning over the detector's own guess for that
+    page, whether confirming it, correcting it, or rotating a page the
+    detector never flagged at all."""
+    return Path(decisions_dir) / f"{Path(pdf_path).stem}.orientation.json"
+
+
+def load_orientation_overrides(pdf_path: str | Path, decisions_dir: Path = DECISIONS_DIR) -> dict[int, int]:
+    path = orientation_overrides_path(pdf_path, decisions_dir)
+    if not path.exists():
+        return {}
+    raw = json.loads(path.read_text())
+    return {int(k): int(v) % 360 for k, v in raw.items()}
+
+
+def save_orientation_overrides(
+    pdf_path: str | Path, overrides: dict[int, int], decisions_dir: Path = DECISIONS_DIR
+) -> None:
+    path = orientation_overrides_path(pdf_path, decisions_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({str(k): int(v) % 360 for k, v in overrides.items()}, indent=2, sort_keys=True))
+
+
+def propose_all(
+    pdf_path: str | Path,
+    segmented: SegmentResult,
+    roster: Roster,
+    *,
+    orientation_overrides: dict[int, int] | None = None,
+) -> list[MatchProposal]:
     """One ranked candidate list per packet, keyed by the stable packet_tag
     rather than segment.py's positional packet_index, so callers (the
     review UI, run_dispositions) can key off something that survives
     across runs. Orphan packets (no header page -- see segment.py) have no
     Name field to score at all, so they always abstain with an empty
-    candidate list rather than being skipped."""
+    candidate list rather than being skipped. `orientation_overrides` is
+    pure plumbing through to `open_pdf` -- see orientation.py's
+    detect-and-ask design; it never changes match.py's own scoring."""
     proposals = []
-    with open_pdf(pdf_path) as pdf:
+    with open_pdf(pdf_path, orientation_overrides=orientation_overrides) as pdf:
         for packet in segmented.packets:
             tag = packet_tag(pdf_path, packet)
             if packet.header_page_index is None:
@@ -767,7 +808,9 @@ def propose_all(pdf_path: str | Path, segmented: SegmentResult, roster: Roster) 
     return proposals
 
 
-def _held_match_for_packet(pdf_path: str | Path, packet: Packet, roster: Roster) -> HeldCandidate | None:
+def _held_match_for_packet(
+    pdf_path: str | Path, packet: Packet, roster: Roster, *, orientation_overrides: dict[int, int] | None = None
+) -> HeldCandidate | None:
     """Re-runs match.py's scoring for one packet (the same name_text/
     propose call propose_all already does for every packet during review)
     to answer one narrow question: is this packet's single best match, out
@@ -778,13 +821,20 @@ def _held_match_for_packet(pdf_path: str | Path, packet: Packet, roster: Roster)
     "OCR is disk-cached" section) -- this isn't a second expensive pass."""
     if packet.header_page_index is None:
         return None
-    with open_pdf(pdf_path) as pdf:
+    with open_pdf(pdf_path, orientation_overrides=orientation_overrides) as pdf:
         fields = extract_header_fields(pdf.pages[packet.header_page_index])
     proposal = propose(packet_tag(pdf_path, packet), fields.name_text, roster)
     return proposal.top_held if proposal.is_held_match else None
 
 
-def _draft_consent_hold_redaction(pdf_path: str | Path, packet: Packet, dpi: int, flatten: bool) -> None:
+def _draft_consent_hold_redaction(
+    pdf_path: str | Path,
+    packet: Packet,
+    dpi: int,
+    flatten: bool,
+    *,
+    orientation_overrides: dict[int, int] | None = None,
+) -> None:
     """Redaction is unconditional, never dependent on whether a SID could
     ever be resolved (see CLAUDE.md) -- a consent-hold packet still gets
     fully redacted, proving the geometry is sound, even though the result
@@ -792,7 +842,14 @@ def _draft_consent_hold_redaction(pdf_path: str | Path, packet: Packet, dpi: int
     directory that's removed the moment this returns, so nothing about a
     consent hold ever leaves a file sitting anywhere on disk."""
     with tempfile.TemporaryDirectory() as scratch_dir:
-        _redact_packet(pdf_path, packet, Path(scratch_dir) / "scratch.pdf", dpi=dpi, flatten=flatten)
+        _redact_packet(
+            pdf_path,
+            packet,
+            Path(scratch_dir) / "scratch.pdf",
+            dpi=dpi,
+            flatten=flatten,
+            orientation_overrides=orientation_overrides,
+        )
 
 
 @dataclass
@@ -828,6 +885,7 @@ def analyze_redaction_holds(
     *,
     dpi: int = RENDER_DPI_FINAL,
     flatten: bool = False,
+    orientation_overrides: dict[int, int] | None = None,
 ) -> list[HoldAnalysis]:
     """Read-only redaction analysis: reports which of run_dispositions'
     three unconditional per-packet HOLDS (detection confidence, consensus-
@@ -873,14 +931,20 @@ def analyze_redaction_holds(
     """
     results: list[HoldAnalysis] = []
     labels = round_labels or {}
-    consensus = consensus_holds if consensus_holds is not None else analyze_consensus_anomalies(pdf_path, segmented).holds
+    consensus = (
+        consensus_holds
+        if consensus_holds is not None
+        else analyze_consensus_anomalies(pdf_path, segmented, orientation_overrides=orientation_overrides).holds
+    )
     with tempfile.TemporaryDirectory() as scratch_dir:
         for packet in segmented.packets:
             if packet.header_page_index is None:
                 continue
             tag = packet_tag(pdf_path, packet)
             scratch_path = Path(scratch_dir) / f"{tag}.pdf"
-            redact_result = _redact_packet(pdf_path, packet, scratch_path, dpi=dpi, flatten=flatten)
+            redact_result = _redact_packet(
+                pdf_path, packet, scratch_path, dpi=dpi, flatten=flatten, orientation_overrides=orientation_overrides
+            )
             analysis = HoldAnalysis(packet_tag=tag, round_label=labels.get(tag, UNDATED_ROUND))
             tag_holds = consensus.get(tag, [])
             if redact_result.uncovered_group_words:
@@ -1013,6 +1077,7 @@ def run_dispositions(
     allow_delete: bool = True,
     manual_geometry: dict[str, dict] | None = None,
     consensus_holds: dict[str, list[AnomalyHold]] | None = None,
+    orientation_overrides: dict[int, int] | None = None,
 ) -> list[DispositionResult]:
     """Apply final per-packet decisions. See module docstring for the
     three-state `decisions` contract -- this is where "confirmed
@@ -1083,6 +1148,17 @@ def run_dispositions(
     run gets any geometry override beyond band_override/header_bbox_
     override/extra_page_regions this function never itself constructs.
 
+    `orientation_overrides` (page_index -> 0/90/180/270, see orientation.py's
+    detect-and-ask design and `load_orientation_overrides`/`save_
+    orientation_overrides` above) is a human's explicit per-page rotation
+    choice, threaded straight through to every OCR/matching/redaction call
+    this function makes (and to the round/consensus passes it computes when
+    not given them directly) so a confirmed or corrected rotation reaches
+    every stage the same way, not just a preview. Left as None (the
+    default), a page the detector couldn't confidently rotate on its own
+    stays exactly as found and its packet is held via the ordinary
+    `packet.issues` gate above -- never guessed.
+
     `consensus_holds` (packet_tag -> list[consensus.AnomalyHold], see
     consensus.analyze_consensus_anomalies) is a fourth unconditional check,
     alongside detection confidence, uncovered group-row ink, and
@@ -1111,9 +1187,11 @@ def run_dispositions(
     results: list[DispositionResult] = []
     topic = topic_from_filename(pdf_path)
     if round_labels is None:
-        round_labels = round_labels_by_tag(collect_packet_rounds(pdf_path, segmented=segmented))
+        round_labels = round_labels_by_tag(
+            collect_packet_rounds(pdf_path, segmented=segmented, orientation_overrides=orientation_overrides)
+        )
     if consensus_holds is None:
-        consensus_holds = analyze_consensus_anomalies(pdf_path, segmented).holds
+        consensus_holds = analyze_consensus_anomalies(pdf_path, segmented, orientation_overrides=orientation_overrides).holds
 
     def _delete_stale_output(stale_path: Path, stale_sid: str) -> None:
         # Deliberately doesn't touch `ledger` -- callers own that, since
@@ -1130,9 +1208,11 @@ def run_dispositions(
         tag = packet_tag(pdf_path, packet)
 
         if tag not in decisions:
-            held = _held_match_for_packet(pdf_path, packet, roster)
+            held = _held_match_for_packet(pdf_path, packet, roster, orientation_overrides=orientation_overrides)
             if held is not None:
-                _draft_consent_hold_redaction(pdf_path, packet, dpi, flatten)
+                _draft_consent_hold_redaction(
+                    pdf_path, packet, dpi, flatten, orientation_overrides=orientation_overrides
+                )
                 reason = (
                     f"best match is a held name ({held.full_name}) -- consent-known, SID unresolvable; "
                     "never auto-assigned a roster SID, never deleted"
@@ -1208,7 +1288,14 @@ def run_dispositions(
         stamp_lines = [f"SID: {entry.sid}", f"PD: {entry.period_display}"]
         geometry_kwargs = (manual_geometry or {}).get(tag, {})
         redact_result = _redact_packet(
-            pdf_path, packet, out_path, dpi=dpi, flatten=flatten, stamp_lines=stamp_lines, **geometry_kwargs
+            pdf_path,
+            packet,
+            out_path,
+            dpi=dpi,
+            flatten=flatten,
+            stamp_lines=stamp_lines,
+            orientation_overrides=orientation_overrides,
+            **geometry_kwargs,
         )
         detection_note: str | None = None
         if redact_result.band is not None and not redact_result.band.detected:

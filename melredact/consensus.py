@@ -452,18 +452,28 @@ def _analyze_group(
     return holds, None
 
 
-def analyze_consensus_anomalies(pdf_path: str | Path, segmented: SegmentResult) -> ConsensusAnalysis:
+def analyze_consensus_anomalies(
+    pdf_path: str | Path, segmented: SegmentResult, *, orientation_overrides: dict[int, int] | None = None
+) -> ConsensusAnalysis:
     """Whole-file entry point: groups every packet's non-header pages by
     (worksheet_type, page_offset), runs the two-pass consensus check on each
     group, and returns packet_tag -> anomalous regions plus which groups
     were too small to check at all. Computed once per run (see pipeline.
     run_dispositions's `consensus_holds` parameter), not per packet -- the
     whole point of building a group's consensus is that it's shared work
-    across every packet in it."""
+    across every packet in it.
+
+    `orientation_overrides` is pure plumbing through to `open_pdf` (see
+    orientation.py's detect-and-ask design) -- without it, a page still
+    awaiting a human's rotation confirmation would be analyzed at the
+    wrong orientation here while segment.py/redact.py (which do receive
+    it) correctly see the upright version, a real cross-module
+    inconsistency. Threading it through changes which physical pixels this
+    function reads, never the detection algorithm itself."""
     groups = _build_groups(pdf_path, segmented)
     holds: dict[str, list[AnomalyHold]] = {}
     skipped: list[ConsensusGroupSkipped] = []
-    with open_pdf(pdf_path) as pdf:
+    with open_pdf(pdf_path, orientation_overrides=orientation_overrides) as pdf:
         for (worksheet_type, page_offset), items in sorted(groups.items()):
             group_holds, skip = _analyze_group(pdf, pdf_path, worksheet_type, page_offset, items)
             if skip is not None:

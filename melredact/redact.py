@@ -690,6 +690,7 @@ def redact_packet(
     band_override: HeaderBand | None = None,
     header_bbox_override: tuple[Bbox, Bbox] | None = None,
     extra_page_regions: dict[int, list[Bbox]] | None = None,
+    orientation_overrides: dict[int, int] | None = None,
 ) -> RedactResult:
     """Produce a redacted single-packet PDF.
 
@@ -745,6 +746,12 @@ def redact_packet(
     An offset that also happens to be the header page's own offset is
     additive with the header rectangles, not a replacement for them.
 
+    `orientation_overrides` (page_index -> 0/90/180/270) is a human's
+    explicit per-page rotation choice (see orientation.py's detect-and-ask
+    design and review_app.py's rotate controls), threaded straight through
+    to `open_pdf` below -- pure plumbing, no change to how the header
+    border or Group-row geometry is computed once the page is upright.
+
     Packets missing a header page (`is_orphan`) have nothing to redact --
     `band`/`redact_bbox`/`redact_strip_bbox` come back None. This function
     is purely mechanical; callers must gate on `packet.issues` themselves
@@ -753,7 +760,7 @@ def redact_packet(
     the same way they already do verify_no_leaked_names findings.
     """
     extra_page_regions = extra_page_regions or {}
-    with open_pdf(pdf_path) as pdf:
+    with open_pdf(pdf_path, orientation_overrides=orientation_overrides) as pdf:
         band: HeaderBand | None = None
         left_bbox: Bbox | None = None
         right_bbox: Bbox | None = None

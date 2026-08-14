@@ -104,6 +104,7 @@ from melredact.pipeline import (
     load_decisions,
     load_detection_overrides,
     load_manual_geometry,
+    load_orientation_overrides,
     packet_tag,
     run_dispositions,
 )
@@ -137,14 +138,31 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(f"Roster CSV not found: {roster_path}", file=sys.stderr)
         return 1
 
+    # Loaded before segmenting -- a human's per-page rotation choice (see
+    # orientation.py's detect-and-ask design and review_app.py's rotate
+    # controls) has to reach segmentation itself, not just redaction, so
+    # every packet built from a confirmed/corrected page reads correctly
+    # from the start rather than being (re-)flagged as unresolved here.
+    orientation_overrides = load_orientation_overrides(pdf_path, decisions_dir=Path(args.decisions))
+
     # Segmented once, up front, and reused everywhere else in this command
     # (block-date collection, round grouping, run_dispositions itself) --
     # segmentation is cheap on its own, but re-segmenting needlessly would
     # also mean re-deriving packet identity (packet_tag) from scratch each
     # time, which is only ever safe when it's the exact same SegmentResult.
-    segmented = segment_pdf(pdf_path)
+    segmented = segment_pdf(pdf_path, orientation_overrides=orientation_overrides)
 
-    round_groups = collect_packet_rounds(pdf_path, segmented=segmented)
+    pending_rotation = [
+        p for p in segmented.packets if any("not yet confirmed by a reviewer" in i for i in p.issues)
+    ]
+    if pending_rotation:
+        print(
+            f"note: {len(pending_rotation)} packet(s) have a page with a confident but unconfirmed "
+            "rotation guess -- use review_app.py's rotate control to confirm or correct before this "
+            f"run can process them: {[Path(pdf_path).stem + f'_p{p.page_indices[0]:03d}' for p in pending_rotation]}"
+        )
+
+    round_groups = collect_packet_rounds(pdf_path, segmented=segmented, orientation_overrides=orientation_overrides)
     print(format_round_report(round_groups))
     round_labels = round_labels_by_tag(round_groups)
 
@@ -176,7 +194,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # consensus.py's own module docstring for the cost this pass carries
     # (a full-group rasterize + ECC alignment pass, disk-cached, but still
     # worth computing once, not twice).
-    consensus_analysis = analyze_consensus_anomalies(pdf_path, segmented)
+    consensus_analysis = analyze_consensus_anomalies(pdf_path, segmented, orientation_overrides=orientation_overrides)
     print()
     print(format_consensus_report(consensus_analysis))
 
@@ -199,7 +217,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 return 1
             class_period = int(inferred)
 
-        dates = collect_packet_dates(pdf_path, segmented=segmented)
+        dates = collect_packet_dates(pdf_path, segmented=segmented, orientation_overrides=orientation_overrides)
         resolution = resolve_block(dates, class_period, metadata)
         print(format_resolution_report(resolution))
 
@@ -260,7 +278,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
         # signal for a human skimming the run, never something that gates
         # or alters this run. Only a `_blocks.json` sidecar makes date
         # resolution load-bearing (the branch above).
-        print(format_month_histogram(collect_packet_dates(pdf_path, segmented=segmented)))
+        print(
+            format_month_histogram(
+                collect_packet_dates(pdf_path, segmented=segmented, orientation_overrides=orientation_overrides)
+            )
+        )
 
     try:
         roster = load_roster(roster_path, period=period_for_roster, infer_period_from=pdf_path)
@@ -304,6 +326,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         allow_delete=not args.no_delete,
         manual_geometry=manual_geometry,
         consensus_holds=consensus_analysis.holds,
+        orientation_overrides=orientation_overrides,
     )
 
     written = [r for r in results if r.out_path is not None]
@@ -363,8 +386,9 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         print(f"Roster CSV not found: {roster_path}", file=sys.stderr)
         return 1
 
-    segmented = segment_pdf(pdf_path)
-    round_groups = collect_packet_rounds(pdf_path, segmented=segmented)
+    orientation_overrides = load_orientation_overrides(pdf_path, decisions_dir=Path(args.decisions))
+    segmented = segment_pdf(pdf_path, orientation_overrides=orientation_overrides)
+    round_groups = collect_packet_rounds(pdf_path, segmented=segmented, orientation_overrides=orientation_overrides)
     print(format_round_report(round_groups))
     round_labels = round_labels_by_tag(round_groups)
 
@@ -374,7 +398,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    consensus_analysis = analyze_consensus_anomalies(pdf_path, segmented)
+    consensus_analysis = analyze_consensus_anomalies(pdf_path, segmented, orientation_overrides=orientation_overrides)
     print()
     print(format_consensus_report(consensus_analysis))
 
@@ -383,7 +407,9 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         "is written to out/, redacted output is discarded immediately after inspection, and "
         "nothing is deleted.\n"
     )
-    results = analyze_redaction_holds(pdf_path, segmented, roster, round_labels, consensus_analysis.holds)
+    results = analyze_redaction_holds(
+        pdf_path, segmented, roster, round_labels, consensus_analysis.holds, orientation_overrides=orientation_overrides
+    )
     print(format_hold_analysis_report(results))
     return 0
 
@@ -518,6 +544,14 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="restrict the roster to this period's block (e.g. '2' or '02'); inferred from --pdf's "
         "filename (e.g. 'PD2') if omitted",
+    )
+    p_analyze.add_argument(
+        "--decisions",
+        default="decisions",
+        help="decisions directory (default: decisions) -- read here only for any already-recorded "
+        "per-page orientation confirmations (see orientation.py's detect-and-ask design), so a page "
+        "a reviewer has already rotated is analyzed at its confirmed orientation rather than being "
+        "reported unresolved a second time",
     )
     p_analyze.set_defaults(func=_cmd_analyze)
 

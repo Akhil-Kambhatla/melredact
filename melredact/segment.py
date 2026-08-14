@@ -168,7 +168,19 @@ def _parse_worksheet_type(text: str) -> str | None:
 def read_footer(page: pdfplumber.page.Page) -> FooterInfo:
     """Read the printed 'Page X of Y' and worksheet-type label from the
     footer band only (not the whole page), so body text elsewhere can never
-    be mistaken for either."""
+    be mistaken for either.
+
+    `page.height <= FOOTER_BAND_TOP` (a degenerate bbox) means "unreadable",
+    not a crash to propagate -- this genuinely happens for a page whose
+    orientation hasn't been resolved yet (see orientation.py's
+    detect-and-ask design): a page still physically rotated 90/270 has
+    swapped width/height, so the ordinary portrait footer band no longer
+    fits on it at all. That page was always going to fail this read one
+    way or another (its footer text isn't where this band looks either
+    way); this just makes the failure the same "unreadable footer" outcome
+    instead of an unhandled pdfplumber ValueError."""
+    if page.height <= FOOTER_BAND_TOP:
+        return FooterInfo(page_num=None, page_total=None, raw_text="", readable=False, worksheet_type=None)
     bbox = (0, FOOTER_BAND_TOP, page.width, page.height)
     if page.chars:
         text = page.crop(bbox).extract_text() or ""
@@ -347,7 +359,7 @@ def extract_header_fields(page: pdfplumber.page.Page) -> HeaderFields:
     )
 
 
-def segment_pdf(pdf_path: str | Path) -> SegmentResult:
+def segment_pdf(pdf_path: str | Path, *, orientation_overrides: dict[int, int] | None = None) -> SegmentResult:
     """Group pages into packets using the footer as ground truth. A header
     page always starts a new packet. A continuation-looking page with no
     open packet (missing page 1) becomes its own flagged, orphaned packet
@@ -355,21 +367,34 @@ def segment_pdf(pdf_path: str | Path) -> SegmentResult:
     Nothing here infers a page count that isn't printed on the page.
 
     `open_pdf` (see pdfio.py) already normalizes every confidently-
-    classifiable page to upright before this function ever sees it (see
-    melredact/orientation.py) -- is_header_page/read_footer below need no
-    rotation-awareness of their own. A page orientation couldn't be
-    confidently determined for, though, is left exactly as found (never a
-    guessed rotation) and is instead surfaced here as a packet `issues`
-    entry naming the page -- the same "abstain and flag" treatment an
-    unreadable footer already gets, not a new hold mechanism. Whichever
-    packet ends up containing that page (however segmentation reads its
-    now-possibly-garbled header/footer content) is held back by the
-    existing "packet with unresolved issues is refused" rule in
-    pipeline.run_dispositions -- no separate code path needed."""
-    from melredact.orientation import unresolved_page_indices
+    classifiable, human-confirmed, or human-corrected page to upright
+    before this function ever sees it (see melredact/orientation.py) --
+    is_header_page/read_footer below need no rotation-awareness of their
+    own. `orientation_overrides` (page_index -> 0/90/180/270) is threaded
+    straight through to `open_pdf` and to the orientation lookup below, so
+    a human's rotation choice (see review_app.py's rotate controls) reaches
+    segmentation the same way it reaches OCR, matching, and redaction --
+    all four go through the same normalized file.
 
-    unresolved = set(unresolved_page_indices(pdf_path))
-    with open_pdf(pdf_path) as pdf:
+    A page whose orientation couldn't be confidently determined at all, or
+    whose confident nonzero rotation guess hasn't been confirmed by a
+    human yet (see orientation.py's detect-and-ask design), is left exactly
+    as found -- never a guessed rotation -- and is instead surfaced here as
+    a packet `issues` entry naming the page, the detector's own guess and
+    confidence when it has one, and what a reviewer needs to do about it.
+    This is the same "abstain and flag" treatment an unreadable footer
+    already gets, not a new hold mechanism: whichever packet ends up
+    containing that page (however segmentation reads its now-possibly-
+    garbled header/footer content) is held back by the existing "packet
+    with unresolved issues is refused" rule in pipeline.run_dispositions --
+    no separate code path needed."""
+    from melredact.orientation import orientation_for
+
+    orientation_result = orientation_for(pdf_path, overrides=orientation_overrides)
+    unresolved = set(orientation_result.unresolved_page_indices())
+    pending_confirmation = set(orientation_result.pending_confirmation_page_indices())
+    orientation_by_page = orientation_result.by_page()
+    with open_pdf(pdf_path, orientation_overrides=orientation_overrides) as pdf:
         pages_info = [(idx, is_header_page(page), read_footer(page)) for idx, page in enumerate(pdf.pages)]
 
     packets: list[Packet] = []
@@ -458,13 +483,19 @@ def segment_pdf(pdf_path: str | Path) -> SegmentResult:
 
     close_current()
 
-    if unresolved:
+    if unresolved or pending_confirmation:
         for packet in packets:
-            bad_pages = sorted(unresolved.intersection(packet.page_indices))
-            for idx in bad_pages:
+            for idx in sorted(unresolved.intersection(packet.page_indices)):
                 packet.issues.append(
                     f"page {idx}: orientation could not be confidently determined, held for human review "
                     "rather than processed at a guessed rotation"
+                )
+            for idx in sorted(pending_confirmation.intersection(packet.page_indices)):
+                po = orientation_by_page[idx]
+                packet.issues.append(
+                    f"page {idx}: orientation detected as rotated {po.detected_angle}° "
+                    f"(confidence {po.score:.2f}) but not yet confirmed by a reviewer -- use the rotate "
+                    "control to confirm or correct this page's orientation before it can be processed"
                 )
 
     return SegmentResult(packets=packets, page_count=len(pages_info))

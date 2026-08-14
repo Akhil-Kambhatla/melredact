@@ -107,7 +107,7 @@ def resolved_source_path(path: str | Path) -> Path:
     return path
 
 
-def open_pdf(path: str | Path) -> pdfplumber.PDF:
+def open_pdf(path: str | Path, *, orientation_overrides: dict[int, int] | None = None) -> pdfplumber.PDF:
     """Drop-in replacement for `pdfplumber.open(path)` everywhere this
     codebase opens a real, caller-supplied PDF -- see the module
     docstring for what this repairs and why. Returns a normal
@@ -117,9 +117,18 @@ def open_pdf(path: str | Path) -> pdfplumber.PDF:
     original actually needs it -- and, as of 2026-08-14, also chained
     through `orientation.normalize_pdf` so every page is upright before a
     single downstream module ever sees it (see module docstring).
+
+    `orientation_overrides` (page_index -> 0/90/180/270) is a human's
+    explicit per-page rotation choice -- see `orientation.py`'s
+    detect-and-ask design. Left as None (the default, and what every call
+    site not explicitly reviewer-facing still passes), a page whose
+    rotation the classifier can't confidently apply on its own stays
+    exactly as found rather than being guessed -- this parameter is the
+    only way a human's confirmation or correction actually reaches the
+    physical file every downstream module reads.
     """
     from melredact.orientation import normalize_pdf
 
     resolved = resolved_source_path(path)
-    result = normalize_pdf(resolved)
+    result = normalize_pdf(resolved, overrides=orientation_overrides)
     return pdfplumber.open(result.normalized_path)
