@@ -1723,6 +1723,40 @@ def run_preflight(
     )
 
 
+_ISSUE_PAGE_RE = re.compile(r"^page (\d+):")
+
+
+def other_blocked_packets(report: PreflightReport) -> list[PreflightPacket]:
+    """Blocked packets not already itemized by the unsegmentable, page-
+    count-mismatch, or orientation sections of the preflight report --
+    shared by `format_preflight_report` and `render_preflight_contact_
+    sheet` so the two can never drift on which packets this covers (found
+    the hard way, 2026-08-14: a real packet, an unreadable footer on a
+    continuation page, fell through every section of the *text* report
+    before this existed as its own itemized category)."""
+    oriented_tags = {f.packet_tag for f in report.orientation_flags if f.packet_tag is not None}
+    return [
+        p
+        for p in report.packets
+        if p.blocked and not p.is_orphan and not p.page_count_mismatch and p.packet_tag not in oriented_tags
+    ]
+
+
+def _issue_page_indices(packet: PreflightPacket) -> list[int]:
+    """Physical page indices named by this packet's own issue strings
+    (segment.py's issues always lead with "page N: ..."), so a report
+    consumer can point a human at the *specific* page an issue is about
+    rather than a generic stand-in. Falls back to the header page (or, for
+    an orphan, the packet's own first page) when no issue names a page at
+    all -- every packet has at least one of those."""
+    found = {int(m.group(1)) for i in packet.issues if (m := _ISSUE_PAGE_RE.match(i))}
+    if found:
+        return sorted(found)
+    if packet.header_page_index is not None:
+        return [packet.header_page_index]
+    return packet.page_indices[:1]
+
+
 def format_preflight_report(report: PreflightReport) -> str:
     """Human-readable preflight report -- everything wrong with the file,
     then a plain verdict at the end (see PreflightReport.n_clean/n_needs_
@@ -1784,12 +1818,7 @@ def format_preflight_report(report: PreflightReport) -> str:
     # process` in the verdict below, but had nowhere in the printed report
     # naming *which* packet or why -- a silent gap between an accurate
     # count and an exhaustive listing.
-    oriented_tags = {f.packet_tag for f in report.orientation_flags if f.packet_tag is not None}
-    other_blocked = [
-        p
-        for p in report.packets
-        if p.blocked and not p.is_orphan and not p.page_count_mismatch and p.packet_tag not in oriented_tags
-    ]
+    other_blocked = other_blocked_packets(report)
     if other_blocked:
         lines.append(f"\nOther blocked packets: {len(other_blocked)}")
         for p in other_blocked:
@@ -1819,8 +1848,9 @@ def render_preflight_contact_sheet(
 ) -> Path | None:
     """One thumbnail per flagged page -- an orientation issue, an
     undetected header border, uncovered-ink advisory ink, a consensus-ink
-    anomaly, or an unsegmentable/orphan packet's own first page -- laid
-    out into a single contact-sheet PNG under
+    anomaly, an unsegmentable/orphan packet's own first page, or any other
+    blocked packet's own issue-named page (see other_blocked_packets) --
+    laid out into a single contact-sheet PNG under
     `out_dir/.diagnostics/<pdf-stem>_preflight/contact_sheet.png`, each
     thumbnail labelled with the specific reason(s) it was flagged. Meant
     to be eyeballed in one place rather than paging through review_app.py
@@ -1854,6 +1884,16 @@ def render_preflight_contact_sheet(
             flag(p.page_indices[0], f"{p.packet_tag}: unsegmentable ({'; '.join(p.issues)})")
         if p.page_count_mismatch and p.header_page_index is not None:
             flag(p.header_page_index, f"{p.packet_tag}: page count vs. footer mismatch")
+
+    # Anything blocked for a reason not already covered above (see
+    # other_blocked_packets' own docstring) -- labelled on the specific
+    # page its own issue text names, not a generic stand-in, so a real
+    # unreadable-footer/segmentation problem shows up on the actual page
+    # that has it, not silently absent from the contact sheet the way it
+    # was before this existed.
+    for p in other_blocked_packets(report):
+        for idx in _issue_page_indices(p):
+            flag(idx, f"{p.packet_tag}: blocked ({'; '.join(p.issues)})")
 
     if not notes:
         return None

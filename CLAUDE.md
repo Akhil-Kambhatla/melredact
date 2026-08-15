@@ -3850,6 +3850,43 @@ asserts it's the sole entry in "Other blocked packets" and that
 `n_cannot_process` exactly equals the sum of every itemized category (no
 silent gap between an accurate count and an exhaustive listing).
 
+**The same gap existed in the contact sheet, not just the text report —
+found by actually reviewing the 3 real blocked packets against the
+rendered images, not just the printed reasons.** `010406_PD1_PRT_p086`'s
+own flagged page (physical page 87) *was* in the contact sheet, but only
+labelled with its non-blocking consensus-ink anomaly — the actual reason
+it's blocked (the unreadable footer on that page) was invisible on the
+sheet itself. Confirmed directly: cropping just that page's footer band at
+300dpi and comparing it against a normal page's footer (`PRT (01/2024)` /
+`Page 2 of 2`, clearly legible) showed the flagged page's footer band is
+genuinely blank — a few stray specks, no printed text at all — a real scan
+defect, not a false OCR read. Fixed by factoring the "blocked but not
+itemized elsewhere" logic out of `format_preflight_report` into a shared
+`pipeline.other_blocked_packets`, used by both the text report and
+`render_preflight_contact_sheet` so the two can't drift on which packets
+this covers, plus a new `pipeline._issue_page_indices` that parses the
+actual page number out of a packet's own issue text (segment.py's issues
+always lead with `"page N: ..."`) so the contact-sheet label lands on the
+*specific* page the problem is on, not a generic stand-in (falls back to
+the header page when no issue names one). Verified against the real file
+after the fix: page 87's thumbnail now correctly shows both `010406_PD1_
+PRT_p086: consensus-ink anomaly` and `010406_PD1_PRT_p086: blocked (page
+87: unreadable footer, cannot verify sequence)`. Regression test:
+`tests/test_preflight.py`'s existing rotation/unsegmentable/no-match test
+now also asserts `_issue_page_indices` resolves packet D's issue to its
+actual continuation page and that `render_preflight_contact_sheet`
+produces a sheet at all for that fixture.
+
+The other two real blocked packets (`_p056`, `_p084`) were also reviewed
+directly against the rendered pages while investigating this, for the same
+reason: `_p056`'s own footer reads a self-consistent "Page 1 of 2" / "Page
+2 of 2" pair, but its first physical page has no header block printed on
+it at all (no border, no Name/Teacher/Group/Date/Period fields) — a real
+template/scan anomaly on that specific page, not a segmentation bug (the
+footer is internally consistent, so nothing was silently dropped or
+merged). `_p084`'s two pages render legibly upside-down, confirming the
+already-documented real 180° duplex-scanner flip once again.
+
 ### What this session did not do
 
 Did not change `redact.py`'s detection geometry, `match.py`'s scoring, or

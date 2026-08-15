@@ -1,7 +1,14 @@
 import pytest
 
 from melredact.cli import main
-from melredact.pipeline import format_preflight_report, propose_all, run_preflight
+from melredact.pipeline import (
+    _issue_page_indices,
+    format_preflight_report,
+    other_blocked_packets,
+    propose_all,
+    render_preflight_contact_sheet,
+    run_preflight,
+)
 from melredact.roster import load_roster
 from melredact.segment import segment_pdf
 from tests.make_fixture import build_main_fixture, build_preflight_fixture, build_rotated_page_copy
@@ -94,12 +101,7 @@ def test_preflight_reports_rotation_unsegmentable_and_no_match_packets(tmp_path)
     # own docstring: found via a real preflight run, this used to fall
     # through every itemized section while still correctly counting
     # toward the verdict).
-    oriented_tags = {f.packet_tag for f in report.orientation_flags if f.packet_tag is not None}
-    other_blocked = [
-        p
-        for p in report.packets
-        if p.blocked and not p.is_orphan and not p.page_count_mismatch and p.packet_tag not in oriented_tags
-    ]
+    other_blocked = other_blocked_packets(report)
     assert len(other_blocked) == 1
     assert other_blocked[0].n_pages == 2
     assert not other_blocked[0].page_count_mismatch
@@ -117,6 +119,14 @@ def test_preflight_reports_rotation_unsegmentable_and_no_match_packets(tmp_path)
     assert "no plausible roster match" in text
     assert "Other blocked packets: 1" in text
     assert other_blocked[0].packet_tag in text
+
+    # The contact sheet must actually include and label packet D's own
+    # issue-named page (its continuation page, physical index 5), not
+    # silently omit it the way it used to (see other_blocked_packets/
+    # _issue_page_indices in pipeline.py).
+    assert _issue_page_indices(other_blocked[0]) == [5]
+    sheet_path = render_preflight_contact_sheet(rotated_path, report, tmp_path / "out")
+    assert sheet_path is not None and sheet_path.exists()
 
 
 def test_preflight_populates_the_same_cache_the_real_run_reads(tmp_path, monkeypatch):
