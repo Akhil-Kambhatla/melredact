@@ -117,7 +117,7 @@ def test_reject_after_approve_deletes_prior_output(main_fixture, tmp_path):
     packet = next(p for p in segment_pdf(main_fixture.pdf_path).packets if packet_tag(main_fixture.pdf_path, p) == "packets_p000")
     # Every fixture packet shares PacketSpec's default date_text
     # ("10/03/2025"), one contiguous round group for the whole file.
-    out_file = output_path(out_dir, roster.by_sid[sid], packet.worksheet_type, round_label=round_label("10/03/2025"))
+    out_file = output_path(out_dir, roster.by_sid[sid], packet.worksheet_type)
     assert out_file.exists()
 
     at2 = _launch(main_fixture.pdf_path, main_fixture.roster_path, out_dir, decisions_dir)
@@ -320,7 +320,7 @@ def test_manual_queue_panel_lists_a_queued_packet_and_can_release_it(tmp_path, m
 
     entry = roster.by_sid[sid]
     assert output_path(
-        out_dir, entry, seg.packets[0].worksheet_type, round_label=round_label("10/03/2025")
+        out_dir, entry, seg.packets[0].worksheet_type
     ).exists()
     assert list_manual_queue(out_dir) == []
 
@@ -366,7 +366,7 @@ def test_edit_redaction_reachable_for_a_non_held_packet_and_resolves_by_name(mai
     packet = next(
         p for p in segment_pdf(main_fixture.pdf_path).packets if packet_tag(main_fixture.pdf_path, p) == tag
     )
-    expected_path = output_path(out_dir, entry, packet.worksheet_type, round_label=round_label("10/03/2025"))
+    expected_path = output_path(out_dir, entry, packet.worksheet_type)
     assert expected_path.exists()
     assert list_manual_queue(out_dir) == [], "a never-held packet must never end up in the manual queue"
 

@@ -179,15 +179,9 @@ def test_output_path_is_teacher_period_sid_not_packet_tag(main_fixture, segmente
     result = next(r for r in results if r.packet_tag == tag)
     assert (
         result.out_path
-        == out_dir
-        / entry.teacher_code
-        / entry.period_display
-        / packet.worksheet_type
-        / "NA"
-        / FIXTURE_ROUND
-        / f"{sid}.pdf"
+        == out_dir / entry.teacher_code / packet.worksheet_type / entry.period_display / f"{sid}.pdf"
     )
-    assert result.out_path == output_path(out_dir, entry, packet.worksheet_type, round_label=FIXTURE_ROUND)
+    assert result.out_path == output_path(out_dir, entry, packet.worksheet_type)
 
 
 def test_explicit_non_consent_deletes_existing_output_not_just_skips_it(main_fixture, segmented, roster, tmp_path):
@@ -249,7 +243,7 @@ def test_corrected_decision_writes_new_sid_and_removes_old(main_fixture, segment
     second = run_dispositions(main_fixture.pdf_path, segmented, {tag: new_entry.sid}, roster, out_dir=out_dir, dpi=DPI)
     tag_result = next(r for r in second if r.packet_tag == tag)
     assert tag_result.sid == new_entry.sid
-    assert tag_result.out_path == output_path(out_dir, new_entry, packet.worksheet_type, round_label=FIXTURE_ROUND)
+    assert tag_result.out_path == output_path(out_dir, new_entry, packet.worksheet_type)
     assert tag_result.out_path.exists()
     assert not old_path.exists()
 
@@ -543,51 +537,6 @@ def test_two_worksheet_types_for_same_student_do_not_collide_in_out(tmp_path, mo
 # --- topic path segment, and the no-silent-overwrite backstop ---
 
 
-def test_topic_from_filename_extracts_the_trailing_segment():
-    from melredact.pipeline import topic_from_filename
-
-    assert topic_from_filename("010406_PD1_PRT_EW.pdf") == "EW"
-    assert topic_from_filename("010406_PD1_PRT_fo.pdf") == "FO"
-
-
-def test_topic_from_filename_defaults_to_NA_with_constant_path_depth(tmp_path, roster):
-    """No topic in the filename (the overwhelmingly common case, e.g. every
-    non-010406 teacher, or 010406's own filenames before a topic session)
-    must resolve to the stable NO_TOPIC literal, not an omitted segment --
-    otherwise output path depth would vary per teacher."""
-    from melredact.pipeline import NO_TOPIC, output_path, topic_from_filename
-
-    assert topic_from_filename("010406_PD1_PRT.pdf") == NO_TOPIC
-    assert topic_from_filename("Hannel MPR PD2.pdf") == NO_TOPIC
-
-    entry = next(iter(roster))
-    no_topic_path = output_path(tmp_path, entry, "PRT")
-    with_topic_path = output_path(tmp_path, entry, "PRT", "EW")
-    assert len(no_topic_path.relative_to(tmp_path).parts) == len(with_topic_path.relative_to(tmp_path).parts)
-    # One level deeper than the topic segment itself now (see the round
-    # segment, output_path's fifth component) -- parent is the round dir,
-    # parent.parent is the topic dir.
-    assert no_topic_path.parent.parent.name == NO_TOPIC
-
-
-def test_different_topics_in_the_source_filename_do_not_collide(tmp_path, roster):
-    """Two scan files for the same teacher/period/worksheet_type but
-    different topics (the real motivating scenario: a teacher whose
-    students complete several PRT sessions, one per topic) must land at
-    distinct output paths purely from the topic segment, before the
-    no-silent-overwrite backstop is ever needed."""
-    from melredact.pipeline import output_path, topic_from_filename
-
-    entry = next(iter(roster))
-    ew_topic = topic_from_filename("010406_PD1_PRT_EW.pdf")
-    fr_topic = topic_from_filename("010406_PD1_PRT_FR.pdf")
-    ew_path = output_path(tmp_path, entry, "PRT", ew_topic)
-    fr_path = output_path(tmp_path, entry, "PRT", fr_topic)
-    assert ew_path != fr_path
-    assert ew_path.parent.parent.name == "EW"
-    assert fr_path.parent.parent.name == "FR"
-
-
 def test_second_packet_claiming_an_owned_path_gets_suffixed_not_overwritten(main_fixture, segmented, roster, tmp_path):
     """The no-silent-overwrite backstop: two distinct packets in the same
     scan file, both decided to the same student and worksheet type (the
@@ -723,10 +672,10 @@ def test_composition_override_does_not_release_an_orientation_issue(main_fixture
     assert "composition override does not cover" in result.reason
 
 
-def test_composition_override_does_not_release_a_consensus_ink_or_verify_hold(main_fixture, segmented, roster, tmp_path, monkeypatch):
-    """A composition override is never even consulted by the two real-
-    finding holds (consensus-ink anomaly, verify_no_leaked_names) -- those
-    stay non-overridable by any confirmation, composition included."""
+def test_composition_override_does_not_release_a_verify_hold(main_fixture, segmented, roster, tmp_path, monkeypatch):
+    """A composition override is never even consulted by the verify_
+    no_leaked_names hold -- it stays non-overridable by any confirmation,
+    composition included."""
     import melredact.pipeline as pipeline_mod
     from melredact.redact import LeakFinding
 
@@ -777,7 +726,7 @@ def test_leak_finding_deletes_output_and_holds_back_not_raises(main_fixture, seg
     result = next(r for r in results if r.packet_tag == tag)
     assert result.held_back
     assert "leaks" in result.reason
-    assert not output_path(out_dir, entry, packet.worksheet_type, round_label=FIXTURE_ROUND).exists()
+    assert not output_path(out_dir, entry, packet.worksheet_type).exists()
 
 
 def test_undetected_header_border_holds_back_only_that_packet_not_the_whole_run(
@@ -1160,7 +1109,7 @@ def test_vertical_group_row_overflow_is_advisory_not_held(tmp_path):
     assert result.geometry_source == "automatic"
 
     entry = roster.by_sid[sid]
-    expected_path = output_path(out_dir, entry, seg.packets[0].worksheet_type, round_label=FIXTURE_ROUND)
+    expected_path = output_path(out_dir, entry, seg.packets[0].worksheet_type)
     assert result.out_path == expected_path
     assert list_manual_queue(out_dir) == [], "an advisory finding must never land the packet in the manual queue"
 
@@ -1224,7 +1173,7 @@ def test_manual_queue_release_with_a_corrected_band_writes_and_clears_the_queue(
 
     assert release.released, release.reason
     entry = roster.by_sid[sid]
-    expected_path = output_path(out_dir, entry, bad_packet.worksheet_type, round_label=FIXTURE_ROUND)
+    expected_path = output_path(out_dir, entry, bad_packet.worksheet_type)
     assert release.out_path == expected_path
     assert expected_path.exists()
     assert list_manual_queue(out_dir) == []
@@ -1265,7 +1214,7 @@ def test_manual_queue_release_with_a_geometry_that_still_leaks_the_name_stays_qu
     assert not release.released
     assert "leaks" in release.reason
     entry = roster.by_sid[sid]
-    assert not output_path(out_dir, entry, bad_packet.worksheet_type, round_label=FIXTURE_ROUND).exists()
+    assert not output_path(out_dir, entry, bad_packet.worksheet_type).exists()
     assert len(list_manual_queue(out_dir)) == 1
 
 
@@ -1349,7 +1298,7 @@ def test_manual_header_region_releases_the_packet_with_the_same_output_shape_as_
     assert release.released, release.reason
     assert release.geometry_source == "manual"
     entry = roster.by_sid[sid]
-    expected_path = output_path(out_dir, entry, seg.packets[0].worksheet_type, round_label=FIXTURE_ROUND)
+    expected_path = output_path(out_dir, entry, seg.packets[0].worksheet_type)
     assert release.out_path == expected_path
     with _open_pdf(expected_path) as pdf:
         assert len(pdf.pages) == seg.packets[0].n_pages == 1
@@ -1383,7 +1332,7 @@ def test_manual_header_region_with_uncovered_ink_still_releases_as_advisory(tmp_
     assert release.released, release.reason
     assert release.advisory_uncovered_words, "the finding must still be surfaced, just no longer blocking"
     entry = roster.by_sid[sid]
-    expected_path = output_path(out_dir, entry, seg.packets[0].worksheet_type, round_label=FIXTURE_ROUND)
+    expected_path = output_path(out_dir, entry, seg.packets[0].worksheet_type)
     assert release.out_path == expected_path
     assert expected_path.exists()
     assert list_manual_queue(out_dir) == []
@@ -1694,7 +1643,7 @@ def test_stored_manual_geometry_reproduces_on_rerun(tmp_path):
     assert geometry[tag]["header_bbox_override"] == header_bbox_override
 
     entry = roster.by_sid[sid]
-    expected_path = output_path(out_dir, entry, seg.packets[0].worksheet_type, round_label=FIXTURE_ROUND)
+    expected_path = output_path(out_dir, entry, seg.packets[0].worksheet_type)
     expected_path.unlink()
     (out_dir / ".ledger" / f"{pdf_path.stem}.json").unlink()
 
@@ -1847,7 +1796,15 @@ def _one_student_multi_round_fixture(tmp_path, date_texts):
     return _build_packets_pdf(specs, ROSTER, [], pdf_path, roster_path)
 
 
-def test_three_contiguous_groups_produce_three_round_labels_and_distinct_paths(tmp_path):
+def test_three_contiguous_groups_write_to_the_same_dir_with_suffixed_paths(tmp_path):
+    """Round grouping itself (see blocks.group_into_rounds) is unchanged --
+    still three real, distinguishable round groups -- but output_path no
+    longer has a round segment (removed 2026-08-15, by explicit request:
+    hierarchy is now teacher/worksheet_type/period/<SID>.pdf only), so a
+    student with a packet in each of three rounds now collides on the
+    identical natural path three times, distinguished only by
+    _claim_output_path's numbered-suffix backstop -- there is no longer
+    anything in the path itself saying which administration is which."""
     fx = _one_student_multi_round_fixture(tmp_path, ["10/01/2025", "2/01/2026", "3/01/2026"])
     roster = load_roster(fx.roster_path)
     seg = segment_pdf(fx.pdf_path)
@@ -1859,12 +1816,12 @@ def test_three_contiguous_groups_produce_three_round_labels_and_distinct_paths(t
     written = [r for r in results if r.out_path is not None]
 
     assert len(written) == 3
-    assert {r.out_path.parent.name for r in written} == {"2025-10", "2026-02", "2026-03"}
-    assert len({r.out_path for r in written}) == 3, "three distinct paths for the same SID, one per round"
-    assert all(r.collision_note is None for r in written), "distinct round dirs need no suffix backstop"
+    assert {r.out_path.parent for r in written} == {written[0].out_path.parent}, "no round segment -- same directory"
+    assert len({r.out_path for r in written}) == 3, "still three distinct (suffixed) paths, never a silent overwrite"
+    assert sum(1 for r in written if r.collision_note is not None) == 2, "second and third writes need the suffix backstop"
 
 
-def test_undated_group_still_writes_under_the_undated_round_segment(tmp_path):
+def test_undated_group_still_writes_successfully(tmp_path):
     fx = _one_student_multi_round_fixture(tmp_path, ["not a real date"])
     roster = load_roster(fx.roster_path)
     seg = segment_pdf(fx.pdf_path)
@@ -1878,30 +1835,6 @@ def test_undated_group_still_writes_under_the_undated_round_segment(tmp_path):
     assert not result.held_back, "an unparseable date is not a reason to withhold otherwise-approved output"
     assert result.out_path is not None
     assert result.out_path.exists()
-    from melredact.blocks import UNDATED_ROUND
-
-    assert result.out_path.parent.name == UNDATED_ROUND
-
-
-def test_single_round_file_with_no_topic_has_constant_path_depth(main_fixture, segmented, roster, tmp_path):
-    """A file with no topic segment (every teacher except one with per-topic
-    filenames) and a single round group must still produce the full,
-    constant-depth path -- teacher/period/worksheet_type/topic/round/sid.pdf --
-    not a shallower path just because there's nothing round- or
-    topic-specific to say."""
-    packet = segmented.packets[0]  # clean_match
-    tag = packet_tag(main_fixture.pdf_path, packet)
-    sid = _sid_for(roster, "Jordan Ames")
-    out_dir = tmp_path / "out"
-
-    results = run_dispositions(main_fixture.pdf_path, segmented, {tag: sid}, roster, out_dir=out_dir, dpi=DPI)
-    result = next(r for r in results if r.packet_tag == tag)
-
-    rel_parts = result.out_path.relative_to(out_dir).parts
-    assert len(rel_parts) == 6  # teacher / period / worksheet_type / topic / round / sid.pdf
-    assert rel_parts[3] == "NA"
-    assert rel_parts[4] == FIXTURE_ROUND
-    assert rel_parts[5] == f"{sid}.pdf"
 
 
 def test_round_label_does_not_alter_match_proposals(tmp_path):
@@ -1920,175 +1853,3 @@ def test_round_label_does_not_alter_match_proposals(tmp_path):
     assert [(c.sid, c.score) for c in p0.candidates] == [(c.sid, c.score) for c in p1.candidates]
     assert [(c.full_name, c.score) for c in p0.held_candidates] == [(c.full_name, c.score) for c in p1.held_candidates]
 
-
-# --- Consensus-ink anomaly check integration (see melredact/consensus.py) ---
-
-
-@pytest.fixture(scope="module")
-def consensus_pipeline_fixture(tmp_path_factory):
-    from tests.make_fixture import build_consensus_fixture
-
-    return build_consensus_fixture(tmp_path_factory.mktemp("consensus_pipeline_fixture"))
-
-
-@pytest.fixture(scope="module")
-def consensus_pipeline_roster(consensus_pipeline_fixture):
-    return load_roster(consensus_pipeline_fixture.roster_path)
-
-
-@pytest.fixture(scope="module")
-def consensus_pipeline_segmented(consensus_pipeline_fixture):
-    return segment_pdf(consensus_pipeline_fixture.pdf_path)
-
-
-@pytest.fixture
-def consensus_pipeline_decisions(consensus_pipeline_fixture):
-    return dict(consensus_pipeline_fixture.sid_by_tag)
-
-
-def test_consensus_hold_is_held_back_end_to_end(
-    consensus_pipeline_fixture, consensus_pipeline_segmented, consensus_pipeline_roster, consensus_pipeline_decisions, tmp_path
-):
-    tag = consensus_pipeline_fixture.anomaly_tag
-    out_dir = tmp_path / "out"
-    results = run_dispositions(
-        consensus_pipeline_fixture.pdf_path,
-        consensus_pipeline_segmented,
-        consensus_pipeline_decisions,
-        consensus_pipeline_roster,
-        out_dir=out_dir,
-        dpi=DPI,
-    )
-    result = next(r for r in results if r.packet_tag == tag)
-    assert result.held_back
-    assert "consensus-ink anomaly" in result.reason
-    assert result.out_path is None
-
-
-def test_consensus_hold_is_not_releasable_via_detection_overrides(
-    consensus_pipeline_fixture, consensus_pipeline_segmented, consensus_pipeline_roster, consensus_pipeline_decisions, tmp_path
-):
-    """detection_overrides only ever releases the *detection-confidence*
-    hold (see pipeline.py's module docstring, "One of these five holds is
-    human-overridable"). A consensus-ink anomaly is a finding of real
-    anomalous ink, not a confidence gap -- putting this packet's own tag in
-    detection_overrides must have zero effect on it."""
-    tag = consensus_pipeline_fixture.anomaly_tag
-    out_dir = tmp_path / "out"
-    results = run_dispositions(
-        consensus_pipeline_fixture.pdf_path,
-        consensus_pipeline_segmented,
-        consensus_pipeline_decisions,
-        consensus_pipeline_roster,
-        out_dir=out_dir,
-        dpi=DPI,
-        detection_overrides={tag},
-    )
-    result = next(r for r in results if r.packet_tag == tag)
-    assert result.held_back
-    assert "consensus-ink anomaly" in result.reason
-    assert result.out_path is None
-
-
-def test_consensus_hold_is_queued_and_released_by_drawing_a_manual_region_over_the_flagged_ink(
-    consensus_pipeline_fixture, consensus_pipeline_segmented, consensus_pipeline_roster, consensus_pipeline_decisions, tmp_path
-):
-    """The actual, checked resolution path for this hold: a human draws a
-    region over the flagged ink in review_app.py's manual editor, which
-    calls release_from_manual_queue with that region as `extra_page_
-    regions` and the hold's own bbox as `flagged_regions_to_verify` -- only
-    a region that actually reaches the flagged ink releases the packet."""
-    from melredact.consensus import analyze_consensus_anomalies
-    from melredact.pipeline import list_manual_queue, release_from_manual_queue
-
-    tag = consensus_pipeline_fixture.anomaly_tag
-    sid = consensus_pipeline_fixture.sid_by_tag[tag]
-    out_dir = tmp_path / "out"
-    run_dispositions(
-        consensus_pipeline_fixture.pdf_path,
-        consensus_pipeline_segmented,
-        consensus_pipeline_decisions,
-        consensus_pipeline_roster,
-        out_dir=out_dir,
-        dpi=DPI,
-    )
-    queued = [e for e in list_manual_queue(out_dir) if e["packet_tag"] == tag]
-    assert len(queued) == 1
-    flagged_regions = queued[0]["flagged_regions"]
-    assert flagged_regions is not None
-    offset_key, bboxes = next(iter(flagged_regions.items()))
-    assert int(offset_key) == 1
-    flagged_bbox = tuple(bboxes[0])
-
-    packet = next(p for p in consensus_pipeline_segmented.packets if packet_tag(consensus_pipeline_fixture.pdf_path, p) == tag)
-    release = release_from_manual_queue(
-        consensus_pipeline_fixture.pdf_path,
-        packet,
-        tag,
-        sid,
-        consensus_pipeline_roster,
-        out_dir=out_dir,
-        dpi=DPI,
-        extra_page_regions={1: [flagged_bbox]},
-        flagged_regions_to_verify={1: [flagged_bbox]},
-    )
-    assert release.released, release.reason
-    assert release.out_path.exists()
-    assert list_manual_queue(out_dir) == []
-
-
-def test_consensus_hold_release_refused_when_drawn_region_misses_the_flagged_ink(
-    consensus_pipeline_fixture, consensus_pipeline_segmented, consensus_pipeline_roster, consensus_pipeline_decisions, tmp_path
-):
-    from melredact.pipeline import list_manual_queue, release_from_manual_queue
-
-    tag = consensus_pipeline_fixture.anomaly_tag
-    sid = consensus_pipeline_fixture.sid_by_tag[tag]
-    out_dir = tmp_path / "out"
-    run_dispositions(
-        consensus_pipeline_fixture.pdf_path,
-        consensus_pipeline_segmented,
-        consensus_pipeline_decisions,
-        consensus_pipeline_roster,
-        out_dir=out_dir,
-        dpi=DPI,
-    )
-    packet = next(p for p in consensus_pipeline_segmented.packets if packet_tag(consensus_pipeline_fixture.pdf_path, p) == tag)
-    wrong_region = (0.0, 0.0, 10.0, 10.0)  # nowhere near CONSENSUS_ANOMALY_BOX
-    release = release_from_manual_queue(
-        consensus_pipeline_fixture.pdf_path,
-        packet,
-        tag,
-        sid,
-        consensus_pipeline_roster,
-        out_dir=out_dir,
-        dpi=DPI,
-        extra_page_regions={1: [wrong_region]},
-        flagged_regions_to_verify={1: [(400.0, 500.0, 430.0, 520.0)]},
-    )
-    assert not release.released
-    assert "consensus-ink anomaly" in release.reason
-    assert len(list_manual_queue(out_dir)) == 1
-
-
-def test_packets_without_anomalous_ink_follow_the_unchanged_path(
-    consensus_pipeline_fixture, consensus_pipeline_segmented, consensus_pipeline_roster, consensus_pipeline_decisions, tmp_path
-):
-    """The shared-answer-ink packets and the plain clean packets must both
-    write normally -- the consensus-ink check must never hold a packet it
-    has no anomaly finding for."""
-    out_dir = tmp_path / "out"
-    results = run_dispositions(
-        consensus_pipeline_fixture.pdf_path,
-        consensus_pipeline_segmented,
-        consensus_pipeline_decisions,
-        consensus_pipeline_roster,
-        out_dir=out_dir,
-        dpi=DPI,
-    )
-    unaffected_tags = set(consensus_pipeline_fixture.answer_tags) | set(consensus_pipeline_fixture.clean_tags)
-    for tag in unaffected_tags:
-        result = next(r for r in results if r.packet_tag == tag)
-        assert not result.held_back, f"{tag} should not be held: {result.reason}"
-        assert result.out_path is not None
-        assert result.out_path.exists()

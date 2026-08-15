@@ -85,7 +85,6 @@ from melredact.config import (
     MIN_SCORE,
     RENDER_DPI_PREVIEW,
 )
-from melredact.consensus import ConsensusAnalysis, analyze_consensus_anomalies, format_consensus_report
 from melredact.match import assign_all
 from melredact.orientation import orientation_for
 from melredact.pdfio import open_pdf
@@ -225,18 +224,6 @@ def _round_data(pdf_path: str, orientation_overrides: dict[int, int], page_order
     groups = group_into_rounds(segmented.packets, dates)
     return dates, groups
 
-
-@st.cache_data(show_spinner="Checking for template-agnostic handwriting anomalies (consensus-ink)...")
-def _consensus(pdf_path: str, orientation_overrides: dict[int, int], page_order: list[int] | None = None) -> ConsensusAnalysis:
-    """Cached the same way _round_data is: the expensive part (whole-group
-    rasterize + ECC alignment, see consensus.py) is itself disk-cached per
-    (file, page, reference page, dpi, block size), so a warm rerun is
-    cheap -- but there's no reason to repeat even the in-memory clustering
-    on every Streamlit rerun (a button click, Prev/Next) within one
-    session."""
-    return analyze_consensus_anomalies(
-        pdf_path, _segment(pdf_path, orientation_overrides, page_order), orientation_overrides=orientation_overrides
-    )
 
 
 @st.cache_data(show_spinner="Loading roster...")
@@ -642,7 +629,6 @@ def _render_sidebar(
     roster: Roster,
     resolved_block: BlockMeaning | None = None,
     round_labels: dict[str, str] | None = None,
-    consensus_holds: dict[str, list] | None = None,
 ) -> None:
     decisions = st.session_state.decisions
     n_pending = sum(1 for p in segmented.packets if packet_tag(args.pdf_path, p) not in decisions)
@@ -693,10 +679,8 @@ def _render_sidebar(
                 out_dir=Path(args.out_dir),
                 detection_overrides=fresh_overrides,
                 composition_overrides=fresh_composition_overrides,
-                round_labels=round_labels,
                 allow_delete=not disable_deletion,
                 manual_geometry=fresh_manual_geometry,
-                consensus_holds=consensus_holds,
                 orientation_overrides=st.session_state.orientation_overrides,
             )
             written = [r for r in results if r.out_path is not None]
@@ -1912,16 +1896,6 @@ def main() -> None:
     st.header("Round grouping")
     st.code(format_round_report(round_groups), language=None)
 
-    # Consensus-ink anomaly check (see melredact/consensus.py): a
-    # template-agnostic handwriting finder that only ever looks at
-    # non-header pages, since the header page is already unconditionally
-    # redacted regardless of any match. Shown here purely so a reviewer
-    # sees what the check found before it gates "Run redaction pipeline"
-    # below the same way held_back already does for the other checks.
-    consensus_analysis = _consensus(args.pdf_path, st.session_state.orientation_overrides, st.session_state.page_order)
-    with st.expander("Consensus-ink anomaly check", expanded=bool(consensus_analysis.holds)):
-        st.code(format_consensus_report(consensus_analysis), language=None)
-
     # --round restricts this whole session to one collection session inside
     # a larger concatenated scan (see pipeline.filter_packets_by_round).
     # Round grouping itself is always computed over the whole file above --
@@ -1962,7 +1936,7 @@ def main() -> None:
     auto_assignments = assign_all(proposals, round_labels=round_labels)
     proposals_by_tag = {p.packet_tag: p for p in proposals}
 
-    _render_sidebar(args, segmented, roster, resolved_block, round_labels, consensus_analysis.holds)
+    _render_sidebar(args, segmented, roster, resolved_block, round_labels)
 
     tags = [packet_tag(args.pdf_path, p) for p in segmented.packets]
     packet_by_tag = dict(zip(tags, segmented.packets))

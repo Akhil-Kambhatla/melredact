@@ -13,20 +13,20 @@ packet's footer-declared length, any page-count-vs-footer disagreement,
 round groups with their date histograms and disagreeing packets, every
 page with a nonzero-or-low-confidence orientation (located as "page N of
 packet X"), every packet with an undetected header border, the roster
-block in use and how many packets have no plausible match, consensus-ink
-anomaly counts, uncovered-ink advisory counts, and any unsegmentable
-packet with its reason -- ending in a plain verdict: how many packets
-would process cleanly, how many would need a human in the editor, and how
-many can't be processed without a fix. It deliberately skips the one
-expensive thing `analyze` does (a real per-packet redaction draft with a
-full-page OCR pass, just to run verify_no_leaked_names) -- detection-hold
-and the uncovered-ink advisory only need the header page's own raster
-plus the header-band OCR crop matching already makes, so preflight stays
-bounded by the same small-crop OCR cost `run`'s own segmentation stage
-already pays on a cold cache, not the full-page cost. Every OCR/
-orientation/consensus call it makes is disk-cached the identical way
-`run`'s own calls are, so a `run` immediately following a `preflight`
-against the same file starts warm. Unless `--no-contact-sheet`, it also
+block in use and how many packets have no plausible match, uncovered-ink
+advisory counts, and any unsegmentable packet with its reason -- ending
+in a plain verdict: how many packets would process cleanly, how many
+would need a human in the editor, and how many can't be processed
+without a fix. It deliberately skips the one expensive thing `analyze`
+does (a real per-packet redaction draft with a full-page OCR pass, just
+to run verify_no_leaked_names) -- detection-hold and the uncovered-ink
+advisory only need the header page's own raster plus the header-band OCR
+crop matching already makes, so preflight stays bounded by the same
+small-crop OCR cost `run`'s own segmentation stage already pays on a
+cold cache, not the full-page cost. Every OCR/orientation call it makes
+is disk-cached the identical way `run`'s own calls are, so a `run`
+immediately following a `preflight` against the same file starts warm.
+Unless `--no-contact-sheet`, it also
 renders a contact sheet of every flagged page's thumbnail (labelled with
 why it was flagged) to `out/.diagnostics/<pdf-stem>_preflight/contact_
 sheet.png`, to eyeball in one place instead of paging through
@@ -123,7 +123,6 @@ from melredact.blocks import (
     round_labels_by_tag,
     save_resolved_block_record,
 )
-from melredact.consensus import analyze_consensus_anomalies, format_consensus_report
 from melredact.pipeline import (
     analyze_redaction_holds,
     decisions_path,
@@ -236,16 +235,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
             return 1
         run_segmented = filter_packets_by_round(pdf_path, segmented, round_labels, args.round)
         print(f"  restricting to round {args.round!r}: {len(run_segmented.packets)} of {len(segmented.packets)} packet(s)")
-
-    # Computed once here (same "whole file, up front" posture as round
-    # grouping above), never re-derived inside run_dispositions below --
-    # see pipeline.run_dispositions's `consensus_holds` parameter and
-    # consensus.py's own module docstring for the cost this pass carries
-    # (a full-group rasterize + ECC alignment pass, disk-cached, but still
-    # worth computing once, not twice).
-    consensus_analysis = analyze_consensus_anomalies(pdf_path, segmented, orientation_overrides=orientation_overrides)
-    print()
-    print(format_consensus_report(consensus_analysis))
 
     metadata = load_block_metadata(roster_path)
     resolved_block = None
@@ -377,10 +366,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         flatten=args.flatten,
         detection_overrides=detection_overrides,
         composition_overrides=composition_overrides,
-        round_labels=round_labels,
         allow_delete=not args.no_delete,
         manual_geometry=manual_geometry,
-        consensus_holds=consensus_analysis.holds,
         orientation_overrides=orientation_overrides,
     )
 
@@ -454,18 +441,12 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    consensus_analysis = analyze_consensus_anomalies(pdf_path, segmented, orientation_overrides=orientation_overrides)
-    print()
-    print(format_consensus_report(consensus_analysis))
-
     print(
         "\nDrafting a redaction attempt for every header packet to check hold reasons -- nothing "
         "is written to out/, redacted output is discarded immediately after inspection, and "
         "nothing is deleted.\n"
     )
-    results = analyze_redaction_holds(
-        pdf_path, segmented, roster, round_labels, consensus_analysis.holds, orientation_overrides=orientation_overrides
-    )
+    results = analyze_redaction_holds(pdf_path, segmented, roster, round_labels, orientation_overrides=orientation_overrides)
     print(format_hold_analysis_report(results))
     return 0
 
@@ -661,11 +642,11 @@ def main(argv: list[str] | None = None) -> int:
         "preflight",
         help="read-only whole-file report of everything wrong with a scan before any review or run: "
         "page/packet counts vs. footer, round-date histograms, orientation issues, undetected header "
-        "borders, roster match coverage, consensus-ink/uncovered-ink counts, and unsegmentable "
-        "packets, ending in a plain clean/needs-editor/cannot-process verdict. Writes nothing, "
-        "deletes nothing -- meant to be run the moment a file comes off Box, before deciding whether "
-        "to review it now or hand it back. Populates the same OCR/orientation/consensus disk caches "
-        "the real run reads, so nothing here is wasted work.",
+        "borders, roster match coverage, uncovered-ink counts, and unsegmentable packets, ending in "
+        "a plain clean/needs-editor/cannot-process verdict. Writes nothing, deletes nothing -- meant "
+        "to be run the moment a file comes off Box, before deciding whether to review it now or hand "
+        "it back. Populates the same OCR/orientation disk caches the real run reads, so nothing here "
+        "is wasted work.",
     )
     _add_common_args(p_preflight)
     p_preflight.add_argument(

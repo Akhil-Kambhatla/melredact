@@ -114,10 +114,13 @@ non-empty `redact_result.uncovered_group_words` is carried onto the
 written `DispositionResult`/`ManualReleaseResult` as `advisory_uncovered_
 words`; it never queues the packet, never blocks a write, and is never
 consulted by `detection_overrides` (there is nothing to override -- it was
-never a hold to begin with). The other three unconditional checks
-(detection confidence, consensus-ink anomaly, verify_no_leaked_names) are
-completely unaffected by this change and still hold exactly as documented
-below.
+never a hold to begin with). The other two unconditional checks
+(detection confidence, verify_no_leaked_names) are completely unaffected
+by this change and still hold exactly as documented below. (A third
+check, template-agnostic consensus-ink handwriting detection, existed
+2026-08-14 through 2026-08-15 and was removed by explicit request -- see
+CLAUDE.md's own removal writeup for what it caught and the accepted
+tradeoff of dropping it.)
 
 Packet identity across runs of the *same* source PDF is grounded in the
 packet's first physical page index (see `packet_tag`), not its position in
@@ -201,7 +204,6 @@ from melredact.blocks import (
     round_labels_by_tag,
 )
 from melredact.config import HEADER_SEARCH_MAX_TOP, MIN_MARGIN, MIN_SCORE, RENDER_DPI_FINAL
-from melredact.consensus import AnomalyHold, analyze_consensus_anomalies
 from melredact.match import HeldCandidate, MatchProposal, assign_all, propose
 from melredact.pdfio import open_pdf
 from melredact.redact import (
@@ -228,48 +230,14 @@ DECISIONS_DIR = Path("decisions")
 OUT_DIR = Path("out")
 MANUAL_QUEUE_DIRNAME = ".manual_queue"
 
-# A worksheet-type collision can still happen *within* one worksheet type,
-# once one teacher's students legitimately complete the same worksheet type
-# more than once (teacher 010406: several PRT sessions, one per topic). Each
-# session is its own scan file named <teacher>_PD<n>_<TYPE>[_<TOPIC>].pdf, so
-# the topic -- read from the *filename*, not the footer, since a topic isn't
-# part of the worksheet's own printed content -- disambiguates sessions the
-# same way worksheet_type already disambiguates worksheet types. NO_TOPIC is
-# a stable literal, not an omitted segment, so every teacher's output sits at
-# the same path depth regardless of whether their filenames carry a topic.
-NO_TOPIC = "NA"
-_TOPIC_FROM_FILENAME = re.compile(r"^[^_]+_PD\d+_[^_]+_([A-Za-z0-9]+)$", re.IGNORECASE)
-
-# Same literal blocks.round_label() returns for a packet whose own date
-# couldn't be confidently parsed (blocks.UNDATED_ROUND) -- reused here as
-# output_path's default `round_label` so a caller that doesn't care about
-# rounds (most direct callers outside run_dispositions/release_from_
-# manual_queue, which always compute and pass a real one) still gets a
-# stable, constant-depth path rather than an omitted segment.
-NO_ROUND = UNDATED_ROUND
-
 
 def packet_tag(pdf_path: str | Path, packet: Packet) -> str:
     return f"{Path(pdf_path).stem}_p{packet.page_indices[0]:03d}"
 
 
-def topic_from_filename(pdf_path: str | Path) -> str:
-    """Best-effort topic code from a source scan's own filename, e.g.
-    "010406_PD1_PRT_EW.pdf" -> "EW". Returns NO_TOPIC, never raises, when the
-    filename doesn't carry a fourth underscore-separated segment (every
-    teacher except the ones with per-topic worksheets) or doesn't match the
-    expected <teacher>_PD<n>_<TYPE>[_<TOPIC>] shape at all (e.g. the older
-    "Hannel MPR PD2.pdf" naming) -- a missing topic is the overwhelmingly
-    common case, not a data problem to fail loudly over."""
-    m = _TOPIC_FROM_FILENAME.match(Path(pdf_path).stem)
-    return m.group(1).upper() if m else NO_TOPIC
-
-
-def output_path(
-    out_dir: str | Path, entry: RosterEntry, worksheet_type: str, topic: str = NO_TOPIC, round_label: str = NO_ROUND
-) -> Path:
+def output_path(out_dir: str | Path, entry: RosterEntry, worksheet_type: str) -> Path:
     """Where a confirmed packet for this roster entry lands:
-    out/<teacher_code>/<period>/<worksheet_type>/<topic>/<round>/<SID>.pdf.
+    out/<teacher_code>/<worksheet_type>/<period>/<SID>.pdf.
     `entry.teacher_code` and `entry.period_display` are the SID's own digits
     (positions 0:6 and 6:8), not anything read off the packet, so those two
     segments are stable and derivable from the SID alone. `worksheet_type`
@@ -277,27 +245,20 @@ def output_path(
     worksheet types (MPR, PRT, ...) -- so it must come from the packet's own
     footer (see Packet.worksheet_type); omitting it is exactly the bug that
     let an MPR and a PRT packet for the same student collide on one path.
-    `topic` (see topic_from_filename) defaults to NO_TOPIC so every caller
-    that hasn't been updated for per-topic worksheets keeps computing the
-    exact same path as before that segment existed.
 
-    `round_label` (see blocks.group_into_rounds/round_labels_by_tag) is the
-    same story one segment deeper: a student can legitimately complete the
-    *same* worksheet+topic more than once, in different collection sessions
-    (the real motivating file, 010406_PD1_PRT.pdf, is three concatenated
-    PRT administrations of the same class), and without a round segment
-    those sessions collide on one path the same way an MPR/PRT collision
-    used to. Defaults to NO_ROUND so a caller that genuinely has no round
-    information at all still gets a stable, constant-depth path."""
-    return (
-        Path(out_dir)
-        / entry.teacher_code
-        / entry.period_display
-        / worksheet_type
-        / topic
-        / round_label
-        / f"{entry.sid}.pdf"
-    )
+    Deliberately no topic or round segment (removed 2026-08-15, by explicit
+    request): a student who legitimately completes the same worksheet type
+    more than once (different topic sessions, or the same worksheet given
+    in separate collection rounds -- the real 010406_PD1_PRT.pdf file is
+    three concatenated PRT administrations of the same class) now collides
+    on this exact path, distinguished only by `_claim_output_path`'s
+    numbered-suffix backstop (`<SID>_2.pdf`, `_3.pdf`, ...) -- there is no
+    longer any label in the path or filename saying which administration a
+    given file is. This was a known, accepted tradeoff at the time of the
+    request (see CLAUDE.md): resolving which numbered copy is which is now
+    a human decision made by opening each file, not something the path
+    structure helps with."""
+    return Path(out_dir) / entry.teacher_code / worksheet_type / entry.period_display / f"{entry.sid}.pdf"
 
 
 def filter_packets_by_round(
@@ -409,25 +370,24 @@ def _claim_output_path(
     out_dir: str | Path,
     entry: RosterEntry,
     worksheet_type: str,
-    topic: str,
-    round_label: str,
 ) -> tuple[Path, str | None]:
     """The natural output path for this packet, unless that exact path
     already exists on disk *and* this run's own ledger attributes it to a
     different packet_tag -- in which case a numbered-suffix alternative
     (`<SID>_2.pdf`, `_3.pdf`, ...) is returned instead, so one packet's
-    output can never silently replace another's. This is a backstop for the
-    case the topic and round path segments (see output_path) don't fully
-    disambiguate on their own: two distinct packets in the *same* scan
-    file, decided to the same student, worksheet type, *and* round (e.g.
-    two packets whose own dates both landed in the same round group by
-    honest majority vote, but are nonetheless different physical packets).
-    Re-running the same tag against its own previously-claimed path is not
-    a collision -- the ledger lookup excludes `tag` itself, so a packet
-    re-processed after a decision change keeps overwriting its own prior
-    file exactly as before.
+    output can never silently replace another's. This is now the *only*
+    backstop for two distinct packets landing on the same natural path --
+    since the topic/round path segments were removed (see output_path's
+    own docstring), this fires far more often than it used to: any two
+    packets for the same student and worksheet type, from different topics
+    or different collection rounds, now collide here by construction, not
+    just the narrower "two packets in the same round" case this docstring
+    used to describe. Re-running the same tag against its own previously-
+    claimed path is not a collision -- the ledger lookup excludes `tag`
+    itself, so a packet re-processed after a decision change keeps
+    overwriting its own prior file exactly as before.
     """
-    base_path = output_path(out_dir, entry, worksheet_type, topic, round_label)
+    base_path = output_path(out_dir, entry, worksheet_type)
     owner_tag = next((t for t, e in ledger.items() if t != tag and e.get("path") == str(base_path)), None)
     if owner_tag is None or not base_path.exists():
         return base_path, None
@@ -558,7 +518,6 @@ def release_from_manual_queue(
     out_dir: str | Path = OUT_DIR,
     dpi: int = RENDER_DPI_FINAL,
     flatten: bool = False,
-    round_label: str | None = None,
     header_bbox_override: tuple[Bbox, Bbox] | None = None,
     extra_page_regions: dict[int, list[Bbox]] | None = None,
     flagged_regions_to_verify: dict[int, list[Bbox]] | None = None,
@@ -584,17 +543,6 @@ def release_from_manual_queue(
     ordinary write in `run_dispositions` -- a manually-released packet is
     just as capable of colliding with another packet's already-claimed
     output path as an automatic one.
-
-    `round_label` (see blocks.group_into_rounds) is normally left to be
-    computed here -- this function re-segments and re-reads dates for the
-    whole file to get it, since a lone queued packet has no group context
-    of its own to derive a round from. This is a comparatively rare,
-    human-driven action (clicking "Release to out/" in the manual queue
-    panel), not something in a hot per-packet loop, so paying for a fresh
-    `collect_packet_rounds` call here -- OCR-cached, so a warm re-run is
-    cheap regardless -- is the simpler choice over threading the whole
-    file's round groups through the manual-queue call chain. A caller that
-    already has it (none currently do) can still pass it directly.
 
     `header_bbox_override`/`extra_page_regions` are the drag-corner
     editor's geometry (see redact_packet's own docstring for what each
@@ -625,13 +573,8 @@ def release_from_manual_queue(
     if sid not in roster:
         return ManualReleaseResult(packet_tag=tag, sid=sid, released=False, reason=f"sid {sid!r} not on roster")
     entry = roster.by_sid[sid]
-    topic = topic_from_filename(pdf_path)
-    if round_label is None:
-        round_label = round_labels_by_tag(
-            collect_packet_rounds(pdf_path, orientation_overrides=orientation_overrides, page_sequence=page_sequence)
-        ).get(tag, UNDATED_ROUND)
     ledger = _load_ledger(out_dir, pdf_path)
-    out_path, collision_note = _claim_output_path(ledger, tag, out_dir, entry, packet.worksheet_type, topic, round_label)
+    out_path, collision_note = _claim_output_path(ledger, tag, out_dir, entry, packet.worksheet_type)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     stamp_lines = [f"SID: {entry.sid}", f"PD: {entry.period_display}"]
     redact_result = _redact_packet(
@@ -981,9 +924,8 @@ class HoldAnalysis:
     # Advisory only, since 2026-08-14 -- see run_dispositions'
     # `advisory_uncovered_words` field and CLAUDE.md's "From detection-
     # gates-workflow to human-reviews-everything" section. Never part of
-    # `clean`'s gating and never gates the consensus/leak checks below it.
+    # `clean`'s gating.
     uncovered_ink_advisory: bool = False
-    consensus_hold: bool = False
     leak_hold: bool = False
     reason: str | None = None
 
@@ -994,7 +936,7 @@ class HoldAnalysis:
         # only an advisory finding and nothing else is still "clean" in
         # the sense that a real run would ship it without human
         # intervention.
-        return not (self.detection_hold or self.consensus_hold or self.leak_hold)
+        return not (self.detection_hold or self.leak_hold)
 
 
 def analyze_redaction_holds(
@@ -1002,18 +944,17 @@ def analyze_redaction_holds(
     segmented: SegmentResult,
     roster: Roster,
     round_labels: dict[str, str] | None = None,
-    consensus_holds: dict[str, list[AnomalyHold]] | None = None,
     *,
     dpi: int = RENDER_DPI_FINAL,
     flatten: bool = False,
     orientation_overrides: dict[int, int] | None = None,
 ) -> list[HoldAnalysis]:
     """Read-only redaction analysis: reports which of run_dispositions'
-    three unconditional per-packet HOLDS (detection confidence, consensus-
-    ink anomaly, verify_no_leaked_names) each packet would trigger, or that
-    it would pass cleanly, plus whether find_uncovered_group_words'
-    ADVISORY (non-blocking since 2026-08-14, see CLAUDE.md) fires -- all
-    WITHOUT ever writing to out_dir, touching decisions, the ledger, or the
+    two unconditional per-packet HOLDS (detection confidence,
+    verify_no_leaked_names) each packet would trigger, or that it would
+    pass cleanly, plus whether find_uncovered_group_words' ADVISORY
+    (non-blocking since 2026-08-14, see CLAUDE.md) fires -- all WITHOUT
+    ever writing to out_dir, touching decisions, the ledger, or the
     manual-redaction queue, or deleting anything. Exists so a real,
     never-before-processed file (see CLAUDE.md's bug #7 trade-off history)
     can be sized up before committing to a real run.
@@ -1025,22 +966,13 @@ def analyze_redaction_holds(
     ran, without ever leaving a file sitting on disk anywhere.
 
     Mirrors run_dispositions' own hold precedence exactly -- detection
-    confidence checked first, then consensus-ink anomaly, then a full
-    verify_no_leaked_names pass, each gating the next the same way
-    run_dispositions' `continue`s do -- rather than checking all three
-    independently, so a packet reported here as "held for detection
-    confidence" is the same packet a real run (absent a detection_
-    overrides entry for it) would actually hold for that reason, not a
-    looser union of every check that happens to fire on it. The uncovered-
-    ink advisory is recorded independently of this precedence chain, since
-    it never gates anything.
-
-    `consensus_holds` (see consensus.analyze_consensus_anomalies) is
-    computed once for the whole file, the same way `round_labels` already
-    is -- left as None, it's computed here from `segmented`; a caller
-    (cli.py's analyze command) that's already computed it for its own
-    report should pass it through rather than paying for the group
-    alignment pass twice.
+    confidence checked first, then a full verify_no_leaked_names pass,
+    each gating the next the same way run_dispositions' `continue`s do --
+    rather than checking both independently, so a packet reported here as
+    "held for detection confidence" is the same packet a real run (absent
+    a detection_overrides entry for it) would actually hold for that
+    reason. The uncovered-ink advisory is recorded independently of this
+    precedence chain, since it never gates anything.
 
     Orphan packets (no header page) have nothing to redact and are
     skipped -- a real run would refuse them via `packet.issues` before ever
@@ -1052,11 +984,6 @@ def analyze_redaction_holds(
     """
     results: list[HoldAnalysis] = []
     labels = round_labels or {}
-    consensus = (
-        consensus_holds
-        if consensus_holds is not None
-        else analyze_consensus_anomalies(pdf_path, segmented, orientation_overrides=orientation_overrides).holds
-    )
     with tempfile.TemporaryDirectory() as scratch_dir:
         for packet in segmented.packets:
             if packet.header_page_index is None:
@@ -1067,15 +994,11 @@ def analyze_redaction_holds(
                 pdf_path, packet, scratch_path, dpi=dpi, flatten=flatten, orientation_overrides=orientation_overrides
             )
             analysis = HoldAnalysis(packet_tag=tag, round_label=labels.get(tag, UNDATED_ROUND))
-            tag_holds = consensus.get(tag, [])
             if redact_result.uncovered_group_words:
                 analysis.uncovered_ink_advisory = True
             if redact_result.band is not None and not redact_result.band.detected:
                 analysis.detection_hold = True
                 analysis.reason = f"header border not confidently detected: {redact_result.band}"
-            elif tag_holds:
-                analysis.consensus_hold = True
-                analysis.reason = "; ".join(h.reason for h in tag_holds)
             else:
                 findings = verify_no_leaked_names(scratch_path, roster)
                 if findings:
@@ -1100,13 +1023,11 @@ def format_hold_analysis_report(results: list[HoldAnalysis]) -> str:
         group = by_round[label]
         n_detection = sum(1 for r in group if r.detection_hold)
         n_ink = sum(1 for r in group if r.uncovered_ink_advisory)
-        n_consensus = sum(1 for r in group if r.consensus_hold)
         n_leak = sum(1 for r in group if r.leak_hold)
         n_clean = sum(1 for r in group if r.clean)
         lines.append(
             f"  {label}: {len(group)} packet(s) -- {n_clean} clean, {n_detection} detection-confidence "
-            f"hold(s), {n_consensus} consensus-ink anomaly hold(s), {n_leak} leak hold(s), "
-            f"{n_ink} carrying a non-blocking uncovered-ink advisory"
+            f"hold(s), {n_leak} leak hold(s), {n_ink} carrying a non-blocking uncovered-ink advisory"
         )
     return "\n".join(lines)
 
@@ -1170,9 +1091,7 @@ class DispositionResult:
     # eyes at than as a gate nothing can ever pass through cleanly on real
     # data. Non-empty means the same finding find_uncovered_group_words
     # always produced; it just no longer holds the packet back on its own
-    # (a consensus-ink anomaly or a verify_no_leaked_names finding still
-    # does -- this is the only one of the four unconditional checks this
-    # applies to).
+    # (a verify_no_leaked_names finding still does).
     advisory_uncovered_words: list = field(default_factory=list)
     # "manual" when this write applied a stored correction from
     # `manual_geometry` (see load_manual_geometry/save_manual_geometry) --
@@ -1256,17 +1175,15 @@ def run_dispositions(
     flatten: bool = False,
     detection_overrides: set[str] = frozenset(),
     composition_overrides: set[str] = frozenset(),
-    round_labels: dict[str, str] | None = None,
     allow_delete: bool = True,
     manual_geometry: dict[str, dict] | None = None,
-    consensus_holds: dict[str, list[AnomalyHold]] | None = None,
     orientation_overrides: dict[int, int] | None = None,
 ) -> list[DispositionResult]:
     """Apply final per-packet decisions. See module docstring for the
     three-state `decisions` contract -- this is where "confirmed
     non-consent" actually becomes a deletion, not just a skipped write --
     and for why output is named by SID under a worksheet_type subdirectory
-    (out/<teacher>/<period>/<worksheet_type>/<SID>.pdf) rather than by
+    (out/<teacher>/<worksheet_type>/<period>/<SID>.pdf) rather than by
     packet_tag, and why deletion is ledger-based rather than a directory
     sweep.
 
@@ -1294,8 +1211,8 @@ def run_dispositions(
     `_COMPOSITION_CONFIRMABLE_ISSUE_MARKERS`'s own docstring). This is a
     structural-confidence override, the same category as `detection_
     overrides` -- it has no effect on, and is never consulted by, the
-    consensus-ink or verify_no_leaked_names holds, which stay non-
-    overridable by any confirmation.
+    verify_no_leaked_names hold, which stays non-overridable by any
+    confirmation.
 
     A packet absent from `decisions` (pending) is never looked up in the
     ledger and never touches any path but its own -- see the module
@@ -1308,19 +1225,6 @@ def run_dispositions(
     (see the module docstring's "One of these five holds is human-
     overridable" section) -- it does not, and must not, affect whether the
     unrelated uncovered-group-words or verify_no_leaked_names holds fire.
-
-    `round_labels` (packet_tag -> "YYYY-MM"|"undated", see blocks.
-    group_into_rounds/round_labels_by_tag) is the round path segment for
-    each packet (see output_path) -- a student can legitimately complete
-    the same worksheet+topic more than once, in different collection
-    sessions, and the round segment is what keeps those sessions from
-    colliding in out/. Left as None (the default), it's computed here from
-    `segmented` -- already paid for by the caller, so no re-segmentation --
-    via a fresh date-OCR pass; a caller that's already computed it for its
-    own report (cli.py, review_app.py, both of which print the round
-    report before ever calling this) should pass it through directly
-    rather than paying for that pass twice. Round labelling never touches
-    matching, scoring, or claiming -- it is output-path metadata only.
 
     `allow_delete` (default True, unchanged behavior) is a blanket safety
     switch for a pilot or first-ever run against a real file that hasn't
@@ -1353,46 +1257,18 @@ def run_dispositions(
     detect-and-ask design and `load_orientation_overrides`/`save_
     orientation_overrides` above) is a human's explicit per-page rotation
     choice, threaded straight through to every OCR/matching/redaction call
-    this function makes (and to the round/consensus passes it computes when
-    not given them directly) so a confirmed or corrected rotation reaches
-    every stage the same way, not just a preview. Left as None (the
-    default), a page the detector couldn't confidently rotate on its own
-    stays exactly as found and its packet is held via the ordinary
-    `packet.issues` gate above -- never guessed.
-
-    `consensus_holds` (packet_tag -> list[consensus.AnomalyHold], see
-    consensus.analyze_consensus_anomalies) is a fourth unconditional check,
-    alongside detection confidence, uncovered group-row ink, and
-    verify_no_leaked_names: template-agnostic handwriting found on a
-    *non-header* page that only a few packets in the group share -- ink
-    redaction never reaches (it only ever touches the header page) and that
-    verify_no_leaked_names cannot catch if the name isn't on the roster at
-    all (see consensus.py's module docstring for the real find this closes:
-    a freehand page-2 name for a student, "Ollie Maduro", who was never on
-    the roster to begin with). Like uncovered_group_words, this is never
-    overridable via `detection_overrides` -- it's a finding of real
-    anomalous ink, not a confidence question about otherwise-sound
-    geometry -- and a held packet is queued to the manual-redaction queue,
-    not just deleted, since a human drawing a region over the flagged ink
-    is exactly what resolves it (see review_app.py's manual editor). Left
-    as None (the default), it's computed here from `segmented` via a fresh
-    consensus pass; a caller that's already computed it for its own report
-    (cli.py, review_app.py) should pass it through directly rather than
-    paying for the group alignment pass twice -- see CLAUDE.md's "cost"
-    measurement for why that pass is worth avoiding twice.
+    this function makes (and to the round pass it computes when not given
+    it directly) so a confirmed or corrected rotation reaches every stage
+    the same way, not just a preview. Left as None (the default), a page
+    the detector couldn't confidently rotate on its own stays exactly as
+    found and its packet is held via the ordinary `packet.issues` gate
+    above -- never guessed.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     ledger = _load_ledger(out_dir, pdf_path)
     ledger_dirty = False
     results: list[DispositionResult] = []
-    topic = topic_from_filename(pdf_path)
-    if round_labels is None:
-        round_labels = round_labels_by_tag(
-            collect_packet_rounds(pdf_path, segmented=segmented, orientation_overrides=orientation_overrides)
-        )
-    if consensus_holds is None:
-        consensus_holds = analyze_consensus_anomalies(pdf_path, segmented, orientation_overrides=orientation_overrides).holds
 
     def _delete_stale_output(stale_path: Path, stale_sid: str) -> None:
         # Deliberately doesn't touch `ledger` -- callers own that, since
@@ -1483,10 +1359,7 @@ def run_dispositions(
                 continue
 
         entry = roster.by_sid[sid]
-        round_label = round_labels.get(tag, UNDATED_ROUND)
-        out_path, collision_note = _claim_output_path(
-            ledger, tag, out_dir, entry, packet.worksheet_type, topic, round_label
-        )
+        out_path, collision_note = _claim_output_path(ledger, tag, out_dir, entry, packet.worksheet_type)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         stamp_lines = [f"SID: {entry.sid}", f"PD: {entry.period_display}"]
         geometry_kwargs = (manual_geometry or {}).get(tag, {})
@@ -1532,27 +1405,8 @@ def run_dispositions(
         # per-packet editor regardless of whether this check fires. Carried
         # onto the written result (DispositionResult.advisory_uncovered_
         # words) so a reviewer or a per-run summary can still see it; it no
-        # longer queues the packet or blocks the write the way a consensus-
-        # ink or verify_no_leaked_names finding still does.
+        # longer queues the packet or blocks the write.
         advisory_uncovered_words = redact_result.uncovered_group_words
-        tag_consensus_holds = consensus_holds.get(tag, [])
-        if tag_consensus_holds:
-            # Template-agnostic handwriting on a non-header page that only
-            # a few packets in its group share -- see consensus.py's module
-            # docstring. Never overridable via detection_overrides, same
-            # reasoning as uncovered_group_words above: a finding of real
-            # anomalous ink, not a confidence gap. Queued, not just
-            # deleted, since a human drawing a region over the flagged ink
-            # is exactly what resolves it.
-            reason = "; ".join(h.reason for h in tag_consensus_holds)
-            flagged_by_offset: dict[int, list] = {}
-            for h in tag_consensus_holds:
-                flagged_by_offset.setdefault(h.page_offset, []).append(h.bbox_pt)
-            _queue_for_manual_redaction(
-                out_dir, pdf_path, tag, sid, packet.worksheet_type, reason, out_path, flagged_regions=flagged_by_offset
-            )
-            results.append(DispositionResult(packet_tag=tag, sid=sid, pending=False, held_back=True, reason=reason))
-            continue
         findings = verify_no_leaked_names(out_path, roster)
         if findings:
             # The verify pass exists precisely so this can't happen
@@ -1663,11 +1517,10 @@ def run_dispositions(
 # on the returned report says plainly whether that cost was actually paid.
 #
 # Every OCR/rasterize/orientation call preflight makes goes through the
-# exact same disk caches (ocr.py, orientation.py, consensus.py) the real
-# `segment_pdf`/`propose_all`/`analyze_consensus_anomalies`/`run_
-# dispositions` calls use -- so a `cli.py run` immediately following a
-# preflight run against the same file starts warm, not cold. Nothing here
-# is throwaway work.
+# exact same disk caches (ocr.py, orientation.py) the real `segment_pdf`/
+# `propose_all`/`run_dispositions` calls use -- so a `cli.py run`
+# immediately following a preflight run against the same file starts
+# warm, not cold. Nothing here is throwaway work.
 # ---------------------------------------------------------------------------
 
 
@@ -1702,9 +1555,6 @@ class PreflightPacket:
     detection_hold: bool = False
     detection_reason: str | None = None
     uncovered_ink_advisory: bool = False
-    consensus_hold: bool = False
-    consensus_reason: str | None = None
-    consensus_hold_pages: list[int] = field(default_factory=list)
     composition_confirmed: bool = False
 
     @property
@@ -1732,13 +1582,12 @@ class PreflightPacket:
 
     @property
     def clean(self) -> bool:
-        """No structural problem, no detection/consensus/advisory flag, and
-        would auto-assign with zero human input -- a one-click "looks
-        right, confirm" packet."""
+        """No structural problem, no detection/advisory flag, and would
+        auto-assign with zero human input -- a one-click "looks right,
+        confirm" packet."""
         return (
             not self.blocked
             and not self.detection_hold
-            and not self.consensus_hold
             and not self.uncovered_ink_advisory
             and self.would_auto_assign
         )
@@ -1778,10 +1627,6 @@ class PreflightReport:
     @property
     def n_uncovered_ink_advisories(self) -> int:
         return sum(1 for p in self.packets if p.uncovered_ink_advisory)
-
-    @property
-    def n_consensus_holds(self) -> int:
-        return sum(1 for p in self.packets if p.consensus_hold)
 
     @property
     def n_cannot_process(self) -> int:
@@ -1895,7 +1740,6 @@ def run_preflight(
     proposals_by_tag = {p.packet_tag: p for p in proposals}
     assignments = assign_all(proposals, round_labels)
 
-    consensus_analysis = analyze_consensus_anomalies(pdf_path, segmented, orientation_overrides=orientation_overrides)
     orientation_flags = _collect_orientation_flags(pdf_path, segmented, orientation_overrides=orientation_overrides)
 
     packets: list[PreflightPacket] = []
@@ -1914,8 +1758,6 @@ def run_preflight(
                     detection_hold = True
                     detection_reason = f"header border not confidently detected: {band}"
                 uncovered_ink_advisory = bool(uncovered)
-
-            tag_holds = consensus_analysis.holds.get(tag, [])
 
             packets.append(
                 PreflightPacket(
@@ -1938,9 +1780,6 @@ def run_preflight(
                     detection_hold=detection_hold,
                     detection_reason=detection_reason,
                     uncovered_ink_advisory=uncovered_ink_advisory,
-                    consensus_hold=bool(tag_holds),
-                    consensus_reason="; ".join(h.reason for h in tag_holds) if tag_holds else None,
-                    consensus_hold_pages=sorted({h.physical_page_index for h in tag_holds}),
                     composition_confirmed=tag in composition_overrides,
                 )
             )
@@ -2031,11 +1870,6 @@ def format_preflight_report(report: PreflightReport) -> str:
     lines.append(f"\nRoster: period {report.roster_period!r}, {report.roster_entry_count} entries")
     lines.append(f"  {len(no_match)} packet(s) with no plausible roster match: {[p.packet_tag for p in no_match]}")
 
-    lines.append(f"\nConsensus-ink anomalies: {report.n_consensus_holds} packet(s) flagged")
-    for p in report.packets:
-        if p.consensus_hold:
-            lines.append(f"    {p.packet_tag}: {p.consensus_reason}")
-
     lines.append(f"\nUncovered-ink advisory (non-blocking): {report.n_uncovered_ink_advisories} packet(s) flagged")
 
     unsegmentable = [p for p in report.packets if p.is_orphan]
@@ -2081,9 +1915,9 @@ def render_preflight_contact_sheet(
     columns: int = 4,
 ) -> Path | None:
     """One thumbnail per flagged page -- an orientation issue, an
-    undetected header border, uncovered-ink advisory ink, a consensus-ink
-    anomaly, an unsegmentable/orphan packet's own first page, or any other
-    blocked packet's own issue-named page (see other_blocked_packets) --
+    undetected header border, uncovered-ink advisory ink, an
+    unsegmentable/orphan packet's own first page, or any other blocked
+    packet's own issue-named page (see other_blocked_packets) --
     laid out into a single contact-sheet PNG under
     `out_dir/.diagnostics/<pdf-stem>_preflight/contact_sheet.png`, each
     thumbnail labelled with the specific reason(s) it was flagged. Meant
@@ -2112,8 +1946,6 @@ def render_preflight_contact_sheet(
             flag(p.header_page_index, f"{p.packet_tag}: header border not detected")
         if p.uncovered_ink_advisory and p.header_page_index is not None:
             flag(p.header_page_index, f"{p.packet_tag}: uncovered-ink advisory")
-        for idx in p.consensus_hold_pages:
-            flag(idx, f"{p.packet_tag}: consensus-ink anomaly")
         if p.is_orphan and p.page_indices:
             flag(p.page_indices[0], f"{p.packet_tag}: unsegmentable ({'; '.join(p.issues)})")
         if p.page_count_mismatch and p.header_page_index is not None:

@@ -4422,6 +4422,229 @@ module cache means an already-running process doesn't pick up an edited
 changed *script* logic — a correctness-relevant fix like this one needs an
 actual process restart, not just a browser reload, to take effect.
 
+## Output hierarchy simplified, consensus-ink detection removed entirely, and a real 010406 page-order/rotation correction applied (2026-08-15, same day)
+
+**Two deliberate design reversals, both by explicit user request after being shown the real tradeoff, not something either code or this session decided on its own.**
+
+### Output hierarchy: `teacher/period/worksheet_type/topic/round/<SID>.pdf` → `teacher/worksheet_type/period/<SID>.pdf`
+
+**The topic and round path segments (see "Teacher 010406 roster reissue,
+multi-topic PRT worksheets..." and "A round segment..." above for why they
+were added) are gone.** `pipeline.output_path(out_dir, entry,
+worksheet_type)` now takes no `topic`/`round_label` parameters at all --
+`out/<teacher_code>/<worksheet_type>/<period>/<SID>.pdf`, full stop.
+
+**Real, accepted consequence, confirmed by the user before implementing:**
+a student who legitimately completes the same worksheet type more than
+once -- the exact real shape `010406_PD1_PRT.pdf` has (three
+administrations, October/February/March) -- now collides on the identical
+natural path every time. `_claim_output_path`'s numbered-suffix backstop
+(`<SID>.pdf`, `<SID>_2.pdf`, `<SID>_3.pdf`) still guarantees no file is
+ever silently overwritten, but there is no longer anything in the path or
+filename saying which administration a given numbered copy is -- a human
+has to open each file and check its own date field to tell them apart.
+This was a known, explicit tradeoff at the time of the request (offered
+as an alternative -- keep the round label in the filename instead of the
+path -- and declined in favor of the simpler, fully-flat hierarchy).
+
+**What was removed as a direct consequence, since it became entirely
+dead code once nothing computed a topic/round path segment anymore:**
+`pipeline.topic_from_filename`, `NO_TOPIC`, `_TOPIC_FROM_FILENAME`,
+`NO_ROUND`, and the `round_labels`/`round_label` parameters on
+`run_dispositions` and `release_from_manual_queue` (each function's own
+per-tag round-label lookup existed solely to feed the now-gone path
+segment). **What was deliberately kept, since it serves purposes
+unrelated to the output path:** `blocks.py`'s round-grouping feature in
+full -- `group_into_rounds`, `round_labels_by_tag`, the `--round`
+scoping flag, `match.assign_all`'s round-scoped claim-and-remove (a real
+student-per-round matching safety property, not a path concern), the
+round-grouping report printed by both `cli.py run`/`preflight` and
+`review_app.py`, and `pipeline.duplicate_decisions_within_round` (still
+fully meaningful -- it flags the same SID decided for two packets within
+one round, independent of whatever the output path looks like).
+
+Tests exercising the removed topic/round path behavior were deleted
+outright (`test_topic_from_filename_extracts_the_trailing_segment`,
+`test_topic_from_filename_defaults_to_NA_with_constant_path_depth`,
+`test_different_topics_in_the_source_filename_do_not_collide`,
+`test_single_round_file_with_no_topic_has_constant_path_depth`); two
+others were rewritten to assert the new, real behavior instead of
+deleted, since the underlying mechanism they tested (round grouping,
+graceful handling of an unparseable date) is still real and still
+correct -- only the path assertion changed: `test_three_contiguous_
+groups_produce_three_round_labels_and_distinct_paths` became `test_
+three_contiguous_groups_write_to_the_same_dir_with_suffixed_paths`
+(same fixture, now asserting the three administrations collide into one
+directory and get numbered-suffixed, exactly the accepted tradeoff
+above), and `test_undated_group_still_writes_under_the_undated_round_
+segment` became `test_undated_group_still_writes_successfully` (drops
+the now-nonexistent round-segment assertion, keeps the real "an
+unparseable date is never a reason to withhold otherwise-approved
+output" guarantee).
+
+### Consensus-ink detection removed entirely, by explicit request
+
+**`melredact/consensus.py` -- the whole template-agnostic handwriting
+detector (see "Promoted: a template-agnostic consensus-ink detector..."
+and "Consensus-ink: registration tolerance..." above for its full
+history) -- is deleted**, along with every integration point:
+`run_dispositions`' `consensus_holds` parameter and its whole hold-check
+block, `analyze_redaction_holds`'/`HoldAnalysis`'s `consensus_hold`/
+`consensus_reason` fields, `PreflightPacket`'s `consensus_hold`/
+`consensus_reason`/`consensus_hold_pages` fields and `run_preflight`'s
+consensus computation, `format_hold_analysis_report`'s and `format_
+preflight_report`'s consensus-ink report lines, the preflight contact
+sheet's consensus-flagged-page labelling, `cli.py run`/`analyze`'s
+consensus report printing, and `review_app.py`'s `_consensus` cached
+function and its own "Consensus-ink anomaly check" expander. `tests/
+test_consensus.py` and the consensus-specific fixture builders in
+`tests/make_fixture.py` (`build_consensus_fixture`, `build_consensus_
+writing_zone_fixture`, `build_small_consensus_group_fixture`,
+`_consensus_page2_image`, `ConsensusFixtureResult`/`ConsensusZone
+FixtureResult`) and the whole "Consensus-ink anomaly check integration"
+test section in `tests/test_pipeline.py` are deleted outright, along
+with every `CONSENSUS_*` constant in `config.py`.
+
+**This was a real safety feature with a genuine track record, not a
+false-positive-only check like the uncovered-ink advisory it sits next
+to in this file's own history -- worth recording plainly, not glossing
+over.** It caught two real leaks on `010406_PD1_PRT.pdf` (a freehand
+name on a continuation page, one for a student never on the roster at
+all, so no other check -- not `verify_no_leaked_names`, not `find_
+uncovered_group_words` -- could have caught it) and had a real,
+measured, low false-positive rate on that same file after its own two
+recalibration passes (7 of 44 real packets held, most confirmed genuine
+stray marks or printed-text noise). Its removal is an accepted,
+requested tradeoff, not a finding that it wasn't working: real,
+never-shipped, never-regenerated real output for 010406 and 020415
+still sits in `out/` un-reshipped from before this removal, produced
+under a pipeline that *did* have this check; nothing about those
+earlier findings is retroactively invalidated. `verify_no_leaked_names`
+and `find_uncovered_group_words`' advisory remain exactly as they were
+-- neither depended on consensus-ink, and neither gained or lost
+anything from its removal.
+
+**`pipeline.release_from_manual_queue`'s `flagged_regions`/
+`flagged_regions_to_verify` machinery, and `_queue_for_manual_
+redaction`'s `flagged_regions` parameter, were deliberately left in
+place rather than torn out** -- they were built specifically for
+consensus-ink's own queue-and-verify workflow (seed the exact flagged
+bbox in the manual editor, refuse release unless the human-drawn region
+actually covers it) and are now permanently unused (nothing left calls
+`_queue_for_manual_redaction` with `flagged_regions` set, since the only
+caller that ever did was the consensus-hold block just removed), but
+harmless: every parameter defaults to `None`/empty, so an unused
+capability sitting idle is not a correctness risk the way removing the
+whole check was worth doing carefully for. Left as dead-but-inert
+generic infrastructure rather than a second, riskier pass to fully
+unwind, given the explicit scope of this request was the check itself,
+not this shared plumbing.
+
+### A real page-order/rotation correction applied to 010406, and the worksheet-type parsing bug found while verifying it
+
+**Using the review server this session's own fixes made usable, a human
+directed a specific structural correction for the real
+`010406_PD1_PRT.pdf`: swap physical pages 85/86 (1-indexed; 0-indexed
+84/85 -- the same reversed continuation/header pair this session already
+found and built tooling for), confirm each already-recorded 180° rotation
+(from an earlier session), combine into one packet, and confirm pages
+87/88 (1-indexed; 0-indexed 86/87, the real unreadable-continuation-
+footer packet the composition-override mechanism was built for) as one
+packet.** Applied via the exact mechanisms review_app.py's own UI calls
+-- `pipeline.save_page_order` (page 85 moved immediately before page 84
+in the processing sequence) and `pipeline.save_composition_overrides`
+(the `010406_PD1_PRT_p086` tag confirmed) -- verified directly against
+the real file before persisting: `segment_pdf(pdf_path, orientation_
+overrides={84: 180, 85: 180}, page_sequence=...)` produces `page_indices
+=[85, 84]`, `header_page_index=85`, `issues=[]`.
+
+**Verifying this surfaced a second real bug: the combined packet's
+`worksheet_type` parsed as `"PAGE_1_OF_2_PRT"` instead of `"PRT"`.**
+Root cause, confirmed by dumping the real footer-band words with their
+positions: `segment._words_to_text`'s plain `(top, x0)` sort assumes the
+worksheet-type line always measures comfortably *above* the page-marker
+line (true on every ordinary real page sampled, ~10-12pt vertical gap,
+matching `config.py`'s own anchors) -- false on this specific real,
+180°-rotated page, where OCR measured "Page 1 of 2" (top=736.0) and "PRT
+01 2024" (top=736.7) only 0.7pt apart, close enough that the sort
+produced "Page 1 of 2 PRT 01 2024" as one blob, which `_parse_worksheet_
+type`'s regex then greedily over-captured past "PRT". Would have
+misfiled this packet's real output under a wrong `worksheet_type`
+directory had it shipped as read, with nothing raised or flagged to
+signal it.
+
+A first fix attempt (nearest-anchor by *vertical* position, mirroring
+`_assign_words_to_rows`' own established pattern) failed on this same
+real page for the same underlying reason the bug exists: the page-
+marker line's own *measured* top (736.0) landed almost exactly on the
+worksheet-type anchor's *configured* top (736), not its own (747) --
+whatever this page's rotation/OCR quirk is, it moved the page-marker
+text's apparent vertical position outright, not just closed the normal
+gap between the two. **Fixed correctly by splitting on horizontal
+position instead** (`segment._footer_worksheet_type_words`):
+worksheet-type prints in the left margin (x0 27-88 on every real page
+checked, including this one), page-marker in the right margin (x0
+512-576) -- genuinely different columns, never scrambled by whatever
+vertical-measurement noise broke the other two approaches. `read_footer`
+now extracts `worksheet_type` from just these column-filtered words,
+via the same disk-cached OCR call `page_words` already makes on the OCR
+path (identical bbox), so this costs nothing extra once warm.
+
+Testing note, found while writing the regression test: a synthetic
+fixture with a native invisible text layer cannot reproduce this bug at
+all, since `page.chars` being truthy routes `read_footer`'s marker-blob
+text through pdfplumber's own `extract_text()` (not `_words_to_text`),
+and `extract_text()`'s own line-clustering doesn't share this failure
+mode -- confirmed directly (a fixture-based end-to-end test passes
+identically whether the fix is applied or not). The real regression
+proof (`test_footer_worksheet_type_words_splits_by_column_not_row`,
+`tests/test_segment.py`) instead reproduces the exact real word geometry
+(top values 0.7pt apart, real x0s) directly at the word-list level,
+bypassing the `page.chars` dispatch entirely, and demonstrates both the
+bug and the fix in one test. The fixture-based end-to-end test (`test_
+worksheet_type_parses_correctly_when_page_marker_and_type_share_a_row`)
+is kept as a secondary sanity check on `read_footer`'s own wiring, not
+the regression proof itself.
+
+**`composition_overrides` was also wired into `run_preflight`**, closing
+a gap found while re-verifying the real file end to end: `preflight` was
+already override-aware for orientation and page-order, but a packet a
+human had confirmed the *composition* for still reported `blocked` in
+preflight's own verdict, disagreeing with what a real run would actually
+do with that confirmation on record. `PreflightPacket.blocked` now
+mirrors `run_dispositions`' own release logic exactly. Test: `test_
+preflight_honors_composition_overrides` (`tests/test_preflight.py`).
+
+**Real result, confirmed by re-running `cli.py preflight` against the
+real file after all of the above:** "Page-count vs. footer" now reports
+0 disagreeing (was 2 -- p084/p085), "Unsegmentable packets" now reports
+only `p056` (was 2), and "Other blocked packets" is now empty (was
+`p086`). Verdict: 13 clean, 32 need the editor, 1 cannot be processed
+(`p056` -- no printed header at all on its own physical page, a genuine
+template/scan anomaly this session's fixes don't address, needs
+something outside the tool). **Nothing was written to `out/`, redacted,
+or shipped as part of this** -- `page_order`/`composition_overrides` are
+real, persisted, human-directed sidecar state now on disk for 010406,
+but a real run for this teacher is still a separate, human-initiated
+step. The review server (port 8503) was restarted after these code
+changes, since Python's own module cache means an already-running
+process doesn't pick up an edited `.py` file the way Streamlit's own
+script-level auto-rerun picks up changed *script* logic.
+
+**Separately, this session also ran a real, full (unscoped) `cli.py run`
+for 010406 with `--no-delete`** (32 packets written, 5 numbered-suffix
+collisions from the still-unresolved duplicate-decision pairs, 4 held
+back for consensus-ink -- before its removal later the same session; one
+of the four was `p086`, released from its footer-confidence hold by
+composition confirmation but still correctly held by the then-active
+consensus-ink check on a real, separate finding on that packet's own
+page 2). That run and its output predate this session's consensus-ink
+removal and output-hierarchy change -- the 32 files it wrote sit at the
+*old* path shape (`teacher/period/worksheet_type/topic/round/<SID>.pdf`)
+and were not regenerated or moved under the new hierarchy as part of
+this session. A future run for 010406 will write under the new,
+flatter path shape; nothing automatically migrates the older files.
+
 ## Working preferences
 
 - Calibrate against real measured data, not assumptions — when a
