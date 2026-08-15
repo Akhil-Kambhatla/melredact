@@ -5,9 +5,13 @@ from melredact.config import RENDER_DPI_PREVIEW
 from melredact.pipeline import (
     DispositionResult,
     analyze_redaction_holds,
+    composition_overrides_path,
     decisions_path,
+    duplicate_decisions_within_round,
     filter_packets_by_round,
+    format_duplicate_decisions_report,
     format_hold_analysis_report,
+    load_composition_overrides,
     load_decisions,
     load_detection_overrides,
     load_orientation_overrides,
@@ -15,6 +19,7 @@ from melredact.pipeline import (
     packet_tag,
     propose_all,
     run_dispositions,
+    save_composition_overrides,
     save_decisions,
     save_orientation_overrides,
 )
@@ -28,6 +33,7 @@ from tests.make_fixture import (
     build_footer_edge_case_fixture,
     build_main_fixture,
     build_rotated_page_copy,
+    build_unreadable_continuation_footer_fixture,
 )
 
 DPI = RENDER_DPI_PREVIEW
@@ -305,6 +311,79 @@ def test_allow_delete_false_leaves_stale_correction_file_in_place(main_fixture, 
     assert tag_result.deletion_skipped
     assert not any(r.deleted_path for r in second)
     assert old_path.exists()  # stale file left in place, never removed
+
+
+def test_stale_suffixed_path_is_cleaned_up_when_a_different_packets_collision_clears(
+    main_fixture, segmented, roster, tmp_path
+):
+    """Real bug found auditing the real 010406 output tree (2026-08-15): a
+    packet's own claimed output path can change between runs even when its
+    own SID never changes -- purely because a *different* packet's
+    collision status with this tag's natural path shifted (that other
+    packet's decision was corrected away from the SID it used to share).
+    The old `prior_sid != sid` check only looked at whether *this* tag's
+    SID changed, so it never caught this, leaving a stale numbered-suffix
+    file in out/ that no current ledger entry pointed at."""
+    tag_a = packet_tag(main_fixture.pdf_path, segmented.packets[0])
+    tag_b = packet_tag(main_fixture.pdf_path, segmented.packets[1])
+    sid_shared = _sid_for(roster, "Jordan Ames")
+    sid_other = _sid_for(roster, "Priya Chandra")
+    out_dir = tmp_path / "out"
+
+    # Both packets decided to the same SID (a real, if mistaken, human
+    # decision -- see CLAUDE.md's real duplicate-decision-within-round
+    # finding) -- A claims the natural path, B collides and gets a
+    # numbered-suffix path instead.
+    first = run_dispositions(
+        main_fixture.pdf_path, segmented, {tag_a: sid_shared, tag_b: sid_shared}, roster, out_dir=out_dir, dpi=DPI
+    )
+    a1 = next(r for r in first if r.packet_tag == tag_a)
+    b1 = next(r for r in first if r.packet_tag == tag_b)
+    assert a1.out_path.name == f"{sid_shared}.pdf"
+    assert b1.collision_note is not None
+    stale_suffixed_path = b1.out_path
+    assert stale_suffixed_path.exists()
+    assert stale_suffixed_path != a1.out_path
+
+    # A's decision is corrected to a different student -- A's own old file
+    # is cleaned up (pre-existing behavior) and the natural path frees up.
+    # B's own decision never changes.
+    second = run_dispositions(
+        main_fixture.pdf_path, segmented, {tag_a: sid_other, tag_b: sid_shared}, roster, out_dir=out_dir, dpi=DPI
+    )
+    b2 = next(r for r in second if r.packet_tag == tag_b)
+    assert b2.out_path.name == f"{sid_shared}.pdf"  # B now claims the natural path, no collision left
+    assert b2.out_path != stale_suffixed_path
+    assert not stale_suffixed_path.exists(), "B's own now-abandoned suffixed file must not be left orphaned"
+
+
+def test_duplicate_decisions_within_round_flags_the_real_010406_shape():
+    """Real shape found auditing 010406's own decisions (2026-08-15): the
+    same SID decided for two different packet_tags within one round must
+    be reported, keyed by (round, sid); different rounds or different SIDs
+    must never be flagged."""
+    decisions = {
+        "scan_p040": "SID_A",
+        "scan_p066": "SID_A",  # same round, same sid as p040 -- duplicate
+        "scan_p004": "SID_A",  # different round -- not a duplicate
+        "scan_p042": "SID_B",
+        "scan_p999": None,  # non-consent, never counted
+    }
+    round_labels = {
+        "scan_p040": "2026-02",
+        "scan_p066": "2026-02",
+        "scan_p004": "2026-03",
+        "scan_p042": "2026-02",
+        "scan_p999": "2026-02",
+    }
+    duplicates = duplicate_decisions_within_round(decisions, round_labels)
+    assert duplicates == {("2026-02", "SID_A"): ["scan_p040", "scan_p066"]}
+
+    report = format_duplicate_decisions_report(duplicates)
+    assert "2026-02" in report and "SID_A" in report and "scan_p040" in report and "scan_p066" in report
+    assert format_duplicate_decisions_report({}) == (
+        "Duplicate-decision check: no SID decided for more than one packet within the same round."
+    )
 
 
 # --- round-scoped processing: --round restricts a run to one round group's
@@ -596,6 +675,85 @@ def test_packet_with_unresolved_issues_is_held_back_even_with_a_decision(tmp_pat
     assert result.held_back
     assert result.out_path is None
     assert "unresolved issues" in result.reason
+
+
+def test_composition_override_releases_an_unreadable_footer_hold_and_writes_the_packet(tmp_path, roster):
+    """The real p086 shape: a packet whose continuation page's footer is
+    unreadable but whose redaction is otherwise correct must become
+    assignable once a human confirms the page composition is right --
+    without the override, it's held exactly like any other unresolved-
+    issues packet (see the previous test)."""
+    pdf_path = build_unreadable_continuation_footer_fixture(tmp_path / "unreadable_footer")
+    seg = segment_pdf(pdf_path)
+    packet = next(p for p in seg.packets if p.issues)
+    assert "unreadable footer, cannot verify sequence" in packet.issues[0]
+    tag = packet_tag(pdf_path, packet)
+    sid = _sid_for(roster, "Jordan Ames")
+
+    without_override = run_dispositions(pdf_path, seg, {tag: sid}, roster, out_dir=tmp_path / "out1", dpi=DPI)
+    held = next(r for r in without_override if r.packet_tag == tag)
+    assert held.held_back
+    assert held.out_path is None
+
+    released = run_dispositions(
+        pdf_path, seg, {tag: sid}, roster, out_dir=tmp_path / "out2", dpi=DPI, composition_overrides={tag}
+    )
+    result = next(r for r in released if r.packet_tag == tag)
+    assert not result.held_back
+    assert result.out_path is not None and result.out_path.exists()
+    assert "human-confirmed page composition" in result.reason
+
+
+def test_composition_override_does_not_release_an_orientation_issue(main_fixture, roster, tmp_path):
+    """An orientation issue has its own real fix (rotate the page) --
+    confirming page composition must never silently wave one through, even
+    if the same packet's other issues would otherwise qualify."""
+    rotated_path = build_rotated_page_copy(main_fixture.pdf_path, tmp_path, 0, 90, "rotated_composition.pdf")
+    seg = segment_pdf(rotated_path)
+    packet = next(p for p in seg.packets if any("orientation" in i for i in p.issues))
+    tag = packet_tag(rotated_path, packet)
+    sid = _sid_for(roster, "Jordan Ames")
+
+    results = run_dispositions(
+        rotated_path, seg, {tag: sid}, roster, out_dir=tmp_path / "out", dpi=DPI, composition_overrides={tag}
+    )
+    result = next(r for r in results if r.packet_tag == tag)
+    assert result.held_back
+    assert result.out_path is None
+    assert "composition override does not cover" in result.reason
+
+
+def test_composition_override_does_not_release_a_consensus_ink_or_verify_hold(main_fixture, segmented, roster, tmp_path, monkeypatch):
+    """A composition override is never even consulted by the two real-
+    finding holds (consensus-ink anomaly, verify_no_leaked_names) -- those
+    stay non-overridable by any confirmation, composition included."""
+    import melredact.pipeline as pipeline_mod
+    from melredact.redact import LeakFinding
+
+    monkeypatch.setattr(
+        pipeline_mod,
+        "verify_no_leaked_names",
+        lambda out_path, roster: [LeakFinding(page_index=0, sid="x", token="leaked")],
+    )
+    packet = segmented.packets[0]
+    tag = packet_tag(main_fixture.pdf_path, packet)
+    sid = _sid_for(roster, "Jordan Ames")
+    results = run_dispositions(
+        main_fixture.pdf_path, segmented, {tag: sid}, roster, out_dir=tmp_path / "out", dpi=DPI,
+        composition_overrides={tag},
+    )
+    result = next(r for r in results if r.packet_tag == tag)
+    assert result.held_back
+    assert "leaks" in result.reason
+
+
+def test_composition_overrides_persist_and_reload(tmp_path):
+    decisions_dir = tmp_path / "decisions"
+    save_composition_overrides("some_scan.pdf", {"some_scan_p000", "some_scan_p010"}, decisions_dir=decisions_dir)
+    assert composition_overrides_path("some_scan.pdf", decisions_dir).exists()
+    reloaded = load_composition_overrides("some_scan.pdf", decisions_dir=decisions_dir)
+    assert reloaded == {"some_scan_p000", "some_scan_p010"}
+    assert load_composition_overrides("never_saved.pdf", decisions_dir=decisions_dir) == set()
 
 
 def test_leak_finding_deletes_output_and_holds_back_not_raises(main_fixture, segmented, roster, tmp_path, monkeypatch):

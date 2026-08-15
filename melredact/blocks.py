@@ -194,6 +194,7 @@ def collect_packet_dates(
     segmented: SegmentResult | None = None,
     *,
     orientation_overrides: dict[int, int] | None = None,
+    page_sequence: list[int] | None = None,
 ) -> list[PacketDate]:
     """One (packet_tag, raw OCR'd date text, parsed month) per packet in the
     file -- the file-level resolution rule's raw material. Deliberately
@@ -215,7 +216,7 @@ def collect_packet_dates(
     from melredact.pipeline import packet_tag as _packet_tag
 
     if segmented is None:
-        segmented = segment_pdf(pdf_path, orientation_overrides=orientation_overrides)
+        segmented = segment_pdf(pdf_path, orientation_overrides=orientation_overrides, page_sequence=page_sequence)
     dates: list[PacketDate] = []
     with open_pdf(pdf_path, orientation_overrides=orientation_overrides) as pdf:
         for packet in segmented.packets:
@@ -446,13 +447,17 @@ def round_disagreeing_tags(groups: list[RoundGroup], dates: list[PacketDate]) ->
 
 
 def collect_packet_rounds(
-    pdf_path: str | Path, segmented: SegmentResult | None = None, *, orientation_overrides: dict[int, int] | None = None
+    pdf_path: str | Path,
+    segmented: SegmentResult | None = None,
+    *,
+    orientation_overrides: dict[int, int] | None = None,
+    page_sequence: list[int] | None = None,
 ) -> list[RoundGroup]:
     """The normal entry point: segment (unless already done), read every
     packet's own Date field, and group into contiguous rounds. See
     group_into_rounds for the grouping rule itself."""
     if segmented is None:
-        segmented = segment_pdf(pdf_path, orientation_overrides=orientation_overrides)
+        segmented = segment_pdf(pdf_path, orientation_overrides=orientation_overrides, page_sequence=page_sequence)
     dates = collect_packet_dates(pdf_path, segmented=segmented, orientation_overrides=orientation_overrides)
     return group_into_rounds(segmented.packets, dates)
 

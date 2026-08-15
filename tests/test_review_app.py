@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -14,7 +15,14 @@ from melredact.pipeline import load_orientation_overrides, packet_tag, run_dispo
 from melredact.redact import redact_packet, verify_no_leaked_names
 from melredact.roster import load_roster
 from melredact.segment import segment_pdf
-from tests.make_fixture import PACKETS, build_footer_edge_case_fixture, build_main_fixture, build_rotated_page_copy
+from tests.make_fixture import (
+    PACKETS,
+    build_footer_edge_case_fixture,
+    build_main_fixture,
+    build_reversed_pair_fixture,
+    build_rotated_page_copy,
+    build_unreadable_continuation_footer_fixture,
+)
 
 APP_PATH = str(Path(__file__).resolve().parent.parent / "review_app.py")
 
@@ -573,3 +581,351 @@ def test_preview_rotation_flows_into_redaction_correctly_once_applied(main_fixtu
     assert not result.held_back, result.reason
     assert result.out_path is not None and result.out_path.exists()
     assert verify_no_leaked_names(result.out_path, roster) == []
+
+
+# --- Phase 2: roster search must be able to select a decision the matcher
+# never proposed (see CLAUDE.md's "a roster entry chosen by search cannot
+# be selected" section) ---
+
+
+def _build_no_name_pdf(tmp_path):
+    """A single header packet whose Name field was left blank by the
+    student -- the real "packet 70" shape this session's bug report
+    described: OCR reads the printed 'Name:' label but no handwritten
+    value at all, so the matcher has zero candidates to propose and a
+    reviewer has to resolve the student entirely through roster search.
+    Two real roster entries so a search can pick one that was never a
+    matcher candidate. Fictional names, never real student PII."""
+    from melredact.config import (
+        DATE_ANCHOR,
+        FOOTER_PAGE_MARKER,
+        FOOTER_WORKSHEET_TYPE,
+        GROUP_ANCHOR,
+        NAME_ANCHOR,
+        PERIOD_ANCHOR,
+        TEACHER_ANCHOR,
+    )
+    from tests.make_fixture import InvisibleText, PdfBuilder, _write_roster_csv, render_header_image
+
+    worksheet_type_text = "PRT (01/2024)"
+    page_marker = "Page 1 of 1"
+    img = render_header_image(
+        name_text="",
+        teacher_text="Hannel",
+        group_text="",
+        date_text="10/03/2025",
+        period_text="02",
+        worksheet_type=worksheet_type_text,
+        page_marker=page_marker,
+        shade_blank_rows=False,
+    )
+    items = [
+        InvisibleText("Name:", NAME_ANCHOR["x0"], NAME_ANCHOR["top"], 9),
+        InvisibleText("Teacher:", TEACHER_ANCHOR["x0"], TEACHER_ANCHOR["top"], 9),
+        InvisibleText("Hannel", 150, TEACHER_ANCHOR["top"]),
+        InvisibleText("Group members, if any:", GROUP_ANCHOR["x0"], GROUP_ANCHOR["top"], 9),
+        InvisibleText("Date:", DATE_ANCHOR["x0"], NAME_ANCHOR["top"], 9),
+        InvisibleText("10/03/2025", 450, NAME_ANCHOR["top"]),
+        InvisibleText("Period:", PERIOD_ANCHOR["x0"], TEACHER_ANCHOR["top"], 9),
+        InvisibleText("02", 450, TEACHER_ANCHOR["top"]),
+        InvisibleText(worksheet_type_text, FOOTER_WORKSHEET_TYPE["x0"], FOOTER_WORKSHEET_TYPE["top"], 9),
+        InvisibleText(page_marker, FOOTER_PAGE_MARKER["x0"], FOOTER_PAGE_MARKER["top"], 9),
+    ]
+    builder = PdfBuilder()
+    builder.add_page(img, items)
+    pdf_path = tmp_path / "no_name.pdf"
+    builder.save(pdf_path)
+
+    # match.propose always scores and returns *every* roster entry (see its
+    # own docstring: "review needs the top candidate regardless"), so a
+    # roster small enough that the matcher's own top5 slice would include
+    # the target anyway can't actually exercise "a decision search added
+    # that the matcher never proposed" -- every entry scores identically
+    # against an empty probe (score_pair against blank text), so a stable
+    # sort keeps them in roster order. Six decoys ahead of the real target
+    # guarantees the target falls outside the top5 slice review_app.py
+    # actually renders as matcher candidates. SIDs follow make_fixture's
+    # own <teacher_code><period><index> convention -- roster.py cross-
+    # checks the SID's own period digits against the rest of its block.
+    def _test_sid(index: int) -> str:
+        return f"020415" f"02" f"{index:02d}"
+
+    decoys = [(_test_sid(i), f"Decoy{i}", "Student") for i in range(1, 7)]
+    target_sid = _test_sid(7)
+    roster_path = tmp_path / "roster.csv"
+    _write_roster_csv(roster_path, decoys + [(target_sid, "Lu", "Brian")])
+    return pdf_path, roster_path, target_sid
+
+
+def test_roster_search_selection_survives_a_later_confirm_click(tmp_path):
+    """Real bug, reported 2026-08-15 (packet 70): search-selecting a
+    student not among the matcher's own candidates recorded the right SID
+    immediately, but the Decision radio's own stale default ("Not on
+    roster", since OCR read no name at all) silently overwrote it back to
+    a non-consent rejection the moment a reviewer clicked the big, obvious
+    "Confirm decision" button afterward. This drives that exact sequence
+    -- search, select, use, THEN click Confirm decision -- and asserts the
+    searched SID survives, proving the radio and the search action can no
+    longer disagree about what's selected."""
+    pdf_path, roster_path, target_sid = _build_no_name_pdf(tmp_path)
+    out_dir = tmp_path / "out"
+    decisions_dir = tmp_path / "decisions"
+    at = _launch(pdf_path, roster_path, out_dir, decisions_dir)
+
+    tag = packet_tag(pdf_path, segment_pdf(pdf_path).packets[0])
+    assert at.session_state.decisions.get(tag) is None or tag not in at.session_state.decisions
+
+    query = next(w for w in at.text_input if w.key == f"search_{tag}")
+    query.set_value("Brian").run()
+    select = next(w for w in at.selectbox if w.key == f"search_select_{tag}")
+    assert select.options == [f"{target_sid} — Brian Lu"]
+    use_btn = next(b for b in at.button if b.key == f"search_use_{tag}")
+    use_btn.click().run()
+    assert not at.exception
+
+    # The search action alone already recorded the right decision --
+    # this much worked even before the fix.
+    assert at.session_state.decisions[tag] == target_sid
+
+    # The radio must now show the searched entry selected, clearly marked
+    # as having come from search rather than the matcher.
+    radio = next(w for w in at.radio if w.key == f"decision_{tag}")
+    assert "found via roster search" in radio.value
+    assert target_sid in radio.value
+
+    # The real regression: clicking Confirm decision afterward -- exactly
+    # what a reviewer who doesn't fully trust the search action alone
+    # would naturally do next -- must reaffirm the same SID, not silently
+    # revert it to a non-consent rejection.
+    confirm_btn = next(b for b in at.button if b.key == f"confirm_{tag}")
+    assert not confirm_btn.disabled
+    confirm_btn.click().run()
+    assert not at.exception
+    assert at.session_state.decisions[tag] == target_sid, "Confirm decision silently reverted a search-selected SID"
+
+
+def test_packet_with_no_ocrd_name_has_no_preselected_decision(tmp_path):
+    """A confident-looking default on zero evidence is itself a hazard (see
+    CLAUDE.md): when OCR reads no name at all and nothing has been decided
+    yet, the Decision radio must show a genuine "nothing chosen" placeholder
+    -- never "Not on roster" pre-selected and one accidental Confirm click
+    away from silently rejecting a real, unreviewed student."""
+    pdf_path, roster_path, _target_sid = _build_no_name_pdf(tmp_path)
+    out_dir = tmp_path / "out"
+    decisions_dir = tmp_path / "decisions"
+    at = _launch(pdf_path, roster_path, out_dir, decisions_dir)
+    tag = packet_tag(pdf_path, segment_pdf(pdf_path).packets[0])
+
+    radio = next(w for w in at.radio if w.key == f"decision_{tag}")
+    assert radio.options[0].startswith("—"), "expected a genuine no-selection placeholder as the first option"
+    assert radio.value == radio.options[0], "nothing should be preselected when OCR read no name at all"
+
+    for key in (f"confirm_{tag}", f"confirm_next_{tag}"):
+        btn = next(b for b in at.button if b.key == key)
+        assert btn.disabled, f"{key} must stay disabled until a reviewer actually chooses a decision"
+
+
+# --- Phase 1: manual editor canvas reliability (see CLAUDE.md's "the
+# canvas is unusable" section) ---
+
+
+def test_manual_editor_canvas_state_survives_a_simulated_rerun_without_losing_boxes(main_fixture, tmp_path):
+    """A rerun this editor itself causes (a page-selector change, an
+    unrelated widget, or -- what a real drag actually triggers -- st_canvas's
+    own debounced sync back to Streamlit) must never discard boxes a
+    reviewer already has in progress. AppTest can't drive a live canvas
+    drag (third-party iframe), so this seeds `mq_regions_{tag}` the same
+    way a completed drag would have left it (see the manual-queue release
+    test above for the same convention), runs the app twice in a row --
+    the second run is the "unrelated rerun" -- and asserts the exact same
+    boxes are still there afterward: not reset to the auto-seeded
+    detection pair, not cleared, not silently mutated."""
+    out_dir = tmp_path / "out"
+    decisions_dir = tmp_path / "decisions"
+    tag = "packets_p000"
+
+    seeded_boxes = [(40.0, 60.0, 200.0, 90.0), (210.0, 60.0, 380.0, 140.0)]
+
+    sys.argv = [
+        "review_app.py",
+        str(main_fixture.pdf_path),
+        str(main_fixture.roster_path),
+        "--out-dir",
+        str(out_dir),
+        "--decisions-dir",
+        str(decisions_dir),
+    ]
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.session_state[f"mq_regions_{tag}"] = {0: list(seeded_boxes)}
+    at.run()
+    assert not at.exception
+    at.selectbox[0].set_value(tag).run()
+    assert at.session_state[f"mq_regions_{tag}"][0] == seeded_boxes
+
+    # A second, unrelated rerun (e.g. what st_canvas's own debounced sync
+    # or an unrelated widget click would trigger) -- must not re-seed or
+    # otherwise touch the boxes already recorded for this page.
+    at.run()
+    assert not at.exception
+    assert at.session_state[f"mq_regions_{tag}"][0] == seeded_boxes
+
+    # The canvas widget's own key must be stable across both reruns above
+    # (never regenerated from anything that changes run to run) -- a
+    # changing key is exactly what would force the frontend component to
+    # remount and discard in-progress state.
+    assert f"mq_canvas_{tag}_0" in at.session_state
+
+
+@pytest.mark.parametrize("dpi_source", ["header_page"])
+def test_editor_dpi_differs_from_module_dpi_and_round_trips_exactly(main_fixture, dpi_source):
+    """The manual editor renders at a page-derived DPI (see
+    config.MANUAL_EDITOR_TARGET_WIDTH_PX / review_app._editor_dpi_for_page),
+    not the module-level review_app.DPI every other preview in this file
+    uses -- proves the two are genuinely different for a real page (so this
+    is a real behavior change, not a no-op), and that the pixel<->point
+    conversion functions still round-trip exactly at whatever DPI that
+    computation actually picks, the same guarantee test_canvas_rect_bbox_
+    round_trip_at_multiple_dpis already gives at a fixed list of DPIs."""
+    with pdfplumber.open(main_fixture.pdf_path) as pdf:
+        page_width_pt = pdf.pages[0].width
+
+    editor_dpi = review_app._editor_dpi_for_page(page_width_pt)
+    assert editor_dpi != review_app.DPI
+
+    rendered_width_px = round(page_width_pt * editor_dpi / 72.0)
+    # Within a couple of pixels of the configured target width -- rounding
+    # the DPI to an integer, then the width to an integer again, can't land
+    # exactly on the target every time.
+    from melredact.config import MANUAL_EDITOR_TARGET_WIDTH_PX
+
+    assert abs(rendered_width_px - MANUAL_EDITOR_TARGET_WIDTH_PX) <= 5
+
+    original = (38.0, 58.0, 300.0, 148.0)
+    rect = review_app._bbox_to_canvas_rect(original, editor_dpi)
+    recovered = review_app._canvas_rect_to_bbox(rect, editor_dpi)
+    for a, b in zip(original, recovered):
+        assert a == pytest.approx(b, abs=1e-6)
+
+
+def test_manual_editor_both_panes_report_identical_pixel_dimensions(main_fixture, tmp_path):
+    """The canvas pane (a fixed-pixel-size custom component) and the
+    preview pane (a plain st.image, which -- unless given an explicit
+    width -- silently shrinks to fit a narrower container) must render at
+    the exact same pixel size, or the two visibly drift apart (see
+    CLAUDE.md's Phase 1 root-cause writeup). Both panes' own captions
+    embed their rendered `WxH` in pixels (see _render_manual_editor)
+    specifically so this is directly observable without reaching into
+    Streamlit's custom-component protocol, which AppTest doesn't expose
+    pixel dimensions for."""
+    out_dir = tmp_path / "out"
+    decisions_dir = tmp_path / "decisions"
+    tag = "packets_p000"
+    at = _launch(main_fixture.pdf_path, main_fixture.roster_path, out_dir, decisions_dir)
+    at.selectbox[0].set_value(tag).run()
+
+    dims_pattern = re.compile(r"(\d+)×(\d+)px")
+    captions_with_dims = [c.value for c in at.caption if dims_pattern.search(c.value)]
+    assert len(captions_with_dims) >= 2, "expected both the original and redacted panes to report their pixel size"
+
+    dims = [dims_pattern.search(c).groups() for c in captions_with_dims]
+    assert len(set(dims)) == 1, f"panes reported different pixel dimensions: {dims}"
+
+
+# --- Phase 3: page composition editor for out-of-order scans (see
+# CLAUDE.md's "pages scanned out of order" section) ---
+
+
+def test_reversed_continuation_header_pair_is_proposed_not_auto_applied(tmp_path):
+    """A scanner-reversed continuation-before-header pair (see segment.
+    find_reversed_continuation_header_pairs) must never be silently fixed
+    -- the header-started packet still shows its stale "footer declared 2"
+    segmentation issue the moment the app loads, before any reviewer
+    action, proving detection alone never mutates anything."""
+    pdf_path = build_reversed_pair_fixture(tmp_path / "reversed")
+    main = build_main_fixture(tmp_path / "main")
+    out_dir = tmp_path / "out"
+    decisions_dir = tmp_path / "decisions"
+    at = _launch(pdf_path, main.roster_path, out_dir, decisions_dir)
+
+    tag = "reversed_pair_p003"
+    at.selectbox[0].set_value(tag).run()
+    assert not at.exception
+    assert at.session_state.page_order is None, "detecting a reversal must never write a page-order override on its own"
+    assert any("footer declared 2" in w.value for w in at.warning), "the stale segmentation issue must still be showing"
+
+    apply_btn = next((b for b in at.button if b.key and b.key.startswith(f"pc_apply_reversal_{tag}_")), None)
+    assert apply_btn is not None, "the reversal fix must be offered as a one-click proposal, not applied automatically"
+
+
+def test_page_composition_editor_reorders_and_clears_stale_issue(tmp_path):
+    """Applying the page composition editor's proposed fix must actually
+    re-run segmentation for the affected packets -- clicking it saves a
+    corrected page order and the packet's own stale "footer declared 2"
+    issue (and its unresolved-issues warning) must be gone afterward, not
+    merely hidden."""
+    pdf_path = build_reversed_pair_fixture(tmp_path / "reversed")
+    main = build_main_fixture(tmp_path / "main")
+    out_dir = tmp_path / "out"
+    decisions_dir = tmp_path / "decisions"
+    at = _launch(pdf_path, main.roster_path, out_dir, decisions_dir)
+
+    tag = "reversed_pair_p003"
+    at.selectbox[0].set_value(tag).run()
+    apply_btn = next(b for b in at.button if b.key and b.key.startswith(f"pc_apply_reversal_{tag}_"))
+    apply_btn.click().run()
+    assert not at.exception
+
+    assert at.session_state.page_order == [0, 1, 3, 2]
+
+    seg = segment_pdf(pdf_path, page_sequence=at.session_state.page_order)
+    fixed = next(p for p in seg.packets if p.page_indices and p.page_indices[0] == 3)
+    assert fixed.page_indices == [3, 2]
+    assert fixed.issues == [], "the composition fix must clear the stale footer/orphan issues, not just paper over them"
+
+    # And the UI itself reflects the fix on the very next render, not just
+    # the underlying segment_pdf call -- re-selecting the same tag (stable
+    # here, since physical page 3 is still page_indices[0] after the fix)
+    # must no longer show the unresolved-issues warning.
+    at.selectbox[0].set_value(tag).run()
+    assert not any("footer declared 2" in w.value for w in at.warning)
+
+
+# --- Phase 4: human-confirmable footer/page-count holds (see CLAUDE.md's
+# "unreadable footers should not block a human who can see the page"
+# section) ---
+
+
+def test_unreadable_footer_packet_becomes_assignable_after_confirming_composition(tmp_path):
+    """The real p086 shape end to end through the review UI: a packet
+    blocked only by its continuation page's unreadable footer must have
+    Confirm-with-a-SID disabled until a reviewer ticks the composition-
+    override checkbox, and enabled (and actually recordable) immediately
+    after."""
+    pdf_path = build_unreadable_continuation_footer_fixture(tmp_path / "unreadable_footer")
+    main = build_main_fixture(tmp_path / "main")
+    out_dir = tmp_path / "out"
+    decisions_dir = tmp_path / "decisions"
+    at = _launch(pdf_path, main.roster_path, out_dir, decisions_dir)
+
+    tag = "unreadable_continuation_footer_p000"
+    at.selectbox[0].set_value(tag).run()
+    assert any("unreadable footer, cannot verify sequence" in w.value for w in at.warning)
+    assert any("Fix page composition" in w.value for w in at.warning), "the warning must name the specific clearing action"
+
+    jordan_option = next(o for o in at.radio[0].options if "Jordan Ames" in o)
+    at.radio[0].set_value(jordan_option).run()
+    confirm_btn = next(b for b in at.button if b.key == f"confirm_{tag}")
+    assert confirm_btn.disabled, "Confirm must stay disabled until composition is confirmed"
+
+    override_cb = next(cb for cb in at.checkbox if cb.key == f"composition_override_{tag}")
+    override_cb.set_value(True).run()
+    assert not at.exception
+
+    confirm_btn = next(b for b in at.button if b.key == f"confirm_{tag}")
+    assert not confirm_btn.disabled, "confirming composition must make the packet assignable"
+    confirm_btn.click().run()
+    assert not at.exception
+
+    roster = load_roster(main.roster_path, infer_period_from=main.pdf_path)
+    sid = next(e.sid for e in roster if e.full_name == "Jordan Ames")
+    assert at.session_state.decisions[tag] == sid

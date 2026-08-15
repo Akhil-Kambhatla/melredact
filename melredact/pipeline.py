@@ -325,6 +325,56 @@ def filter_packets_by_round(
     return SegmentResult(packets=kept, page_count=segmented.page_count)
 
 
+def duplicate_decisions_within_round(
+    decisions: dict[str, str | None], round_labels: dict[str, str]
+) -> dict[tuple[str, str], list[str]]:
+    """(round_label, sid) -> packet_tags, for every sid a human has decided
+    for MORE than one packet within the same round group.
+
+    match.assign_all's own round-scoped claim-and-remove exists precisely
+    because a student should have at most one packet per round (see
+    blocks.py's module docstring: a file routinely has more packets than
+    consented students within a round, and claim-and-remove is what stops
+    an eager auto-match handing one student's SID to a decoy packet) --
+    but that guard only governs *automatic* assignment. Nothing currently
+    stops a human from independently confirming the same SID for two
+    different packets in the same round via review_app.py, and the
+    consequence -- found auditing the real 010406 output tree, 2026-08-15,
+    seven real instances across the February and March rounds -- is
+    genuinely confusing even though nothing is silently overwritten:
+    `_claim_output_path`'s numbered-suffix backstop still writes both
+    packets safely (`<SID>.pdf`, `<SID>_2.pdf`), but a reviewer has no way
+    to tell from the filename alone which packet is which, or whether the
+    duplication is a real reviewer mistake (two different students
+    confused for one) or a genuine one-off (the same student handed two
+    worksheets in one sitting). Resolving that needs a human looking at
+    the actual pages -- this function's only job is making the situation
+    visible before a run ships either file, never guessing an answer or
+    holding/blocking anything on its own, the same "flag, never guess"
+    posture `duplicate_round_labels` already takes for a structurally
+    similar problem one level up (round grouping itself, rather than a
+    decision within one)."""
+    by_round_sid: dict[tuple[str, str], list[str]] = {}
+    for tag, sid in decisions.items():
+        if sid is None:
+            continue
+        label = round_labels.get(tag, UNDATED_ROUND)
+        by_round_sid.setdefault((label, sid), []).append(tag)
+    return {key: sorted(tags) for key, tags in by_round_sid.items() if len(tags) > 1}
+
+
+def format_duplicate_decisions_report(duplicates: dict[tuple[str, str], list[str]]) -> str:
+    if not duplicates:
+        return "Duplicate-decision check: no SID decided for more than one packet within the same round."
+    lines = [
+        f"Duplicate-decision check: {len(duplicates)} SID(s) decided for more than one packet within the "
+        "same round -- review before shipping (see duplicate_decisions_within_round's own docstring):"
+    ]
+    for (label, sid), tags in sorted(duplicates.items()):
+        lines.append(f"  round {label}, sid {sid}: {tags}")
+    return "\n".join(lines)
+
+
 def ledger_path(out_dir: str | Path, pdf_path: str | Path) -> Path:
     """Where run_dispositions persists, for this (out_dir, source pdf) pair,
     which SID and exact path it last wrote output to under each packet_tag
@@ -514,6 +564,7 @@ def release_from_manual_queue(
     flagged_regions_to_verify: dict[int, list[Bbox]] | None = None,
     decisions_dir: str | Path = DECISIONS_DIR,
     orientation_overrides: dict[int, int] | None = None,
+    page_sequence: list[int] | None = None,
 ) -> ManualReleaseResult:
     """The human side of the manual-redaction queue: re-redacts `packet`
     using a human-supplied, corrected `band_override` instead of whatever
@@ -577,7 +628,7 @@ def release_from_manual_queue(
     topic = topic_from_filename(pdf_path)
     if round_label is None:
         round_label = round_labels_by_tag(
-            collect_packet_rounds(pdf_path, orientation_overrides=orientation_overrides)
+            collect_packet_rounds(pdf_path, orientation_overrides=orientation_overrides, page_sequence=page_sequence)
         ).get(tag, UNDATED_ROUND)
     ledger = _load_ledger(out_dir, pdf_path)
     out_path, collision_note = _claim_output_path(ledger, tag, out_dir, entry, packet.worksheet_type, topic, round_label)
@@ -804,6 +855,51 @@ def save_orientation_overrides(
     path = orientation_overrides_path(pdf_path, decisions_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({str(k): int(v) % 360 for k, v in overrides.items()}, indent=2, sort_keys=True))
+
+
+def page_order_path(pdf_path: str | Path, decisions_dir: Path = DECISIONS_DIR) -> Path:
+    """Where a human's corrected physical page processing order is recorded
+    -- see review_app.py's page composition editor and segment.segment_
+    pdf's own `page_sequence` parameter. A separate file from decisions_
+    path, same reasoning as overrides_path/manual_geometry_path/
+    orientation_overrides_path: decisions' sid|None|absent three-state
+    contract shouldn't also carry this. Stores the full physical-index
+    processing order as a JSON list, not a sparse "swap map" -- a full
+    ordering composes reordering, removal (a page simply absent from the
+    list is processed by nothing, see segment_pdf's own docstring), and
+    moving a page between packets (a page's position in the list, not just
+    its own value, is what decides which packet segmentation groups it
+    into) as one representation, rather than three separate mechanisms."""
+    return Path(decisions_dir) / f"{Path(pdf_path).stem}.page_order.json"
+
+
+def load_page_order(pdf_path: str | Path, decisions_dir: Path = DECISIONS_DIR) -> list[int] | None:
+    """None (the overwhelmingly common case -- no page in this pdf has ever
+    needed manual reordering) means "use natural physical order", the same
+    convention segment_pdf's own `page_sequence=None` default already
+    uses."""
+    path = page_order_path(pdf_path, decisions_dir)
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text())
+    sequence = data.get("sequence")
+    return [int(i) for i in sequence] if sequence is not None else None
+
+
+def save_page_order(
+    pdf_path: str | Path, sequence: list[int] | None, decisions_dir: Path = DECISIONS_DIR
+) -> None:
+    """`sequence=None` clears the override (deletes the sidecar if present)
+    -- the "reset to natural physical order" action review_app.py's page
+    composition editor exposes, mirroring how `_set_page_rotation(...,
+    None)` clears a single page's orientation override."""
+    path = page_order_path(pdf_path, decisions_dir)
+    if sequence is None:
+        if path.exists():
+            path.unlink()
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"sequence": [int(i) for i in sequence]}, indent=2))
 
 
 def propose_all(
@@ -1088,6 +1184,67 @@ class DispositionResult:
     geometry_source: str = "automatic"
 
 
+# Substrings of segment.py's own `packet.issues` text that a human
+# confirming "I've looked at this packet's pages and the page count/order
+# is correct" (see `composition_overrides` below and review_app.py's own
+# checkbox) is actually in a position to judge -- an unreadable footer or a
+# page-count mismatch is a confidence problem about *counting/reading
+# pages*, exactly what a human looking at the real pages can resolve by
+# eye. Deliberately an allowlist, not a denylist: a future segment.py issue
+# type this list doesn't already know about defaults to NOT confirmable,
+# so composition_overrides can never silently start waiving something it
+# was never actually built to judge.
+#
+# Two real issue shapes are deliberately excluded, on purpose, not by
+# omission: an orientation issue ("orientation could not be confidently
+# determined" / "orientation detected as rotated") has its own real fix
+# (rotate the page -- see orientation.py's detect-and-ask design) and
+# confirming composition doesn't answer "which way is this page actually
+# rotated"; a worksheet-type-unreadable issue means the packet's own
+# output *path* can't be computed at all (see output_path's worksheet_type
+# segment) -- confirming the page count doesn't tell this function what
+# kind of worksheet it is, and guessing that would be exactly the kind of
+# guess this codebase's abstain-by-default posture exists to prevent.
+_COMPOSITION_CONFIRMABLE_ISSUE_MARKERS = (
+    "continuation page with no preceding header",
+    "unreadable footer, cannot verify page count",
+    "unreadable footer, cannot verify sequence",
+    "footer claims page",
+    "footer declares total",
+    "footer declared",
+    "header page footer unreadable, cannot verify page count",
+    "header page footer claims page",
+)
+
+
+def is_composition_confirmable_issue(issue: str) -> bool:
+    return any(marker in issue for marker in _COMPOSITION_CONFIRMABLE_ISSUE_MARKERS)
+
+
+def composition_overrides_path(pdf_path: str | Path, decisions_dir: Path = DECISIONS_DIR) -> Path:
+    """Where a human's approval to release a packet from its unresolved-
+    segmentation-issues hold is recorded -- see run_dispositions'
+    `composition_overrides` parameter. A separate file from decisions_path,
+    same reasoning as overrides_path/orientation_overrides_path: decisions'
+    sid|None|absent three-state contract shouldn't also carry this."""
+    return Path(decisions_dir) / f"{Path(pdf_path).stem}.composition_overrides.json"
+
+
+def load_composition_overrides(pdf_path: str | Path, decisions_dir: Path = DECISIONS_DIR) -> set[str]:
+    path = composition_overrides_path(pdf_path, decisions_dir)
+    if not path.exists():
+        return set()
+    return set(json.loads(path.read_text()))
+
+
+def save_composition_overrides(
+    pdf_path: str | Path, overrides: set[str], decisions_dir: Path = DECISIONS_DIR
+) -> None:
+    path = composition_overrides_path(pdf_path, decisions_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(sorted(overrides), indent=2))
+
+
 def run_dispositions(
     pdf_path: str | Path,
     segmented: SegmentResult,
@@ -1098,6 +1255,7 @@ def run_dispositions(
     dpi: int = RENDER_DPI_FINAL,
     flatten: bool = False,
     detection_overrides: set[str] = frozenset(),
+    composition_overrides: set[str] = frozenset(),
     round_labels: dict[str, str] | None = None,
     allow_delete: bool = True,
     manual_geometry: dict[str, dict] | None = None,
@@ -1120,6 +1278,24 @@ def run_dispositions(
     worksheet_type is one such issue (see segment.segment_pdf), so a
     packet ever reaches output_path below only once its worksheet_type is
     known -- never guessed.
+
+    `composition_overrides` (see composition_overrides_path/load_
+    composition_overrides/save_composition_overrides) is a set of
+    packet_tags a human has explicitly confirmed the page composition
+    (page count/order) for despite an unresolved footer/sequence issue --
+    real motivating case: a packet whose continuation page has an
+    unreadable footer but whose redaction is correct and a reviewer can
+    read the page directly (see review_app.py's own issues warning and
+    CLAUDE.md). This only ever releases issues `_is_composition_
+    confirmable_issue` recognizes (footer/page-count/sequence confidence
+    problems) -- an orientation issue or an unreadable worksheet-type
+    label still holds the packet regardless of this override, since
+    neither is something "the page count is right" actually answers (see
+    `_COMPOSITION_CONFIRMABLE_ISSUE_MARKERS`'s own docstring). This is a
+    structural-confidence override, the same category as `detection_
+    overrides` -- it has no effect on, and is never consulted by, the
+    consensus-ink or verify_no_leaked_names holds, which stay non-
+    overridable by any confirmation.
 
     A packet absent from `decisions` (pending) is never looked up in the
     ledger and never touches any path but its own -- see the module
@@ -1292,17 +1468,19 @@ def run_dispositions(
                 )
             )
             continue
+        composition_note: str | None = None
         if packet.issues:
-            results.append(
-                DispositionResult(
-                    packet_tag=tag,
-                    sid=sid,
-                    pending=False,
-                    held_back=True,
-                    reason=f"refusing to process a packet with unresolved issues: {packet.issues}",
+            unconfirmable = [i for i in packet.issues if not is_composition_confirmable_issue(i)]
+            if tag in composition_overrides and not unconfirmable:
+                composition_note = f"shipped despite unresolved segmentation issues (human-confirmed page composition): {packet.issues}"
+            else:
+                reason = f"refusing to process a packet with unresolved issues: {packet.issues}"
+                if tag in composition_overrides and unconfirmable:
+                    reason += f" (composition override does not cover: {unconfirmable})"
+                results.append(
+                    DispositionResult(packet_tag=tag, sid=sid, pending=False, held_back=True, reason=reason)
                 )
-            )
-            continue
+                continue
 
         entry = roster.by_sid[sid]
         round_label = round_labels.get(tag, UNDATED_ROUND)
@@ -1399,20 +1577,51 @@ def run_dispositions(
                 sid=sid,
                 pending=False,
                 out_path=out_path,
-                reason=detection_note,
+                reason="; ".join(n for n in (detection_note, composition_note) if n) or None,
                 collision_note=collision_note,
                 advisory_uncovered_words=advisory_uncovered_words,
                 geometry_source="manual" if geometry_kwargs else "automatic",
             )
         )
 
-        # A correction (this tag's approved SID changed from a previously
-        # written one) supersedes the old file -- delete it as a direct
-        # consequence of *this* explicit new decision, once the new file is
-        # confirmed written and clean, not as a background sweep. Deletes
-        # the ledger's own recorded path, not a recomputed one, same as the
-        # non-consent case above.
-        if prior_entry is not None and prior_sid != sid:
+        # This tag's own previously-written file supersedes to the new one
+        # on a SID change (a correction, as before) -- OR when the SID is
+        # unchanged but this tag's path still shifted *within the same
+        # output directory* (found 2026-08-15, real 010406 data): a
+        # packet's numbered-suffix status with `_claim_output_path` can
+        # change between runs purely because a *different* packet's own
+        # collision with this tag's natural path cleared (e.g. that other
+        # packet's decision was corrected away from the SID it used to
+        # share) -- this tag then moves from a numbered-suffix path to the
+        # natural one (or vice versa) with an unchanged SID, and the old
+        # `prior_sid != sid` check never fired, leaving the stale suffixed
+        # file sitting in out/ forever, attached to no current ledger
+        # entry.
+        #
+        # Deliberately scoped to "same output directory" (teacher/period/
+        # worksheet_type/topic/round all unchanged), not just "any path
+        # difference": two DIFFERENT packets can legitimately share a
+        # ledger (keyed only on the *source pdf's own filename stem* --
+        # see ledger_path) and packet_tag (based on page_indices[0] alone)
+        # by pure coincidence when two distinct scan files happen to share
+        # a stem -- the real MPR/PRT collision-prevention test in this
+        # suite builds exactly that shape on purpose. Comparing raw paths
+        # (an earlier version of this fix) wrongly deleted the *other*
+        # worksheet type's real, current file in that case, since its
+        # entirely different worksheet_type directory made the path
+        # "different" for a reason that has nothing to do with a
+        # suffix shift. Restricting to same-parent-directory means this
+        # only ever fires for what it was built to catch: the identical
+        # packet, at the identical natural output_path shape, just with or
+        # without a numbered suffix.
+        prior_path = Path(prior_entry["path"]) if prior_entry is not None else None
+        same_packet_suffix_shifted = (
+            prior_path is not None
+            and prior_sid == sid
+            and prior_path.parent == out_path.parent
+            and prior_path != out_path
+        )
+        if prior_entry is not None and (prior_sid != sid or same_packet_suffix_shifted):
             if allow_delete:
                 _delete_stale_output(Path(prior_entry["path"]), prior_sid)
             else:
@@ -1641,6 +1850,7 @@ def run_preflight(
     *,
     period: str | None = None,
     orientation_overrides: dict[int, int] | None = None,
+    page_sequence: list[int] | None = None,
     dpi: int = RENDER_DPI_FINAL,
 ) -> PreflightReport:
     """The preflight entry point -- see the module note above this section
@@ -1648,11 +1858,15 @@ def run_preflight(
     nothing, deletes nothing, never touches decisions/ledger/manual-queue.
     `roster` is the already-scoped roster (see roster.load_roster) the
     real run would use -- `period` is carried onto the report purely for
-    display, not re-derived here."""
+    display, not re-derived here. `page_sequence` (see segment.segment_
+    pdf's own parameter and pipeline.load_page_order) applies a human-
+    confirmed page-order correction the same way orientation_overrides
+    applies a human-confirmed rotation -- reported against, never inferred
+    here."""
     start = time.monotonic()
     pdf_path = Path(pdf_path)
 
-    segmented = segment_pdf(pdf_path, orientation_overrides=orientation_overrides)
+    segmented = segment_pdf(pdf_path, orientation_overrides=orientation_overrides, page_sequence=page_sequence)
     dates = collect_packet_dates(pdf_path, segmented=segmented, orientation_overrides=orientation_overrides)
     round_groups = group_into_rounds(segmented.packets, dates)
     round_labels = round_labels_by_tag(round_groups)

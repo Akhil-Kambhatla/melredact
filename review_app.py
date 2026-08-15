@@ -77,26 +77,39 @@ from melredact.blocks import (
     round_labels_by_tag,
     save_resolved_block_record,
 )
-from melredact.config import CACHE_DIR, HEADER_SEARCH_MAX_TOP, MIN_MARGIN, MIN_SCORE, RENDER_DPI_PREVIEW
+from melredact.config import (
+    CACHE_DIR,
+    HEADER_SEARCH_MAX_TOP,
+    MANUAL_EDITOR_TARGET_WIDTH_PX,
+    MIN_MARGIN,
+    MIN_SCORE,
+    RENDER_DPI_PREVIEW,
+)
 from melredact.consensus import ConsensusAnalysis, analyze_consensus_anomalies, format_consensus_report
 from melredact.match import assign_all
 from melredact.orientation import orientation_for
 from melredact.pdfio import open_pdf
 from melredact.pipeline import (
+    duplicate_decisions_within_round,
     filter_packets_by_round,
+    is_composition_confirmable_issue,
     list_manual_queue,
+    load_composition_overrides,
     load_decisions,
     load_detection_overrides,
     load_manual_geometry,
     load_orientation_overrides,
+    load_page_order,
     manual_queue_draft_path,
     packet_tag,
     propose_all,
     release_from_manual_queue,
     run_dispositions,
+    save_composition_overrides,
     save_decisions,
     save_detection_overrides,
     save_orientation_overrides,
+    save_page_order,
 )
 from melredact.redact import (
     Bbox,
@@ -107,7 +120,15 @@ from melredact.redact import (
     render_region_preview,
 )
 from melredact.roster import Roster, RosterError, filter_roster_by_name, infer_period_from_filename, load_roster
-from melredact.segment import Packet, SegmentResult, extract_header_fields, header_row_height, page_words, segment_pdf
+from melredact.segment import (
+    Packet,
+    SegmentResult,
+    extract_header_fields,
+    find_reversed_continuation_header_pairs,
+    header_row_height,
+    page_words,
+    segment_pdf,
+)
 
 DPI = RENDER_DPI_PREVIEW
 
@@ -156,8 +177,8 @@ def _parse_args() -> argparse.Namespace:
 
 
 @st.cache_data(show_spinner="Segmenting PDF into packets...")
-def _segment(pdf_path: str, orientation_overrides: dict[int, int]) -> SegmentResult:
-    return segment_pdf(pdf_path, orientation_overrides=orientation_overrides)
+def _segment(pdf_path: str, orientation_overrides: dict[int, int], page_order: list[int] | None = None) -> SegmentResult:
+    return segment_pdf(pdf_path, orientation_overrides=orientation_overrides, page_sequence=page_order)
 
 
 @st.cache_data(show_spinner=False)
@@ -179,17 +200,19 @@ def _block_metadata(roster_path: str):
 
 
 @st.cache_data(show_spinner="Reading packet dates for block resolution...")
-def _block_resolution(pdf_path: str, class_period: int, roster_path: str, orientation_overrides: dict[int, int]) -> BlockResolution:
+def _block_resolution(
+    pdf_path: str, class_period: int, roster_path: str, orientation_overrides: dict[int, int], page_order: list[int] | None = None
+) -> BlockResolution:
     # roster_path is only here to key the cache correctly if the sidecar
     # ever changes between reruns -- resolve_block itself only reads
     # `metadata`, recomputed fresh by the caller (cheap, see _block_metadata).
     metadata = load_block_metadata(roster_path)
-    dates = collect_packet_dates(pdf_path, orientation_overrides=orientation_overrides)
+    dates = collect_packet_dates(pdf_path, orientation_overrides=orientation_overrides, page_sequence=page_order)
     return resolve_block(dates, class_period, metadata)
 
 
 @st.cache_data(show_spinner="Reading packet dates for round grouping...")
-def _round_data(pdf_path: str, orientation_overrides: dict[int, int]) -> tuple[list, list[RoundGroup]]:
+def _round_data(pdf_path: str, orientation_overrides: dict[int, int], page_order: list[int] | None = None) -> tuple[list, list[RoundGroup]]:
     """(dates, groups) -- computed together and cached once per pdf_path
     (same OCR-cached date-extraction pass as block resolution's own
     _block_resolution, just grouped into contiguous rounds instead of
@@ -197,21 +220,23 @@ def _round_data(pdf_path: str, orientation_overrides: dict[int, int]) -> tuple[l
     script (a button click, Prev/Next) doesn't repeat it. See blocks.
     group_into_rounds for the grouping rule; round labelling never
     influences matching, so this is entirely independent of _proposals."""
-    segmented = _segment(pdf_path, orientation_overrides)
+    segmented = _segment(pdf_path, orientation_overrides, page_order)
     dates = collect_packet_dates(pdf_path, segmented=segmented, orientation_overrides=orientation_overrides)
     groups = group_into_rounds(segmented.packets, dates)
     return dates, groups
 
 
 @st.cache_data(show_spinner="Checking for template-agnostic handwriting anomalies (consensus-ink)...")
-def _consensus(pdf_path: str, orientation_overrides: dict[int, int]) -> ConsensusAnalysis:
+def _consensus(pdf_path: str, orientation_overrides: dict[int, int], page_order: list[int] | None = None) -> ConsensusAnalysis:
     """Cached the same way _round_data is: the expensive part (whole-group
     rasterize + ECC alignment, see consensus.py) is itself disk-cached per
     (file, page, reference page, dpi, block size), so a warm rerun is
     cheap -- but there's no reason to repeat even the in-memory clustering
     on every Streamlit rerun (a button click, Prev/Next) within one
     session."""
-    return analyze_consensus_anomalies(pdf_path, _segment(pdf_path, orientation_overrides), orientation_overrides=orientation_overrides)
+    return analyze_consensus_anomalies(
+        pdf_path, _segment(pdf_path, orientation_overrides, page_order), orientation_overrides=orientation_overrides
+    )
 
 
 @st.cache_data(show_spinner="Loading roster...")
@@ -220,9 +245,11 @@ def _roster(roster_path: str, pdf_path: str, period: str | None) -> Roster:
 
 
 @st.cache_data(show_spinner="Scoring name candidates against the roster...")
-def _proposals(pdf_path: str, roster_path: str, period: str | None, orientation_overrides: dict[int, int]):
+def _proposals(
+    pdf_path: str, roster_path: str, period: str | None, orientation_overrides: dict[int, int], page_order: list[int] | None = None
+):
     return propose_all(
-        pdf_path, _segment(pdf_path, orientation_overrides), _roster(roster_path, pdf_path, period),
+        pdf_path, _segment(pdf_path, orientation_overrides, page_order), _roster(roster_path, pdf_path, period),
         orientation_overrides=orientation_overrides,
     )
 
@@ -272,6 +299,36 @@ def _page_image(pdf_path: str, page_index: int, dpi: int, orientation_overrides:
         image = pdf.pages[page_index].to_image(resolution=dpi).original.convert("RGB")
     image.save(cache_file)
     return image
+
+
+@st.cache_data(show_spinner=False)
+def _page_size_pt(pdf_path: str, page_index: int, orientation_overrides: dict[int, int]) -> tuple[float, float]:
+    """This page's own (width, height) in PDF points, post-orientation --
+    just enough to pick an editor-specific DPI (see _editor_dpi_for_page)
+    without rendering the page itself. Cheap (pdfplumber page-size read,
+    no OCR, no rasterization) and cached the same way every other small
+    per-page lookup in this file is."""
+    with open_pdf(pdf_path, orientation_overrides=orientation_overrides) as pdf:
+        page = pdf.pages[page_index]
+        return (page.width, page.height)
+
+
+def _editor_dpi_for_page(page_width_pt: float) -> int:
+    """The DPI that renders this page at exactly MANUAL_EDITOR_TARGET_
+    WIDTH_PX wide -- see config.py's own docstring on that constant for
+    why the manual editor needs a fixed, page-derived DPI rather than
+    reusing RENDER_DPI_PREVIEW: a canvas and a plain st.image of the same
+    page must land on the identical literal pixel width regardless of
+    container size, and computing that width from the page's own point-
+    width (rather than picking one DPI for every page) keeps it true even
+    for a page whose physical size differs (e.g. a still-unconfirmed 90/
+    270-rotated page has swapped width/height). Clamped to a sane DPI
+    range so a pathologically narrow or wide page can't produce an
+    unreadably-low or absurdly-high resolution render."""
+    if page_width_pt <= 0:
+        return RENDER_DPI_PREVIEW
+    dpi = round(MANUAL_EDITOR_TARGET_WIDTH_PX * 72.0 / page_width_pt)
+    return max(72, min(300, dpi))
 
 
 def _rotate_image_for_display(image: Image.Image, angle: int) -> Image.Image:
@@ -333,13 +390,112 @@ def _decision_label(sid: str | None, roster: Roster) -> str:
     return f"{sid} — {entry.full_name}"
 
 
+# Sentinel for "no decision has actually been chosen yet" -- distinct from
+# `None`, which is a real, confirmable choice ("Not on roster / no
+# consent"). Never written to `decisions`; only ever used as a Decision
+# radio option's paired value so the radio can genuinely have nothing
+# selected instead of always landing on some option by construction (see
+# `_decision_options`' own docstring for the real bug this exists to
+# prevent: a packet OCR read no name for used to silently default the
+# radio to "Not on roster", one accidental Confirm click away from
+# rejecting a real student nobody actually looked at).
+_NO_SELECTION = object()
+
+
+def _search_added_key(tag: str) -> str:
+    return f"search_added_sid_{tag}"
+
+
+def _decision_options(
+    tag: str, roster: Roster, candidate_options: list[tuple[str, str | None]], has_ocrd_name: bool
+) -> list[tuple[str, object]]:
+    """Every selectable Decision option for this packet, in the order the
+    radio shows them: the matcher's own top candidates first, then any SID
+    that reached this decision by a different route, then "Not on roster".
+
+    Real bug this fixes (packet 70, reported 2026-08-15): the Decision
+    radio's own options used to be built from *only* `candidate_options`
+    (the matcher's top 5) plus "Not on roster" -- a student found via
+    "Search the full roster" had no matching option in that list at all.
+    Clicking "Use this roster entry" still correctly wrote the chosen SID
+    to `decisions` immediately, but the radio widget itself, unaware of
+    that write, kept showing whatever its own default was (here: "Not on
+    roster", since no matcher candidate cleared MIN_SCORE) -- and the very
+    next "Confirm decision" click (the large, obvious call-to-action
+    sitting right below) used the RADIO's stale value, silently
+    overwriting the correct search-selected decision with a non-consent
+    rejection. Folding every route a decision can arrive by into one
+    shared option list -- used for both the live preview and the radio
+    itself, so they can never independently disagree -- is what makes that
+    impossible: whichever SID a reviewer actually picked, by whatever
+    route, is always a real, selectable, clearly-labelled option.
+
+    `search_added` (see `_search_added_key`) and an already-`recorded`
+    decision are each only added if not already present among the
+    matcher's own candidates, and are visibly marked with where they came
+    from ("found via roster search" / "previously recorded") -- a
+    reviewer should never mistake either for a matcher proposal.
+
+    When nothing has ever been decided for this tag AND OCR read no name
+    at all (`has_ocrd_name=False`) and no search selection has been made
+    either, a genuine "nothing chosen yet" placeholder (paired with the
+    `_NO_SELECTION` sentinel) is prepended -- see `_NO_SELECTION`'s own
+    docstring for why a pre-selected "Not on roster" on zero evidence is
+    itself a hazard, not just an inconvenience."""
+    options: list[tuple[str, object]] = list(candidate_options)
+    known_sids = {sid for _, sid in options}
+
+    search_added = st.session_state.get(_search_added_key(tag))
+    if search_added is not None and search_added not in known_sids:
+        options.append((f"🔍 {_decision_label(search_added, roster)} (found via roster search)", search_added))
+        known_sids.add(search_added)
+
+    recorded = st.session_state.decisions.get(tag)
+    if recorded is not None and recorded not in known_sids:
+        options.append((f"↺ {_decision_label(recorded, roster)} (previously recorded)", recorded))
+        known_sids.add(recorded)
+
+    options.append(("Not on roster (no consent)", None))
+
+    if not has_ocrd_name and tag not in st.session_state.decisions and search_added is None:
+        options.insert(0, ("— No name was read; choose a decision below —", _NO_SELECTION))
+
+    return options
+
+
+def _default_decision_sid(tag: str, auto_assignments: dict[str, str | None], has_ocrd_name: bool):
+    """Which value the Decision radio should default to on the very first
+    render this session (Streamlit ignores this the moment the widget has
+    its own stored session_state value, i.e. after any interaction) --
+    priority: an explicit already-recorded decision, then a roster-search
+    selection, then the matcher's own auto-assignment, then (only when
+    there is genuinely nothing to go on) the `_NO_SELECTION` placeholder
+    rather than silently landing on "Not on roster"."""
+    if not has_ocrd_name and tag not in st.session_state.decisions and st.session_state.get(_search_added_key(tag)) is None:
+        return _NO_SELECTION
+    if tag in st.session_state.decisions:
+        return st.session_state.decisions[tag]
+    search_added = st.session_state.get(_search_added_key(tag))
+    if search_added is not None:
+        return search_added
+    return auto_assignments.get(tag)
+
+
 def _init_state(pdf_path: str, decisions_dir: str) -> None:
     if "decisions" not in st.session_state:
         st.session_state.decisions = load_decisions(pdf_path, decisions_dir=Path(decisions_dir))
     if "detection_overrides" not in st.session_state:
         st.session_state.detection_overrides = load_detection_overrides(pdf_path, decisions_dir=Path(decisions_dir))
+    if "composition_overrides" not in st.session_state:
+        st.session_state.composition_overrides = load_composition_overrides(pdf_path, decisions_dir=Path(decisions_dir))
     if "orientation_overrides" not in st.session_state:
         st.session_state.orientation_overrides = load_orientation_overrides(pdf_path, decisions_dir=Path(decisions_dir))
+    if "page_order" not in st.session_state:
+        # A human-confirmed correction to physical page processing order
+        # (see the page composition editor, _render_page_composition_
+        # editor) -- None (the overwhelmingly common case) means "natural
+        # physical order", segment_pdf's own existing default.
+        st.session_state.page_order = load_page_order(pdf_path, decisions_dir=Path(decisions_dir))
     if "pending_rotation" not in st.session_state:
         # In-memory-only preview state (see _render_page_stack), never
         # persisted and never part of orientation_overrides -- a reviewer
@@ -373,6 +529,76 @@ def _set_page_rotation(pdf_path: str, decisions_dir: str, page_index: int, angle
     _set_pending_rotation(page_index, None)
 
 
+def _current_page_sequence(page_count: int) -> list[int]:
+    """The physical page processing order currently in effect: a human's
+    saved override (`st.session_state.page_order`) if one exists, else
+    natural physical order -- the same convention segment_pdf's own
+    `page_sequence=None` default already uses."""
+    order = st.session_state.page_order
+    return list(order) if order else list(range(page_count))
+
+
+def _set_page_order(pdf_path: str, decisions_dir: str, sequence: list[int], page_count: int) -> None:
+    """Record a corrected page processing order and persist it immediately
+    -- the composition-editing sibling of `_set_page_rotation`. Every
+    downstream cache (`_segment`, `_proposals`, `_consensus`, `_round_
+    data`) is keyed on `page_order`, so mutating it and rerunning naturally
+    re-segments with the new order, the same way rotating a page
+    invalidates those same caches. Normalizes back to `None` (clearing the
+    sidecar) when `sequence` turns out to equal natural physical order --
+    e.g. after undoing every edit -- so an unused sidecar never lingers."""
+    normalized = None if sequence == list(range(page_count)) else sequence
+    st.session_state.page_order = normalized
+    save_page_order(pdf_path, normalized, decisions_dir=Path(decisions_dir))
+
+
+def _sequence_move_within(sequence: list[int], page_idx: int, delta: int) -> list[int]:
+    """Swap `page_idx` with its sequence-adjacent neighbor `delta` positions
+    away -- the primitive behind the page composition editor's Up/Down
+    controls. A no-op (returns `sequence` unchanged) at either end, so
+    callers don't need their own bounds-checking beyond disabling the
+    button."""
+    pos = sequence.index(page_idx)
+    new_pos = pos + delta
+    if not (0 <= new_pos < len(sequence)):
+        return sequence
+    sequence = list(sequence)
+    sequence[pos], sequence[new_pos] = sequence[new_pos], sequence[pos]
+    return sequence
+
+
+def _sequence_remove(sequence: list[int], page_idx: int) -> list[int]:
+    """Drop `page_idx` out of the processing order entirely -- it becomes
+    unassigned to any packet (see segment_pdf's own `page_sequence`
+    docstring), not deleted from the file. The composition editor's own
+    "removed pages" list (see `_render_page_composition_editor`) is what
+    lets a reviewer put it back later."""
+    return [p for p in sequence if p != page_idx]
+
+
+def _sequence_insert_before(sequence: list[int], page_idx: int, before_page_idx: int | None) -> list[int]:
+    """Move (or re-insert, if `page_idx` was previously removed) `page_idx`
+    to sit immediately before `before_page_idx` in the processing order --
+    `None` means "at the very start". The shared primitive behind "move to
+    previous packet" (insert before that packet's own first page) and
+    re-inserting a removed page."""
+    sequence = [p for p in sequence if p != page_idx]
+    pos = sequence.index(before_page_idx) if before_page_idx is not None else 0
+    sequence.insert(pos, page_idx)
+    return sequence
+
+
+def _sequence_insert_after(sequence: list[int], page_idx: int, after_page_idx: int | None) -> list[int]:
+    """Mirror of `_sequence_insert_before`: moves/inserts `page_idx` to sit
+    immediately after `after_page_idx` -- `None` means "at the very end".
+    Backs "move to next packet" (insert after that packet's own last
+    page)."""
+    sequence = [p for p in sequence if p != page_idx]
+    pos = sequence.index(after_page_idx) + 1 if after_page_idx is not None else len(sequence)
+    sequence.insert(pos, page_idx)
+    return sequence
+
+
 def _confirm(pdf_path: str, decisions_dir: str, tag: str, sid: str | None) -> None:
     st.session_state.decisions[tag] = sid
     save_decisions(pdf_path, st.session_state.decisions, decisions_dir=Path(decisions_dir))
@@ -393,6 +619,21 @@ def _set_detection_override(pdf_path: str, decisions_dir: str, tag: str, approve
     else:
         st.session_state.detection_overrides.discard(tag)
     save_detection_overrides(pdf_path, st.session_state.detection_overrides, decisions_dir=Path(decisions_dir))
+
+
+def _set_composition_override(pdf_path: str, decisions_dir: str, tag: str, approved: bool) -> None:
+    """Records (or revokes) a human's explicit confirmation that `tag`'s
+    page composition (page count/order) is correct despite an unresolved
+    footer/sequence issue -- see pipeline.py's `composition_overrides` and
+    its own docstring for exactly which issue types this can and can't
+    release. Same "separate action from _confirm" reasoning as `_set_
+    detection_override`: confirming a SID match answers "who is this", not
+    "I've looked at the actual pages and the count/order is right"."""
+    if approved:
+        st.session_state.composition_overrides.add(tag)
+    else:
+        st.session_state.composition_overrides.discard(tag)
+    save_composition_overrides(pdf_path, st.session_state.composition_overrides, decisions_dir=Path(decisions_dir))
 
 
 def _render_sidebar(
@@ -417,6 +658,18 @@ def _render_sidebar(
     st.sidebar.metric("Packets", len(segmented.packets))
     st.sidebar.write(f"⏳ Pending: {n_pending}  ✅ Approved: {n_consented}  🚫 Rejected: {n_rejected}")
 
+    if round_labels:
+        # See pipeline.duplicate_decisions_within_round's own docstring for
+        # why this exists: round-scoped claim-and-remove only ever guards
+        # *automatic* assignment, so nothing stops a human from confirming
+        # the same SID for two different packets in the same round -- a
+        # real, repeated finding on the actual 010406 output tree. Purely
+        # informational, never held or blocked; a human has to look at the
+        # actual pages to know which (if either) confirmation is wrong.
+        duplicates = duplicate_decisions_within_round(decisions, round_labels)
+        for (label, sid), dup_tags in sorted(duplicates.items()):
+            st.sidebar.warning(f"⚠️ SID {sid} decided for {len(dup_tags)} packets in round {label}: {dup_tags}")
+
     st.sidebar.divider()
     disable_deletion = st.sidebar.checkbox(
         "Disable deletion (safety)",
@@ -430,6 +683,7 @@ def _render_sidebar(
         with st.spinner("Redacting approved packets..."):
             fresh_decisions = load_decisions(args.pdf_path, decisions_dir=Path(args.decisions_dir))
             fresh_overrides = load_detection_overrides(args.pdf_path, decisions_dir=Path(args.decisions_dir))
+            fresh_composition_overrides = load_composition_overrides(args.pdf_path, decisions_dir=Path(args.decisions_dir))
             fresh_manual_geometry = load_manual_geometry(args.pdf_path, decisions_dir=Path(args.decisions_dir))
             results = run_dispositions(
                 args.pdf_path,
@@ -438,6 +692,7 @@ def _render_sidebar(
                 roster,
                 out_dir=Path(args.out_dir),
                 detection_overrides=fresh_overrides,
+                composition_overrides=fresh_composition_overrides,
                 round_labels=round_labels,
                 allow_delete=not disable_deletion,
                 manual_geometry=fresh_manual_geometry,
@@ -686,15 +941,31 @@ def _render_manual_editor(
     `_render_manual_queue` opens it with the queue entry's own
     `flagged_regions` for a packet an automated check actually held.
 
-    Original page on the left, live redacted result on the right, both at
-    DPI (see review_app.py's own DPI constant). A reviewer drags the
-    corners of the seeded rectangles (see `_seed_manual_regions`, which
-    seeds the header page's own automatically-detected boxes so the common
-    case is nudging what detection already proposed, not drawing from
-    nothing) or draws new ones on any page of the packet -- the page
-    selector below acts as a tab strip, one page at a time, each with its
-    own independent rectangles, so a stray name on page 3 is exactly as
-    reachable as page 1's header.
+    Original page on the left, live redacted result on the right -- both
+    rendered at an identical, fixed pixel width computed per page (see
+    `_editor_dpi_for_page`/config.MANUAL_EDITOR_TARGET_WIDTH_PX), and the
+    preview pane's `st.image` call is given that same width explicitly, so
+    neither pane is ever left to container-relative CSS sizing that could
+    make the two drift apart (found 2026-08-15: the canvas renders at a
+    literal pixel size regardless of its container, while a plain
+    `st.image` with no explicit width silently shrinks to fit a narrower
+    container -- two views of the same page at two different effective
+    sizes is what read as "misaligned, shifts between renders"). A
+    reviewer drags the corners of the seeded rectangles (see `_seed_
+    manual_regions`, which seeds the header page's own automatically-
+    detected boxes so the common case is nudging what detection already
+    proposed, not drawing from nothing) or draws new ones on any page of
+    the packet -- the page selector below acts as a tab strip, one page at
+    a time, each with its own independent rectangles, so a stray name on
+    page 3 is exactly as reachable as page 1's header.
+
+    The redacted preview only regenerates on an explicit "Update preview"
+    click (plus once automatically, the first time a page is opened) --
+    see the comment above `preview_state_key` below for why: st_canvas
+    debounces its own sync back to Streamlit at ~200ms *during* an active
+    drag/resize, and recomputing the redaction geometry inline on every one
+    of those reruns was slow enough to read as a drag that "sometimes
+    doesn't take."
 
     find_uncovered_group_words' own finding is shown as an orange advisory
     outline on the header page (see `_advisory_outline_image`) -- it no
@@ -742,10 +1013,20 @@ def _render_manual_editor(
 
     current_boxes = regions.get(page_offset, [])
     page_idx = packet.page_indices[page_offset]
+
+    # A page-derived DPI, not the module-level DPI constant every other
+    # preview in this file uses -- see config.MANUAL_EDITOR_TARGET_
+    # WIDTH_PX's own docstring. Both panes below render at this exact
+    # pixel width, with an explicit `width=` on the plain-image pane too,
+    # so neither is ever left to container-relative CSS sizing that could
+    # drift between the two or between reruns.
+    page_w_pt, _page_h_pt = _page_size_pt(args.pdf_path, page_idx, st.session_state.orientation_overrides)
+    editor_dpi = _editor_dpi_for_page(page_w_pt)
+
     render_start = time.perf_counter()
-    raw_image = _page_image(args.pdf_path, page_idx, DPI, st.session_state.orientation_overrides)
-    render_elapsed = time.perf_counter() - render_start
-    st.caption(f"Page rendered in {render_elapsed * 1000:.0f} ms" + (" (cached)" if render_elapsed < 0.05 else ""))
+    raw_image = _page_image(args.pdf_path, page_idx, editor_dpi, st.session_state.orientation_overrides)
+    render_elapsed_ms = (time.perf_counter() - render_start) * 1000
+    pane_width = raw_image.width
 
     mode_label = st.radio(
         "Tool",
@@ -776,13 +1057,23 @@ def _render_manual_editor(
             drawing_mode="transform" if interactive else "rect",
             initial_drawing={
                 "version": "4.4.0",
-                "objects": [_bbox_to_canvas_rect(b, DPI, interactive=interactive) for b in current_boxes],
+                "objects": [_bbox_to_canvas_rect(b, editor_dpi, interactive=interactive) for b in current_boxes],
             },
+            # Stable across every rerun this function can cause on its own
+            # (page/tool/delete/preview-button interactions never change
+            # tag or page_offset) -- the component is never remounted by
+            # anything this editor itself does, so in-progress canvas
+            # state (fabric.js's own selection/undo history) survives.
             key=f"mq_canvas_{tag}_{page_offset}",
+        )
+        st.caption(
+            f"Original pane rendered in {render_elapsed_ms:.0f} ms"
+            + (" (cached)" if render_elapsed_ms < 50 else "")
+            + f" · {pane_width}×{raw_image.height}px"
         )
     if canvas_result.json_data is not None:
         objs = [o for o in canvas_result.json_data.get("objects", []) if o.get("type") == "rect"]
-        current_boxes = [_canvas_rect_to_bbox(o, DPI) for o in objs]
+        current_boxes = [_canvas_rect_to_bbox(o, editor_dpi) for o in objs]
         regions[page_offset] = current_boxes
 
     if current_boxes:
@@ -817,20 +1108,64 @@ def _render_manual_editor(
             header_words, header_fields.anchors, header_bbox_override[0], header_bbox_override[1]
         )
 
+    # The redacted preview is regenerated only on an explicit click, not on
+    # every rerun this editor causes (a box drag/resize, a tool switch, the
+    # delete control) -- found 2026-08-15: st_canvas syncs its state back to
+    # Streamlit on a ~200ms debounce *during* an active drag/resize, each
+    # sync triggering a full script rerun; recomputing the redaction preview
+    # (detect_header_band's raster scan, find_uncovered_group_words) inline
+    # on every one of those reruns is expensive enough that it could still
+    # be running when the next debounced sync lands mid-gesture, which reads
+    # to a reviewer as a drag that "sometimes doesn't take." Gating it here
+    # means every mid-drag rerun only has to re-render this already-disk-
+    # cached page image and rebuild `initial_drawing`, not redo the
+    # redaction geometry, drawing, and advisory check too. A first view of a
+    # page still gets an automatic preview (`is_first_view`) so a reviewer
+    # isn't staring at nothing before drawing anything.
+    preview_state_key = f"mq_preview_state_{tag}"
+    if preview_state_key not in st.session_state:
+        st.session_state[preview_state_key] = {}
+    preview_cache = st.session_state[preview_state_key]
+    boxes_signature = tuple(current_boxes)
+    cached = preview_cache.get(page_offset)
+    is_first_view = cached is None
+
     with col_preview:
-        st.caption("Redacted result (live preview)")
-        stamp_lines = _stamp_lines_for(default_sid, roster) if default_sid in roster else None
-        if page_offset == header_offset:
-            if header_bbox_override is None:
-                st.image(raw_image, caption="No regions drawn yet on the header page")
+        st.caption("Redacted result")
+        update_clicked = st.button("🔄 Update preview", key=f"mq_updatepreview_{tag}_{page_offset}")
+        if is_first_view or update_clicked:
+            preview_start = time.perf_counter()
+            stamp_lines = _stamp_lines_for(default_sid, roster) if default_sid in roster else None
+            if page_offset == header_offset:
+                if header_bbox_override is None:
+                    preview_image, preview_caption = raw_image, "No regions drawn yet on the header page"
+                else:
+                    preview_image, _band = render_redaction_preview(
+                        raw_image, dpi=editor_dpi, stamp_lines=stamp_lines, header_bbox_override=header_bbox_override
+                    )
+                    preview_caption = "Preview with your drawn regions"
             else:
-                preview_image, _ = render_redaction_preview(
-                    raw_image, dpi=DPI, stamp_lines=stamp_lines, header_bbox_override=header_bbox_override
-                )
-                st.image(preview_image, caption="Preview with your drawn regions")
-        else:
-            preview_image = render_region_preview(raw_image, dpi=DPI, bboxes=current_boxes)
-            st.image(preview_image, caption="Preview with your drawn regions" if current_boxes else "No regions drawn on this page")
+                preview_image = render_region_preview(raw_image, dpi=editor_dpi, bboxes=current_boxes)
+                preview_caption = "Preview with your drawn regions" if current_boxes else "No regions drawn on this page"
+            preview_elapsed_ms = (time.perf_counter() - preview_start) * 1000
+            preview_cache[page_offset] = {
+                "boxes": boxes_signature,
+                "image": preview_image,
+                "caption": preview_caption,
+                "elapsed_ms": preview_elapsed_ms,
+            }
+            cached = preview_cache[page_offset]
+        st.image(cached["image"], caption=cached["caption"], width=pane_width)
+        st.caption(
+            f"Redacted pane rendered in {cached['elapsed_ms']:.0f} ms"
+            + (" (cached)" if not (is_first_view or update_clicked) else "")
+            + f" · {pane_width}×{raw_image.height}px"
+        )
+        if cached["boxes"] != boxes_signature:
+            st.info(
+                "This preview reflects an earlier set of regions -- click 'Update preview' to refresh it. "
+                "Applying always uses your current regions regardless of what the preview shows."
+            )
 
     if advisory_words:
         st.warning(
@@ -841,8 +1176,9 @@ def _render_manual_editor(
             "applying."
         )
         st.image(
-            _advisory_outline_image(raw_image, advisory_words, DPI),
+            _advisory_outline_image(raw_image, advisory_words, editor_dpi),
             caption="Advisory: possible uncovered ink (orange outline, not blocking)",
+            width=pane_width,
         )
 
     st.write("Resolve the student by name — never by typing a SID directly:")
@@ -903,6 +1239,7 @@ def _render_manual_editor(
             extra_page_regions=extra_page_regions or None,
             flagged_regions_to_verify=flagged_regions,
             orientation_overrides=st.session_state.orientation_overrides,
+            page_sequence=st.session_state.page_order,
         )
         if result.released:
             st.success(f"Released {tag} -> {result.out_path}")
@@ -1054,6 +1391,127 @@ def _render_page_stack(args: argparse.Namespace, packet: Packet, tag: str) -> No
                 st.caption("Orientation: upright (automatic).")
 
 
+def _render_page_composition_editor(
+    args: argparse.Namespace,
+    segmented: SegmentResult,
+    packet: Packet,
+    tag: str,
+    tags: list[str],
+    packet_by_tag: dict[str, Packet],
+) -> None:
+    """A reviewer's tool for the scanner's other page-order defect (see
+    orientation.py's own detect-and-ask design for the rotation one):
+    segment_pdf assumes physical scan order is document order (see its own
+    module docstring), and a scanner that fed pages out of order breaks
+    that assumption in a way no automatic check can safely repair on its
+    own -- reordering, removing, or moving a page between packets is
+    exactly the kind of structural correction that has to be a human
+    decision, confirmed here, never guessed.
+
+    Shows this packet's own pages (physical index + raw footer text, for
+    context) with Up/Down (swap with the sequence-adjacent page within
+    this same packet), Remove (the page becomes unassigned to any packet,
+    not deleted from the file -- see `_sequence_remove`'s own docstring),
+    and, on the packet's first/last page only, a move-to-adjacent-packet
+    shortcut. Every control computes a new full page processing order and
+    calls `_set_page_order`, which persists it and is picked up on rerun
+    by every cache keyed on `page_order` (`_segment`, `_proposals`, ...) --
+    the identical "mutate the override, rerun, let the cache keys do the
+    invalidation" mechanism `_set_page_rotation` already uses for rotation.
+
+    `find_reversed_continuation_header_pairs` (see segment.py) is checked
+    first and, when it names a page in *this* packet, shown as a one-click
+    proposal rather than requiring the general controls below -- but it's
+    exactly that: a proposal a reviewer confirms by clicking, never applied
+    on its own.
+
+    Applying any edit changes which physical page is this packet's own
+    first page in processing order, which can change `packet_tag` itself
+    (see pipeline.packet_tag -- based on `page_indices[0]`) -- a decision
+    already recorded under the *old* tag for an affected packet won't
+    follow it automatically. This is surfaced as a caption, not silently
+    hidden, since the packets this editor exists for are exactly the ones
+    that were too broken to have a trustworthy decision recorded yet.
+    """
+    sequence = _current_page_sequence(segmented.page_count)
+
+    suggestions = find_reversed_continuation_header_pairs(segmented)
+    relevant = [
+        s for s in suggestions if s.continuation_page_index in packet.page_indices or s.header_page_index in packet.page_indices
+    ]
+    for s in relevant:
+        st.warning(
+            f"Pages {s.continuation_page_index} and {s.header_page_index} look like a reversed "
+            f"continuation/header pair -- both declare a {s.declared_total}-page packet, consistent "
+            "with being one packet if simply read in the other order."
+        )
+        if st.button(
+            f"Apply suggested fix: process page {s.header_page_index} immediately before page "
+            f"{s.continuation_page_index}",
+            key=f"pc_apply_reversal_{tag}_{s.continuation_page_index}",
+        ):
+            new_sequence = _sequence_insert_before(sequence, s.header_page_index, s.continuation_page_index)
+            _set_page_order(args.pdf_path, args.decisions_dir, new_sequence, segmented.page_count)
+            st.rerun()
+
+    idx_in_tags = tags.index(tag)
+    prev_packet = packet_by_tag[tags[idx_in_tags - 1]] if idx_in_tags > 0 else None
+    next_packet = packet_by_tag[tags[idx_in_tags + 1]] if idx_in_tags + 1 < len(tags) else None
+
+    st.caption(
+        "Reordering, removing, or moving a page can change this packet's own identity (packet_tag is "
+        "based on its first page in processing order) -- an existing decision for the old tag won't "
+        "follow automatically; re-review affected packets after applying an edit here."
+    )
+
+    for i, page_idx in enumerate(packet.page_indices):
+        cols = st.columns([2, 1, 1, 2, 3])
+        cols[0].write(f"Physical page {page_idx}")
+        if cols[1].button("↑", key=f"pc_up_{tag}_{page_idx}", disabled=i == 0, help="Move up within this packet"):
+            new_sequence = _sequence_move_within(sequence, page_idx, -1)
+            _set_page_order(args.pdf_path, args.decisions_dir, new_sequence, segmented.page_count)
+            st.rerun()
+        if cols[2].button(
+            "↓", key=f"pc_down_{tag}_{page_idx}", disabled=i == len(packet.page_indices) - 1, help="Move down within this packet"
+        ):
+            new_sequence = _sequence_move_within(sequence, page_idx, 1)
+            _set_page_order(args.pdf_path, args.decisions_dir, new_sequence, segmented.page_count)
+            st.rerun()
+        if cols[3].button("✕ Remove from packet", key=f"pc_remove_{tag}_{page_idx}"):
+            new_sequence = _sequence_remove(sequence, page_idx)
+            _set_page_order(args.pdf_path, args.decisions_dir, new_sequence, segmented.page_count)
+            st.rerun()
+        if i == 0 and prev_packet is not None:
+            if cols[4].button("← Move to previous packet", key=f"pc_prev_{tag}_{page_idx}"):
+                new_sequence = _sequence_insert_after(sequence, page_idx, prev_packet.page_indices[-1])
+                _set_page_order(args.pdf_path, args.decisions_dir, new_sequence, segmented.page_count)
+                st.rerun()
+        elif i == len(packet.page_indices) - 1 and next_packet is not None:
+            if cols[4].button("Move to next packet →", key=f"pc_next_{tag}_{page_idx}"):
+                new_sequence = _sequence_insert_before(sequence, page_idx, next_packet.page_indices[0])
+                _set_page_order(args.pdf_path, args.decisions_dir, new_sequence, segmented.page_count)
+                st.rerun()
+
+    removed = [p for p in range(segmented.page_count) if p not in sequence]
+    if removed:
+        st.write(f"Removed (currently unassigned to any packet): {removed}")
+        pick = st.selectbox("Re-insert a removed page", options=removed, key=f"pc_reinsert_pick_{tag}")
+        insert_col1, insert_col2 = st.columns(2)
+        if insert_col1.button("Insert before this packet", key=f"pc_reinsert_before_{tag}"):
+            new_sequence = _sequence_insert_before(sequence, pick, packet.page_indices[0])
+            _set_page_order(args.pdf_path, args.decisions_dir, new_sequence, segmented.page_count)
+            st.rerun()
+        if insert_col2.button("Insert after this packet", key=f"pc_reinsert_after_{tag}"):
+            new_sequence = _sequence_insert_after(sequence, pick, packet.page_indices[-1])
+            _set_page_order(args.pdf_path, args.decisions_dir, new_sequence, segmented.page_count)
+            st.rerun()
+
+    if st.session_state.page_order is not None:
+        if st.button("Reset entire file to natural physical order", key=f"pc_reset_all_{tag}"):
+            _set_page_order(args.pdf_path, args.decisions_dir, list(range(segmented.page_count)), segmented.page_count)
+            st.rerun()
+
+
 def _render_packet(
     args: argparse.Namespace,
     packet: Packet,
@@ -1066,18 +1524,67 @@ def _render_packet(
     disagreeing_tags: frozenset[str] = frozenset(),
     round_labels: dict[str, str] | None = None,
     output_round_disagreeing: frozenset[str] = frozenset(),
+    segmented: SegmentResult | None = None,
+    packet_by_tag: dict[str, Packet] | None = None,
 ) -> None:
     if resolved_block is not None:
         st.caption(f"Approving into: {resolved_block.describe()}")
 
     _render_page_stack(args, packet, tag)
 
+    unconfirmable_issues = [i for i in packet.issues if not is_composition_confirmable_issue(i)]
     if packet.issues:
+        # Every blocked packet must tell a reviewer the specific action
+        # that clears it, not just that something's wrong (see CLAUDE.md's
+        # "unreadable footers should not block a human who can see the
+        # page" section) -- these hints are derived from which *kind* of
+        # issue segment.py actually recorded, not a generic "resolve out
+        # of band" that leaves a reviewer guessing.
+        action_hints = []
+        if any("orientation" in i for i in packet.issues):
+            action_hints.append("rotate the affected page above to confirm or correct its orientation")
+        if any(is_composition_confirmable_issue(i) for i in packet.issues):
+            action_hints.append(
+                "open 'Fix page composition' below to reorder/remove/move pages, or, if the page "
+                "count/order actually is correct, confirm it there to release this hold"
+            )
+        if any("worksheet type unreadable" in i for i in packet.issues):
+            action_hints.append("set the worksheet type by hand in the manual redaction editor below")
+        hint_text = "; ".join(action_hints) if action_hints else "resolve the issue(s) named below"
         st.warning(
-            "This packet has unresolved segmentation issues and cannot be assigned a SID "
-            "until a human resolves them out of band (e.g. a missing/misfiled page). "
-            "You may still mark it as not-on-roster to reject it.\n\n" + "\n".join(f"- {i}" for i in packet.issues)
+            f"This packet has unresolved segmentation issues and cannot be assigned a SID until "
+            f"resolved -- {hint_text}. You may still mark it as not-on-roster to reject it.\n\n"
+            + "\n".join(f"- {i}" for i in packet.issues)
         )
+        if not unconfirmable_issues:
+            override_checked = st.checkbox(
+                "I've looked at this packet's actual pages and confirm the page count/order is "
+                "correct -- release this packet from the footer/sequence hold above despite the "
+                "issue(s) listed. This never releases a leak finding or an unconfirmed rotation, "
+                "only a footer/page-count confidence problem.",
+                value=tag in st.session_state.composition_overrides,
+                key=f"composition_override_{tag}",
+            )
+            if override_checked != (tag in st.session_state.composition_overrides):
+                _set_composition_override(args.pdf_path, args.decisions_dir, tag, override_checked)
+                st.toast(f"Composition override {'granted' if override_checked else 'revoked'} for {tag}")
+
+    if segmented is not None and packet_by_tag is not None:
+        # Reachable for any packet, not just a blocked one -- a page-order
+        # defect can be spotted just by looking at the page stack above,
+        # before segmentation even reports an issue for it (e.g. the
+        # *header* page of a reversed pair looks like an ordinary packet on
+        # its own). Collapsed by default unless this packet actually has an
+        # unresolved segmentation issue or a reversal suggestion names one
+        # of its pages, so it doesn't compete with the common "looks right,
+        # confirm" path.
+        suggestions_here = [
+            s
+            for s in find_reversed_continuation_header_pairs(segmented)
+            if s.continuation_page_index in packet.page_indices or s.header_page_index in packet.page_indices
+        ]
+        with st.expander("📑 Fix page composition", expanded=bool(packet.issues) or bool(suggestions_here)):
+            _render_page_composition_editor(args, segmented, packet, tag, tags, packet_by_tag)
 
     if tag not in st.session_state.decisions and proposal.is_held_match:
         st.info(
@@ -1092,13 +1599,15 @@ def _render_packet(
     if packet.header_page_index is None:
         st.info("No header page for this packet (orphan continuation page).")
         candidate_options: list[tuple[str, str | None]] = []
+        has_ocrd_name = False
     else:
         fields = _header_fields(args.pdf_path, packet.header_page_index, st.session_state.orientation_overrides)
 
         top5 = proposal.candidates[:5]
         candidate_options = [(_decision_label(c.sid, roster), c.sid) for c in top5]
-        all_options_preview = candidate_options + [("Not on roster (no consent)", None)]
-        default_sid_preview = auto_assignments.get(tag)
+        has_ocrd_name = bool(fields.name_text and fields.name_text.strip())
+        all_options_preview = _decision_options(tag, roster, candidate_options, has_ocrd_name)
+        default_sid_preview = _default_decision_sid(tag, auto_assignments, has_ocrd_name)
         default_index_preview = next(
             (i for i, (_, sid) in enumerate(all_options_preview) if sid == default_sid_preview),
             len(all_options_preview) - 1,
@@ -1119,7 +1628,7 @@ def _render_packet(
         raw_image = _page_image(args.pdf_path, packet.header_page_index, DPI, st.session_state.orientation_overrides)
         render_elapsed = time.perf_counter() - render_start
         st.caption(f"Packet rendered in {render_elapsed * 1000:.0f} ms" + (" (cached)" if render_elapsed < 0.05 else ""))
-        stamp_lines = _stamp_lines_for(selected_sid, roster)
+        stamp_lines = _stamp_lines_for(selected_sid, roster) if selected_sid is not _NO_SELECTION else None
         preview_image, band = render_redaction_preview(raw_image, dpi=DPI, anchors=fields.anchors, stamp_lines=stamp_lines)
         if not band.detected:
             st.warning("Header border not confidently detected on this page -- redaction geometry may be unreliable.")
@@ -1136,11 +1645,20 @@ def _render_packet(
                     f"Detection-hold override {'granted' if override_checked else 'revoked'} for {tag}"
                 )
 
+        if not has_ocrd_name and tag not in st.session_state.decisions:
+            st.warning(
+                "⚠️ OCR read no name at all on this page -- the Decision below has nothing pre-selected. "
+                "Look at the scan and either search the roster for the right student or explicitly mark "
+                "this packet as not on the roster; nothing is confirmable until you choose."
+            )
+
         col1, col2 = st.columns(2)
         col1.image(raw_image, caption="Original scan")
         band_note = "border detected" if band.detected else "fallback band used"
         preview_caption = f"Redaction preview, reflects current selection ({band_note})"
-        if selected_sid is None:
+        if selected_sid is _NO_SELECTION:
+            preview_caption += " -- no decision made yet"
+        elif selected_sid is None:
             preview_caption += " -- no packet would be written for 'Not on roster'"
         col2.image(preview_image, caption=preview_caption)
 
@@ -1173,18 +1691,43 @@ def _render_packet(
                 key=f"search_select_{tag}",
             )
             if st.button("Use this roster entry", key=f"search_use_{tag}", disabled=bool(packet.issues)):
+                # Real bug fixed here (packet 70, 2026-08-15): this used to
+                # only write the decision, leaving the Decision radio below
+                # unaware of the choice -- its own stale default ("Not on
+                # roster", since no matcher candidate cleared MIN_SCORE)
+                # would then silently overwrite this exact write the next
+                # time a reviewer clicked "Confirm decision", not realizing
+                # the radio disagreed with what had just been saved. Setting
+                # search_added_sid *before* recomputing the shared option
+                # list means the radio's own widget state (set below) is
+                # guaranteed to use a label that's actually present in that
+                # list next render -- see _decision_options' own docstring.
+                st.session_state[_search_added_key(tag)] = chosen
                 _confirm(args.pdf_path, args.decisions_dir, tag, chosen)
+                fresh_options = _decision_options(tag, roster, candidate_options, has_ocrd_name)
+                label_for_chosen = next(label for label, sid in fresh_options if sid == chosen)
+                st.session_state[f"decision_{tag}"] = label_for_chosen
                 st.rerun()
 
-    all_options = candidate_options + [("Not on roster (no consent)", None)]
+    all_options = _decision_options(tag, roster, candidate_options, has_ocrd_name)
     labels = [label for label, _ in all_options]
-    default_sid = auto_assignments.get(tag)
+    default_sid = _default_decision_sid(tag, auto_assignments, has_ocrd_name)
     default_index = next((i for i, (_, sid) in enumerate(all_options) if sid == default_sid), len(all_options) - 1)
 
     choice_label = st.radio("Decision", options=labels, index=default_index, key=f"decision_{tag}")
     choice_sid = dict(all_options)[choice_label]
+    if choice_sid is _NO_SELECTION:
+        st.caption("No decision selected yet -- Confirm is disabled until you choose one.")
 
-    disabled = bool(packet.issues) and choice_sid is not None
+    # A packet with unresolved issues still blocks Confirm-with-a-SID --
+    # unless every one of those issues is composition-confirmable (see
+    # is_composition_confirmable_issue) AND a human has actually ticked the
+    # composition-override checkbox above: that's what "makes the packet
+    # assignable" (see CLAUDE.md). Rejecting as not-on-roster is always
+    # allowed regardless, same as before this override existed.
+    composition_released = not unconfirmable_issues and tag in st.session_state.composition_overrides
+    still_blocked = bool(packet.issues) and not composition_released
+    disabled = (still_blocked and choice_sid is not None) or choice_sid is _NO_SELECTION
     next_index = tags.index(tag) + 1
     has_next = next_index < len(tags)
 
@@ -1278,7 +1821,7 @@ def _render_block_gate(args: argparse.Namespace) -> tuple[BlockMeaning, frozense
         )
         return None
 
-    resolution = _block_resolution(args.pdf_path, class_period, args.roster_path, st.session_state.orientation_overrides)
+    resolution = _block_resolution(args.pdf_path, class_period, args.roster_path, st.session_state.orientation_overrides, st.session_state.page_order)
 
     st.header("Block resolution")
     st.code(format_resolution_report(resolution), language=None)
@@ -1355,7 +1898,7 @@ def main() -> None:
     # recorded rotation from a prior session.
     _init_state(args.pdf_path, args.decisions_dir)
 
-    segmented = _segment(args.pdf_path, st.session_state.orientation_overrides)
+    segmented = _segment(args.pdf_path, st.session_state.orientation_overrides, st.session_state.page_order)
 
     # Round grouping (see blocks.group_into_rounds) applies to every
     # teacher, unlike the _blocks.json-gated block-resolution feature
@@ -1363,7 +1906,7 @@ def main() -> None:
     # CLAUDE.md's round-segment design deliberately never holds or blocks a
     # packet on its own date disagreeing with its group (see the per-packet
     # warning in _render_packet), so there's nothing here to confirm.
-    round_dates, round_groups = _round_data(args.pdf_path, st.session_state.orientation_overrides)
+    round_dates, round_groups = _round_data(args.pdf_path, st.session_state.orientation_overrides, st.session_state.page_order)
     round_labels = round_labels_by_tag(round_groups)
     output_round_disagreeing = round_disagreeing_tags(round_groups, round_dates)
     st.header("Round grouping")
@@ -1375,7 +1918,7 @@ def main() -> None:
     # redacted regardless of any match. Shown here purely so a reviewer
     # sees what the check found before it gates "Run redaction pipeline"
     # below the same way held_back already does for the other checks.
-    consensus_analysis = _consensus(args.pdf_path, st.session_state.orientation_overrides)
+    consensus_analysis = _consensus(args.pdf_path, st.session_state.orientation_overrides, st.session_state.page_order)
     with st.expander("Consensus-ink anomaly check", expanded=bool(consensus_analysis.holds)):
         st.code(format_consensus_report(consensus_analysis), language=None)
 
@@ -1415,7 +1958,7 @@ def main() -> None:
         st.error(f"Roster error: {exc}")
         return
     session_tags = {packet_tag(args.pdf_path, p) for p in segmented.packets}
-    proposals = [p for p in _proposals(args.pdf_path, args.roster_path, period_for_roster, st.session_state.orientation_overrides) if p.packet_tag in session_tags]
+    proposals = [p for p in _proposals(args.pdf_path, args.roster_path, period_for_roster, st.session_state.orientation_overrides, st.session_state.page_order) if p.packet_tag in session_tags]
     auto_assignments = assign_all(proposals, round_labels=round_labels)
     proposals_by_tag = {p.packet_tag: p for p in proposals}
 
@@ -1465,6 +2008,8 @@ def main() -> None:
         disagreeing_tags,
         round_labels,
         output_round_disagreeing,
+        segmented,
+        packet_by_tag,
     )
     _prefetch_next_packet(args, tags, packet_by_tag, tag)
 

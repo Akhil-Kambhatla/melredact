@@ -3907,6 +3907,393 @@ rotation timing on a real packet (as opposed to the synthetic-fixture
 timing already measured above) is still real, useful follow-up work this
 session didn't do.
 
+## Four review-tool reliability fixes, a round-scoped path-collision bug, and a 010406 cleanup (2026-08-15)
+
+**Motivation: the reviewer is meant to be the general answer to every
+anomaly this data produces (see "From detection-gates-workflow to
+human-reviews-everything" above) — but that only holds if the review tool
+itself is reliable enough to carry the load.** A real reviewing session
+against `010406_PD1_PRT.pdf` (92 pages, 47 packets) surfaced four concrete
+defects in the tool itself, plus a real round-path-collision bug found
+auditing the actual `out/010406/` tree. Fixed in dependency order (the
+canvas fix first, since every other fix's own manual verification depends
+on the editor actually working); confirmed against the real file at the
+end via `cli.py preflight`, not just the synthetic fixture.
+
+### Phase 1: the manual-redaction canvas was unusable
+
+**Root cause, found by reading the frontend, not guessing: two independent
+sizing/timing problems, not one.** First — `st_canvas`'s declared
+`width`/`height` render as a literal pixel size (no CSS-driven scaling),
+while a plain `st.image` with no explicit `width` defaults to Streamlit's
+`'content'` sizing, which a narrower container silently shrinks via
+`max-width` CSS. The editor's two panes (the canvas showing the original
+page, a plain `st.image` showing the live redacted preview) were two views
+of the *same* page rendered at two potentially different effective sizes —
+what a reviewer sees as "misaligned, shifts between renders": the shift is
+real browser layout reflow (sidebar state, a scrollbar appearing) changing
+the *container's* width from render to render, which only ever moved the
+CSS-scaled preview pane, never the fixed-pixel canvas. Second —
+`streamlit-drawable-canvas-fix`'s own frontend syncs canvas state back to
+Streamlit on a ~200ms debounce *during* an active drag/resize (confirmed
+by reading the bundled JS, not assumed — see the `Object(u.a)(t.
+stateToSendToStreamlit,200)` debounce hook and the `loadFromJSON`/
+`isEqual` reload path it feeds), each sync triggering a full script rerun;
+recomputing the redaction preview (`detect_header_band`'s raster scan,
+`find_uncovered_group_words`) inline on every one of those reruns was slow
+enough that the *next* debounced sync could land mid-gesture, reading to a
+reviewer as a drag that "sometimes doesn't take."
+
+**Fix, `review_app.py` + `config.py`:** both panes now render at an
+identical, page-derived fixed pixel width (`config.
+MANUAL_EDITOR_TARGET_WIDTH_PX = 700`, `review_app._editor_dpi_for_page`
+picks the DPI that produces exactly that width for *this* page's own
+point-width, since a still-unconfirmed 90/270-rotated page has swapped
+width/height) — the preview pane's `st.image` call is now given that same
+width explicitly, so neither pane is ever left to container-relative CSS
+sizing that could drift from the other. The redacted preview now only
+regenerates on an explicit "🔄 Update preview" click (plus once
+automatically, the first time a page is opened) instead of on every rerun
+this editor causes — a stale-preview banner says so plainly, and Apply
+always uses the *current* drawn regions regardless of whether the preview
+was refreshed, so staleness is a UX concern only, never a correctness one.
+Both panes report their own render time and pixel dimensions in a caption
+(`"... · WxHpx"`), directly observable and directly testable (see
+`test_manual_editor_both_panes_report_identical_pixel_dimensions`, which
+asserts the two captions report identical dimensions). The canvas
+component's own `key` was already stable across reruns (confirmed, not
+assumed) and the pixel↔point conversion functions already round-tripped
+exactly (`test_canvas_rect_bbox_round_trip_at_multiple_dpis`, pre-existing)
+— neither needed a code change, just confirmation.
+
+**Verified against a real packet, not just the synthetic fixture, per
+this session's own instruction, then discarded** (same posture every
+other real-page inspection in this file already takes): rendered
+`010406_PD1_PRT.pdf`'s SID 0104060110 packet at the new fixed width in
+both panes, drew two boxes (left column + full-width overflow strip),
+resized one via `scaleX`/`scaleY`, converted through `_canvas_rect_to_bbox`
+at the editor's own DPI and applied as `redact_packet`'s
+`header_bbox_override` at the real, different, final redaction DPI — both
+regions redacted correctly and `verify_no_leaked_names` found nothing.
+Tests: `test_manual_editor_canvas_state_survives_a_simulated_rerun_
+without_losing_boxes`, `test_editor_dpi_differs_from_module_dpi_and_
+round_trips_exactly`, `test_manual_editor_both_panes_report_identical_
+pixel_dimensions` (`tests/test_review_app.py`).
+
+### Phase 2: a roster entry chosen by search could not actually be selected
+
+**Real bug, reported directly (packet 70, real 010406 data): search-
+selecting "Brian Lu" via "Use this roster entry" recorded the right SID
+immediately, but a subsequent click of "Confirm decision" — the large,
+obvious call-to-action sitting right below — silently reverted it to a
+non-consent rejection.** Root cause: the Decision radio's own options list
+was built *only* from the matcher's top-5 candidates plus "Not on roster"
+— a student found via search that wasn't already a matcher candidate had
+no matching radio option at all. The radio's own default (there was no
+plausible auto-candidate for this packet, since OCR read no name) landed
+on "Not on roster," and clicking Confirm afterward used the *radio's*
+value, not the just-recorded search decision, silently overwriting it.
+
+**Fix: `review_app._decision_options`, one shared option-list builder used
+by both the live preview and the radio itself, so they can never
+independently disagree.** Folds in, in order: the matcher's own top-5,
+then a roster-search selection (`🔍 ... (found via roster search)`,
+tracked via `_search_added_key`) if not already present, then the
+currently-recorded decision (`↺ ... (previously recorded)`) if not already
+present (covers a reload where the recorded decision came from search in
+an earlier session), then "Not on roster." Clicking "Use this roster
+entry" now sets `st.session_state[f"decision_{tag}"]` to the *exact* label
+`_decision_options` will independently produce for that SID on the next
+render (computed once, from the same shared list, not duplicated by hand)
+— a later "Confirm decision" click reaffirms the same value instead of
+reverting it.
+
+**Empty-name case: no default candidate is pre-selected at all.** A new
+sentinel, `_NO_SELECTION` (distinct from `None`, which is the real "Not on
+roster" choice), is prepended as a genuine "— No name was read; choose a
+decision below —" placeholder whenever OCR read no name at all
+(`has_ocrd_name = False`) and nothing has been decided or search-selected
+yet — forced as the radio's default via `_default_decision_sid`, with
+Confirm/Confirm & Next disabled while it's selected. A pre-selected "Not
+on roster" on zero evidence was itself the hazard: one accidental Confirm
+click away from silently rejecting a real, unreviewed student.
+
+Tests: `test_roster_search_selection_survives_a_later_confirm_click`
+(drives the exact real sequence — search, select, use, *then* click
+Confirm decision — against a purpose-built fixture large enough that the
+target SID genuinely falls outside the matcher's own top-5, per `match.
+propose`'s own "always returns every roster entry" contract),
+`test_packet_with_no_ocrd_name_has_no_preselected_decision` (`tests/
+test_review_app.py`).
+
+### Phase 3: pages scanned out of order
+
+**Real shape, `010406_PD1_PRT.pdf` pages 84/85 (0-indexed): the scanner
+fed a packet's continuation page (page 84, footer "2 of 2") immediately
+*before* its own header page (page 85, footer "1 of 2").**
+`segment.segment_pdf` assumes physical scan order is document order (see
+its own module docstring) — this reversal made page 84 report as an
+unsegmentable orphan and page 85 as its own packet, short one page, even
+though the two pages' own footers agree on one consistent packet if
+simply read in the other order.
+
+**Fix, `segment.py`: `segment_pdf` gained an optional `page_sequence:
+list[int] | None` parameter** — the physical page indices to process, in
+order, defaulting to `None` (natural physical order, byte-identical to
+every existing caller's behavior). A page excluded from `page_sequence`
+is processed by nothing (unassigned to any packet, not deleted from the
+file) — the same outcome the page composition editor's own "remove"
+control relies on. `Packet.page_indices` still holds real physical
+indices throughout, so no downstream consumer (OCR, rendering, redaction)
+needs any awareness of this parameter — only *grouping* changes.
+
+**`segment.find_reversed_continuation_header_pairs(segmented)`** detects
+the shape directly from an already-segmented (natural-order) result: a
+single-page orphan packet whose very next physical page is a header-
+started packet with the same declared total. Reuses segment_pdf's own
+output rather than re-simulating its state machine. Never applies
+anything — returns proposals only.
+
+**`review_app.py`'s page composition editor** (`_render_page_composition_
+editor`, inside a "📑 Fix page composition" expander on every packet, auto-
+expanded when the packet has unresolved issues or a reversal suggestion
+names one of its pages): shows this packet's own pages with Up/Down
+(swap with the sequence-adjacent page in this same packet), ✕ Remove
+(unassign, not delete), and, on the packet's first/last page only, a
+move-to-adjacent-packet shortcut — plus, when applicable, the reversal
+suggestion as a one-click "Apply suggested fix" button. Every control
+computes a new full page-processing sequence via a handful of pure
+functions (`_sequence_move_within`/`_sequence_remove`/`_sequence_insert_
+before`/`_sequence_insert_after`) and calls `_set_page_order`, which
+persists it (`pipeline.page_order_path`/`load_page_order`/`save_page_
+order`, a sidecar mirroring `orientation_overrides_path`'s own pattern)
+and reruns — every cache keyed on `page_order` (`_segment`, `_proposals`,
+`_round_data`, `_consensus`) picks up the change on the next render, the
+identical "mutate the override, rerun, let cache keys invalidate"
+mechanism `_set_page_rotation` already established for orientation. A
+caption warns that reordering can change a packet's own `packet_tag`
+(based on `page_indices[0]`) and an already-recorded decision under the
+old tag won't follow automatically.
+
+**Verified against the real file, not just the synthetic fixture:**
+applying the exact fix a reviewer would (`page_sequence` with page 85
+moved immediately before page 84) via the real `segment_pdf` call
+produces one clean packet, `page_indices=[85, 84]`, `header_page_index=
+85`, `issues=[]` — confirmed directly, not assumed.
+
+Tests: `test_reversed_continuation_header_pair_reported_as_two_broken_
+packets`, `test_find_reversed_continuation_header_pairs_detects_the_swap`,
+`test_page_sequence_override_fixes_the_reversed_pair`, `test_page_
+sequence_excluding_a_page_leaves_it_unassigned` (`tests/test_segment.py`,
+using a new `tests.make_fixture.build_reversed_pair_fixture`);
+`test_reversed_continuation_header_pair_is_proposed_not_auto_applied`,
+`test_page_composition_editor_reorders_and_clears_stale_issue` (`tests/
+test_review_app.py`, full AppTest round trip through the real UI).
+
+### Phase 4: an unreadable footer shouldn't block a human who can see the page
+
+**Real shape, `010406_PD1_PRT_p086`: header page fine, continuation page's
+own footer marker blank — "unreadable footer, cannot verify sequence."**
+Redaction is correct (only the header page carries anything to redact);
+the packet was nonetheless permanently held, since `run_dispositions`
+refuses *any* packet with unresolved `segment.py` issues regardless of
+what `decisions` says, with no way for a human to say "I looked at the
+actual pages, the count is right."
+
+**Fix, `pipeline.py`: `composition_overrides: set[str]`, a set of
+packet_tags a human has explicitly confirmed the page composition for,**
+mirroring `detection_overrides`'s own shape and persistence
+(`composition_overrides_path`/`load_composition_overrides`/`save_
+composition_overrides`, a sidecar next to `decisions_path`, not folded
+into it). Releases the `packet.issues` hold *only* when every one of the
+packet's own issues is one `is_composition_confirmable_issue` recognizes —
+an allowlist of footer/page-count/sequence-confidence substrings
+(`_COMPOSITION_CONFIRMABLE_ISSUE_MARKERS`), deliberately an allowlist, not
+a denylist: a future segment.py issue type this list doesn't already know
+about defaults to NOT confirmable. Two real issue shapes are deliberately
+excluded on purpose: an orientation issue (has its own real fix — rotate
+the page) and a worksheet-type-unreadable issue (the packet's own output
+*path* can't even be computed without it — confirming page count doesn't
+answer "what kind of worksheet is this"). A written packet released this
+way carries the note in its own `reason` ("shipped despite unresolved
+segmentation issues (human-confirmed page composition)"), same pattern
+`detection_overrides` already uses — never silently indistinguishable
+from an ordinary clean write.
+
+**Never touches the two real-finding holds.** `composition_overrides` is
+only ever consulted at the `packet.issues` gate, nothing else —
+consensus-ink and `verify_no_leaked_names` holds run entirely
+independently, further down, and stay non-overridable by any confirmation,
+composition included (verified directly: `test_composition_override_does_
+not_release_a_consensus_ink_or_verify_hold`).
+
+**`review_app.py`:** a checkbox appears next to a packet's issues warning
+*only* when every one of its issues is composition-confirmable — "I've
+looked at this packet's actual pages and confirm the page count/order is
+correct." Ticking it releases both the `packet.issues` hold in a later
+"Run redaction pipeline" *and* immediately un-disables "Confirm decision"/
+"Confirm & Next" for that packet (this is what "makes the packet
+assignable" — confirming composition and confirming a SID are still two
+separate actions, same reasoning `detection_overrides`' own checkbox
+already established: "who is this" and "I've verified the geometry/
+count" answer different questions).
+
+**Every blocked packet now names the specific clearing action, not a
+generic "resolve out of band."** The issues warning itself now derives a
+hint from *which kind* of issue is actually present: an orientation issue
+says "rotate the affected page above"; a composition-confirmable issue
+says "open 'Fix page composition' below... or confirm it there"; a
+worksheet-type issue says "set the worksheet type by hand in the manual
+redaction editor." (`cli.py`'s own per-file `reason` line already
+surfaced the specific issue text without a code change, since `composition_
+note` folds into the same `reason` string `detection_note` already used.)
+
+**Real fixture built from the exact p086 shape** (`tests.make_fixture.
+build_unreadable_continuation_footer_fixture`: header page normal,
+continuation page's own footer marker blank) rather than a synthetic
+stand-in, so the tests exercise the identical issue text the real file
+produces. Tests: `test_composition_override_releases_an_unreadable_
+footer_hold_and_writes_the_packet`, `test_composition_override_does_not_
+release_an_orientation_issue`, `test_composition_override_does_not_
+release_a_consensus_ink_or_verify_hold`, `test_composition_overrides_
+persist_and_reload` (`tests/test_pipeline.py`); `test_unreadable_footer_
+packet_becomes_assignable_after_confirming_composition` (`tests/
+test_review_app.py`, full UI round trip: disabled before the checkbox,
+enabled and recordable after).
+
+### Phase 5: a real round-path-collision bug, found auditing `out/010406/`
+
+**Reported: SID 0104060104's "first, second, and third copies" under
+`out/010406/01/PRT/NA/2026-02/` looked wrong.** Audited the real ledger
+and `decisions/010406_PD1_PRT.json` directly rather than guessing: **seven**
+real (round, sid) pairs, not one, had more than one packet_tag decided
+for the same student within the same round —
+`{2026-02: sid ...04 (p048, p066), ...05 (p042, p064), ...07 (p062,
+p076), ...08 (p040, p068); 2026-03: sid ...02 (p022, p030), ...03 (p008,
+p032), ...10 (p028, p038)}`. Each pair produced the numbered-suffix
+collision-avoidance path (`<SID>.pdf`, `<SID>_2.pdf` — see `_claim_
+output_path`, unchanged and working as designed: neither file silently
+overwrote the other) — but two files under one student's own path with no
+way to tell them apart from the filename alone is itself confusing, and
+a real second bug (below) compounded it.
+
+**Root cause of the duplicate decisions themselves: match.assign_all's
+round-scoped claim-and-remove only ever guards *automatic* assignment**
+(see "Round-scoped claiming" above) — nothing stops a human from
+independently confirming the same SID for two different packets within
+one round via review_app.py's roster search or radio. Whether each of
+these seven pairs is a genuine reviewer mix-up (two different students
+confused for one) or a real one-off (the same student handed two
+worksheets in one sitting) needs a human looking at the actual pages —
+not something this session decided or guessed.
+
+**Fix 1 (real code bug, not just the duplicate-decision symptom):
+`run_dispositions`'s stale-output cleanup was keyed on `prior_sid != sid`,
+missing the case where a packet's own claimed *path* changes even though
+its own SID doesn't.** Concretely: packet B decided the same SID as
+already-ledgered packet A gets a numbered-suffix path (`X_2.pdf`); A's own
+decision later corrects to a different SID, freeing the natural `X.pdf`
+path; B (whose own decision never changed) then claims *that* natural
+path on its next run — but the old `prior_sid != sid` check for B saw no
+SID change and never deleted B's own now-abandoned `X_2.pdf`, leaving it
+sitting in `out/` forever, attached to no current ledger entry.
+
+First attempt (comparing raw paths, `prior_entry["path"] != str(out_path)`
+unconditionally) was too broad and broke a real, pre-existing protection:
+`test_two_worksheet_types_for_same_student_do_not_collide_in_out` failed
+immediately, since `ledger_path`/`packet_tag` are keyed only on the
+*source pdf's own filename stem*, not its full path — two genuinely
+different scan files that happen to share a stem (that test's own MPR/PRT
+fixture pair, built on purpose) share both a ledger and a packet_tag by
+coincidence, and legitimately claim two different `out_path`s (different
+worksheet_type directories) for the *same* SID. Comparing raw paths
+deleted the *other* worksheet type's real, current file in that case,
+since its differently-named directory made the path "different" for a
+reason unrelated to any suffix shift. **Fixed correctly: the comparison
+is scoped to `prior_path.parent == out_path.parent`** (same teacher/
+period/worksheet_type/topic/round — i.e. the identical natural
+`output_path` shape) **`and prior_sid == sid`** — so it only ever fires for
+the exact shape it was built to catch (the identical packet, gaining or
+losing a numbered suffix), never for two different packets that
+legitimately share a tag. Both regressions are now regression-tested
+together: `test_stale_suffixed_path_is_cleaned_up_when_a_different_
+packets_collision_clears` (the real bug this fix closes — confirmed to
+actually catch it: an unscoped or reverted version of the fix leaves the
+stale file behind, exactly as the real 010406 tree showed) and the
+pre-existing `test_two_worksheet_types_for_same_student_do_not_collide_
+in_out` (the protection a too-broad fix would have re-broken), both
+passing together in `tests/test_pipeline.py`.
+
+**Fix 2 (visibility, not auto-resolution): `pipeline.duplicate_decisions_
+within_round(decisions, round_labels)`** reports every (round_label, sid)
+decided for more than one packet_tag — purely informational, never held,
+blocked, or auto-resolved (the same "flag, never guess" posture `blocks.
+duplicate_round_labels` already takes for a structurally similar problem
+one level up). Printed by `cli.py run` right after the decisions summary
+(`format_duplicate_decisions_report`) and shown as a sidebar warning per
+duplicate in `review_app.py`, both before any file is written, so a human
+sees it before shipping rather than discovering it in `out/` afterward the
+way this session did.
+
+**010406 cleanup, per explicit instruction:** `out/010406/` (the full
+shipped tree) and its stale `out/.ledger/010406_PD1_PRT.json` (which
+pointed at now-deleted files) were deleted. Also cleaned up, found stale
+while auditing: `out/.diagnostics/010406_PD1_PRT*` (real-scan-derived
+diagnostic renders left on disk from earlier sessions, contrary to this
+project's own repeated "delete after inspection" posture — see every
+other real-page-render cleanup elsewhere in this file) and `out/.
+manual_queue/010406_PD1_PRT/` (queued drafts for packets p058/p078, now
+stale relative to the wiped output tree and ledger). **`decisions/
+010406_PD1_PRT.json` and its sidecars (orientation overrides, manual
+geometry) were deliberately left untouched** — they're real human review
+work, not derived state, and the seven duplicate-decision pairs need a
+human's own review, not code to guess an answer. **Nothing was
+regenerated or reshipped this session** — the fixes are verified; a real
+re-run for 010406 is still a human-initiated action, same "verified, not
+automatically re-shipped" posture as every other real-data finding in
+this file.
+
+### Phase 6: real preflight verdict after all four fixes
+
+Re-ran `cli.py preflight` against the real, unmodified `data/PRT/
+010406_PD1_PRT.pdf` (warm cache, 3.7s) after all four phases above:
+**92 pages, 47 packets — 15 clean, 28 would need the editor, 4 cannot be
+processed without a fix** (`p056`, `p084`, `p085`, `p086` — the same four
+packets the pre-session baseline's "3 unprocessable" count named, just
+correctly itemized as four distinct packet_tags rather than three, since
+`p085` is its own real recovered header packet, not folded into `p084`).
+
+**Of those 4, 3 are now clearable inside the review UI thanks to this
+session's own fixes, confirmed directly against the real file, not
+assumed:**
+- `p084`/`p085` (the reversed continuation/header pair): `find_reversed_
+  continuation_header_pairs` correctly flags it on the real file, and
+  applying the fix via `segment_pdf`'s own `page_sequence` parameter
+  produces one clean packet (`page_indices=[85, 84]`, `issues=[]`) —
+  verified directly against the real, normalized source file.
+- `p086` (unreadable continuation footer): its one issue,
+  `"page 87: unreadable footer, cannot verify sequence"`, is exactly the
+  shape `is_composition_confirmable_issue` releases — a human ticking the
+  composition-override checkbox in `review_app.py` after looking at the
+  actual page makes it assignable.
+
+**1 still needs something outside the tool:** `p056` has no printed
+header block on its own first physical page at all — a real template/
+scan anomaly (already documented under "Round-scoped claiming... 2026-08-
+13" above), not a page-order or footer-confidence problem any of this
+session's fixes address. There is no worksheet-type, name, or date to
+read off that page at all, so nothing short of the physical original
+document (or some other out-of-band identification) can resolve it —
+correctly still held, for the correct remaining reason.
+
+**Separately, still open and unrelated to this session's own scope:** the
+19 unreviewed PRT packets and the 15 packets with no plausible roster
+match (both pre-existing, need real human review time, not a code fix);
+the seven real duplicate-decisions-within-round pairs found in Fix 5
+above, which need a human to look at the actual pages and decide which
+(if either) confirmation for each pair is correct before a real run for
+010406 should happen at all.
+
 ## Working preferences
 
 - Calibrate against real measured data, not assumptions — when a

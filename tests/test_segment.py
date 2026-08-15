@@ -7,6 +7,7 @@ from melredact.segment import (
     _assign_words_to_rows,
     _parse_worksheet_type,
     extract_header_fields,
+    find_reversed_continuation_header_pairs,
     is_header_page,
     segment_pdf,
 )
@@ -16,6 +17,7 @@ from tests.make_fixture import (
     build_footer_edge_case_fixture,
     build_main_fixture,
     build_packet_heavy_fixture,
+    build_reversed_pair_fixture,
 )
 
 
@@ -289,3 +291,69 @@ def test_illegible_name_is_still_captured_verbatim_for_matching(main_fixture):
         packet = next(p for p, s in zip(result.packets, PACKETS) if s.tag == "illegible_scrawl")
         fields = extract_header_fields(pdf.pages[packet.header_page_index])
     assert fields.name_text == "S 8"
+
+
+@pytest.fixture(scope="module")
+def reversed_pair_pdf(tmp_path_factory):
+    return build_reversed_pair_fixture(tmp_path_factory.mktemp("reversed_pair"))
+
+
+def test_reversed_continuation_header_pair_reported_as_two_broken_packets(reversed_pair_pdf):
+    """Baseline, unfixed shape: natural physical order reports the
+    continuation page as an orphan (missing its header) and the header
+    page as its own packet short one page -- segment_pdf's own scan-order-
+    is-document-order assumption (see its module docstring) breaking
+    exactly as documented, not silently working around it."""
+    result = segment_pdf(reversed_pair_pdf)
+    orphan = next(p for p in result.packets if p.is_orphan)
+    assert orphan.page_indices == [2]
+    assert "continuation page with no preceding header" in " ".join(orphan.issues)
+
+    header_only = next(p for p in result.packets if p.header_page_index == 3)
+    assert header_only.page_indices == [3]
+    assert "footer declared 2" in " ".join(header_only.issues)
+
+
+def test_find_reversed_continuation_header_pairs_detects_the_swap(reversed_pair_pdf):
+    """The proposal itself: names the exact continuation/header physical
+    indices and their agreed-on declared total, computed purely by reading
+    segment_pdf's own already-produced orphan/header-started packets --
+    never mutates anything."""
+    result = segment_pdf(reversed_pair_pdf)
+    suggestions = find_reversed_continuation_header_pairs(result)
+    assert len(suggestions) == 1
+    assert suggestions[0].continuation_page_index == 2
+    assert suggestions[0].header_page_index == 3
+    assert suggestions[0].declared_total == 2
+
+    # A normal, unaffected file has nothing to suggest.
+    assert find_reversed_continuation_header_pairs(segment_pdf(build_main_fixture(reversed_pair_pdf.parent / "control").pdf_path)) == []
+
+
+def test_page_sequence_override_fixes_the_reversed_pair(reversed_pair_pdf):
+    """Applying the proposed fix (process the header page immediately
+    before the continuation page) via segment_pdf's own `page_sequence`
+    parameter must produce one clean, issue-free packet -- proving the
+    override actually re-groups the pages, not just relabels them."""
+    fixed = segment_pdf(reversed_pair_pdf, page_sequence=[0, 1, 3, 2])
+    assert len(fixed.packets) == 2  # the control packet, plus the now-merged pair
+    merged = next(p for p in fixed.packets if p.header_page_index == 3)
+    assert merged.page_indices == [3, 2]
+    assert merged.is_orphan is False
+    assert merged.issues == []
+    assert fixed.page_count == 4  # true physical count, unchanged by the override
+
+    # Nothing about this override is auto-discovered -- the identical,
+    # unmodified fixture still reports the original break when segmented
+    # without it.
+    assert segment_pdf(reversed_pair_pdf).packets != fixed.packets
+
+
+def test_page_sequence_excluding_a_page_leaves_it_unassigned(reversed_pair_pdf):
+    """A page left out of `page_sequence` entirely is processed by
+    nothing -- the "remove this page" outcome the page composition editor's
+    own remove control relies on (see review_app.py's _sequence_remove)."""
+    result = segment_pdf(reversed_pair_pdf, page_sequence=[0, 1, 3])
+    all_pages = {idx for p in result.packets for idx in p.page_indices}
+    assert 2 not in all_pages
+    assert result.page_count == 4

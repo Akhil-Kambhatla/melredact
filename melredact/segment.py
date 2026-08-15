@@ -115,6 +115,26 @@ class SegmentResult:
     page_count: int
 
 
+@dataclass
+class ReversalSuggestion:
+    """A proposed fix for the simplest scanner page-order defect this
+    project has seen reported: a continuation page's own footer ('page 2
+    of 2') physically scanned immediately *before* the header page it
+    actually belongs after ('page 1 of 2') -- segment_pdf's own scan-
+    order-is-document-order assumption (see this module's docstring)
+    reports the continuation page as an unsegmentable orphan and the
+    header page as if it starts an otherwise-normal packet, even though
+    the two pages' own footers agree on a single, consistent packet once
+    read in the other order. Never auto-applied -- see review_app.py's
+    page composition editor, which surfaces this as something a reviewer
+    confirms before segmentation is ever re-run with a corrected page
+    order (`page_sequence`, below)."""
+
+    continuation_page_index: int
+    header_page_index: int
+    declared_total: int
+
+
 def _normalize_word(text: str) -> str:
     return text.strip().lower()
 
@@ -359,12 +379,35 @@ def extract_header_fields(page: pdfplumber.page.Page) -> HeaderFields:
     )
 
 
-def segment_pdf(pdf_path: str | Path, *, orientation_overrides: dict[int, int] | None = None) -> SegmentResult:
+def segment_pdf(
+    pdf_path: str | Path,
+    *,
+    orientation_overrides: dict[int, int] | None = None,
+    page_sequence: list[int] | None = None,
+) -> SegmentResult:
     """Group pages into packets using the footer as ground truth. A header
     page always starts a new packet. A continuation-looking page with no
     open packet (missing page 1) becomes its own flagged, orphaned packet
     rather than being silently merged into whatever came before or dropped.
     Nothing here infers a page count that isn't printed on the page.
+
+    `page_sequence`, when given, is the physical page indices to process,
+    in the order to process them -- a human-confirmed correction for a
+    scanner that reversed page order (see review_app.py's page composition
+    editor and `find_reversed_continuation_header_pairs`), never inferred
+    automatically. Defaults to `None`, meaning "physical order" (`list(
+    range(page_count))`), the only behavior this function had before this
+    parameter existed -- every existing caller keeps computing the exact
+    same result. A page excluded from `page_sequence` is processed by
+    nothing (not assigned to any packet) -- the same "remove this page"
+    outcome the editor's own remove control produces; `page_count` on the
+    returned `SegmentResult` is still the PDF's true physical page count
+    either way, not `len(page_sequence)`, since it describes the file, not
+    this run's chosen processing order. This only ever changes which
+    physical pages get grouped into which packet -- `Packet.page_indices`
+    still holds real physical indices throughout, so every downstream
+    consumer (rendering, OCR, redaction) that already reads a page by its
+    physical index needs no awareness of this parameter at all.
 
     `open_pdf` (see pdfio.py) already normalizes every confidently-
     classifiable, human-confirmed, or human-corrected page to upright
@@ -395,7 +438,9 @@ def segment_pdf(pdf_path: str | Path, *, orientation_overrides: dict[int, int] |
     pending_confirmation = set(orientation_result.pending_confirmation_page_indices())
     orientation_by_page = orientation_result.by_page()
     with open_pdf(pdf_path, orientation_overrides=orientation_overrides) as pdf:
-        pages_info = [(idx, is_header_page(page), read_footer(page)) for idx, page in enumerate(pdf.pages)]
+        true_page_count = len(pdf.pages)
+        order = page_sequence if page_sequence is not None else range(true_page_count)
+        pages_info = [(idx, is_header_page(pdf.pages[idx]), read_footer(pdf.pages[idx])) for idx in order]
 
     packets: list[Packet] = []
     current: Packet | None = None
@@ -498,4 +543,33 @@ def segment_pdf(pdf_path: str | Path, *, orientation_overrides: dict[int, int] |
                     "control to confirm or correct this page's orientation before it can be processed"
                 )
 
-    return SegmentResult(packets=packets, page_count=len(pages_info))
+    return SegmentResult(packets=packets, page_count=true_page_count)
+
+
+def find_reversed_continuation_header_pairs(segmented: SegmentResult) -> list[ReversalSuggestion]:
+    """Scans an already-segmented (natural physical order) result for the
+    reversed-scan-order shape described in `ReversalSuggestion`'s own
+    docstring: a single-page orphan packet (a continuation page with no
+    preceding header) whose very next physical page is a header page whose
+    own declared total page count agrees with the orphan's. Reuses
+    segment_pdf's own output rather than re-simulating its state machine --
+    an orphan packet and a header-started packet are exactly the two
+    symptoms this defect produces, already computed. Returns proposals in
+    physical page order; never mutates `segmented` or applies anything."""
+    suggestions: list[ReversalSuggestion] = []
+    header_starts = {p.header_page_index: p for p in segmented.packets if p.header_page_index is not None}
+    for p in segmented.packets:
+        if not (p.is_orphan and p.n_pages == 1 and p.declared_total is not None):
+            continue
+        continuation_idx = p.page_indices[0]
+        header_packet = header_starts.get(continuation_idx + 1)
+        if header_packet is None or header_packet.declared_total != p.declared_total:
+            continue
+        suggestions.append(
+            ReversalSuggestion(
+                continuation_page_index=continuation_idx,
+                header_page_index=continuation_idx + 1,
+                declared_total=p.declared_total,
+            )
+        )
+    return suggestions

@@ -130,10 +130,14 @@ from melredact.pipeline import (
     filter_packets_by_round,
     format_hold_analysis_report,
     format_preflight_report,
+    load_composition_overrides,
     load_decisions,
     load_detection_overrides,
+    duplicate_decisions_within_round,
+    format_duplicate_decisions_report,
     load_manual_geometry,
     load_orientation_overrides,
+    load_page_order,
     packet_tag,
     render_preflight_contact_sheet,
     run_dispositions,
@@ -141,7 +145,7 @@ from melredact.pipeline import (
 )
 from melredact.redact import verify_no_leaked_names
 from melredact.roster import RosterError, infer_period_from_filename, load_full_roster, load_roster
-from melredact.segment import segment_pdf
+from melredact.segment import find_reversed_continuation_header_pairs, segment_pdf
 
 
 def _add_common_args(parser: argparse.ArgumentParser) -> None:
@@ -175,13 +179,18 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # every packet built from a confirmed/corrected page reads correctly
     # from the start rather than being (re-)flagged as unresolved here.
     orientation_overrides = load_orientation_overrides(pdf_path, decisions_dir=Path(args.decisions))
+    # A human-confirmed page-order correction (see review_app.py's page
+    # composition editor and segment.segment_pdf's own `page_sequence`
+    # parameter) -- None (the overwhelmingly common case) means "natural
+    # physical order", segment_pdf's own existing default.
+    page_sequence = load_page_order(pdf_path, decisions_dir=Path(args.decisions))
 
     # Segmented once, up front, and reused everywhere else in this command
     # (block-date collection, round grouping, run_dispositions itself) --
     # segmentation is cheap on its own, but re-segmenting needlessly would
     # also mean re-deriving packet identity (packet_tag) from scratch each
     # time, which is only ever safe when it's the exact same SegmentResult.
-    segmented = segment_pdf(pdf_path, orientation_overrides=orientation_overrides)
+    segmented = segment_pdf(pdf_path, orientation_overrides=orientation_overrides, page_sequence=page_sequence)
 
     pending_rotation = [
         p for p in segmented.packets if any("not yet confirmed by a reviewer" in i for i in p.issues)
@@ -191,6 +200,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
             f"note: {len(pending_rotation)} packet(s) have a page with a confident but unconfirmed "
             "rotation guess -- use review_app.py's rotate control to confirm or correct before this "
             f"run can process them: {[Path(pdf_path).stem + f'_p{p.page_indices[0]:03d}' for p in pending_rotation]}"
+        )
+
+    reversal_suggestions = find_reversed_continuation_header_pairs(segmented)
+    if reversal_suggestions:
+        print(
+            f"note: {len(reversal_suggestions)} continuation-before-header page pair(s) look reversed "
+            "(consistent footer sequence read in the other order) -- use review_app.py's page "
+            f"composition editor to review and apply: "
+            f"{[(s.continuation_page_index, s.header_page_index) for s in reversal_suggestions]}"
         )
 
     round_groups = collect_packet_rounds(pdf_path, segmented=segmented, orientation_overrides=orientation_overrides)
@@ -322,6 +340,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return 1
     decisions = load_decisions(pdf_path, decisions_dir=Path(args.decisions))
     detection_overrides = load_detection_overrides(pdf_path, decisions_dir=Path(args.decisions))
+    composition_overrides = load_composition_overrides(pdf_path, decisions_dir=Path(args.decisions))
     manual_geometry = load_manual_geometry(pdf_path, decisions_dir=Path(args.decisions))
 
     if resolved_block is not None:
@@ -345,6 +364,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
             f'  streamlit run review_app.py -- "{pdf_path}" "{roster_path}"'
         )
 
+    duplicate_decisions = duplicate_decisions_within_round(decisions, round_labels)
+    print()
+    print(format_duplicate_decisions_report(duplicate_decisions))
+
     results = run_dispositions(
         pdf_path,
         run_segmented,
@@ -353,6 +376,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         out_dir=out_dir,
         flatten=args.flatten,
         detection_overrides=detection_overrides,
+        composition_overrides=composition_overrides,
         round_labels=round_labels,
         allow_delete=not args.no_delete,
         manual_geometry=manual_geometry,
@@ -418,7 +442,8 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         return 1
 
     orientation_overrides = load_orientation_overrides(pdf_path, decisions_dir=Path(args.decisions))
-    segmented = segment_pdf(pdf_path, orientation_overrides=orientation_overrides)
+    page_sequence = load_page_order(pdf_path, decisions_dir=Path(args.decisions))
+    segmented = segment_pdf(pdf_path, orientation_overrides=orientation_overrides, page_sequence=page_sequence)
     round_groups = collect_packet_rounds(pdf_path, segmented=segmented, orientation_overrides=orientation_overrides)
     print(format_round_report(round_groups))
     round_labels = round_labels_by_tag(round_groups)
@@ -460,6 +485,7 @@ def _cmd_preflight(args: argparse.Namespace) -> int:
     # case for a brand-new file) just means no orientation overrides yet,
     # not an error.
     orientation_overrides = load_orientation_overrides(pdf_path, decisions_dir=Path(args.decisions))
+    page_sequence = load_page_order(pdf_path, decisions_dir=Path(args.decisions))
 
     try:
         roster = load_roster(roster_path, period=args.period, infer_period_from=pdf_path)
@@ -467,7 +493,9 @@ def _cmd_preflight(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    report = run_preflight(pdf_path, roster, period=args.period, orientation_overrides=orientation_overrides)
+    report = run_preflight(
+        pdf_path, roster, period=args.period, orientation_overrides=orientation_overrides, page_sequence=page_sequence
+    )
     print(format_preflight_report(report))
 
     if not args.no_contact_sheet:

@@ -143,6 +143,26 @@ RENDER_DPI_FINAL = 300
 RENDER_DPI_PREVIEW = 150
 STAMP_FONT_SIZE_PT = 22
 
+# The manual-redaction editor's two panes (original + live preview, see
+# review_app.py's _render_manual_editor) render both the st_canvas drawing
+# surface AND the plain st.image preview at this same fixed pixel width,
+# computed per-page from the page's own point-width rather than always
+# reusing RENDER_DPI_PREVIEW -- found 2026-08-15, real-reviewer-reported
+# bug: st_canvas renders its declared width/height as a literal pixel size
+# (no CSS-driven scaling), while a plain st.image with no explicit width
+# defaults to 'content' sizing, which a container narrower than the image
+# silently shrinks via max-width CSS. Two images of the *same* page shown
+# side by side at two different effective on-screen sizes is what a
+# reviewer sees as "misaligned, and shifts between renders" -- the shift
+# is real browser layout reflow (sidebar state, scrollbar presence)
+# changing the *container's* width from render to render, which only ever
+# moved the CSS-scaled pane, never the fixed-pixel canvas. Fix: pick an
+# editor-specific DPI per page so both the canvas and the preview image
+# render at this literal target width already, with an explicit `width=`
+# on the preview's st.image call too -- neither pane is ever left to a
+# container-relative size that can drift.
+MANUAL_EDITOR_TARGET_WIDTH_PX = 700
+
 # --- Redaction ---
 # Solid fill drawn over the destroyed region, plus a visible stamp so a
 # reviewer can see at a glance that redaction happened (vs. a blank field).

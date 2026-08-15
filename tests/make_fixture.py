@@ -632,6 +632,107 @@ def build_footer_edge_case_fixture(out_dir: Path) -> Path:
     return pdf_path
 
 
+def build_reversed_pair_fixture(out_dir: Path) -> Path:
+    """Isolated fixture for the reversed-scan-order defect (see segment.
+    find_reversed_continuation_header_pairs and CLAUDE.md's page
+    composition editor writeup): a scanner that fed a packet's
+    continuation page ahead of its own header page. Physical page order is
+    [normal 2-page packet, continuation page 'Page 2 of 2', header page
+    'Page 1 of 2'] -- the continuation and header footers agree on a
+    single, consistent packet (same declared total), just scanned in the
+    wrong physical order. Names reused from the main fixture's own roster
+    (Jordan Ames, Priya Chandra -- both real entries in ROSTER above) so
+    callers that need a roster can reuse build_main_fixture's without
+    building a second one."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = out_dir / "reversed_pair.pdf"
+    builder = PdfBuilder()
+
+    def header_page(name: str, marker: str):
+        img = render_header_image(
+            name_text=name,
+            teacher_text="Hannel",
+            group_text="none",
+            date_text="10/03/2025",
+            period_text="02",
+            worksheet_type=WORKSHEET_TYPE_TEXT,
+            page_marker=marker,
+            shade_blank_rows=False,
+        )
+        items = [
+            InvisibleText("Name:", NAME_ANCHOR["x0"], NAME_ANCHOR["top"], 9),
+            InvisibleText(name, 150, NAME_ANCHOR["top"]),
+            InvisibleText(WORKSHEET_TYPE_TEXT, FOOTER_WORKSHEET_TYPE["x0"], FOOTER_WORKSHEET_TYPE["top"], 9),
+            InvisibleText(marker, FOOTER_PAGE_MARKER["x0"], FOOTER_PAGE_MARKER["top"], 9),
+        ]
+        return img, items
+
+    def continuation_page(marker: str):
+        img = render_continuation_image(worksheet_type=WORKSHEET_TYPE_TEXT, page_marker=marker)
+        items = [
+            InvisibleText(WORKSHEET_TYPE_TEXT, FOOTER_WORKSHEET_TYPE["x0"], FOOTER_WORKSHEET_TYPE["top"], 9),
+            InvisibleText(marker, FOOTER_PAGE_MARKER["x0"], FOOTER_PAGE_MARKER["top"], 9),
+        ]
+        return img, items
+
+    # Packet A: normal, unaffected control packet -- physical pages 0-1.
+    builder.add_page(*header_page("Jordan Ames", "Page 1 of 2"))
+    builder.add_page(*continuation_page("Page 2 of 2"))
+
+    # The reversed pair: continuation physically first (page 2), header
+    # physically second (page 3).
+    builder.add_page(*continuation_page("Page 2 of 2"))
+    builder.add_page(*header_page("Priya Chandra", "Page 1 of 2"))
+
+    builder.save(pdf_path)
+    return pdf_path
+
+
+def build_unreadable_continuation_footer_fixture(out_dir: Path) -> Path:
+    """The real p086 shape (see CLAUDE.md's "unreadable footers should not
+    block a human who can see the page" section): a 2-page packet whose
+    HEADER page is entirely normal (readable footer, real name) but whose
+    CONTINUATION page's own footer marker is blank -- unreadable. segment.py
+    still finds the header, sets a real worksheet_type from its own
+    readable footer, and correctly appends the continuation page to the
+    packet -- but flags "unreadable footer, cannot verify sequence" and
+    "packet has 2 page(s) but footer declared 2"-consistent totals stay
+    fine, only the *sequence* confidence is in question, since nothing on
+    the continuation page proves it's really page 2 of this packet rather
+    than some other page. Redaction itself is unaffected (only the header
+    page carries anything to redact), so this is exactly the "confidence
+    problem, not a leak" case a human looking at the actual page can
+    resolve just by reading it."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = out_dir / "unreadable_continuation_footer.pdf"
+    builder = PdfBuilder()
+
+    img = render_header_image(
+        name_text="Jordan Ames",
+        teacher_text="Hannel",
+        group_text="none",
+        date_text="10/03/2025",
+        period_text="02",
+        worksheet_type=WORKSHEET_TYPE_TEXT,
+        page_marker="Page 1 of 2",
+        shade_blank_rows=False,
+    )
+    items = [
+        InvisibleText("Name:", NAME_ANCHOR["x0"], NAME_ANCHOR["top"], 9),
+        InvisibleText("Jordan Ames", 150, NAME_ANCHOR["top"]),
+        InvisibleText(WORKSHEET_TYPE_TEXT, FOOTER_WORKSHEET_TYPE["x0"], FOOTER_WORKSHEET_TYPE["top"], 9),
+        InvisibleText("Page 1 of 2", FOOTER_PAGE_MARKER["x0"], FOOTER_PAGE_MARKER["top"], 9),
+    ]
+    builder.add_page(img, items)
+
+    cont_img = render_continuation_image(worksheet_type=WORKSHEET_TYPE_TEXT, page_marker="")
+    cont_items = [InvisibleText(WORKSHEET_TYPE_TEXT, FOOTER_WORKSHEET_TYPE["x0"], FOOTER_WORKSHEET_TYPE["top"], 9)]
+    builder.add_page(cont_img, cont_items)
+
+    builder.save(pdf_path)
+    return pdf_path
+
+
 def build_preflight_fixture(out_dir: Path) -> tuple[Path, Path]:
     """Small, purpose-built fixture for preflight's own tests: three
     independent, deterministic signals in one file, none of them needing
