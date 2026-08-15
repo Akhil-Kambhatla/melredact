@@ -6,18 +6,23 @@ from melredact.segment import (
     HeaderAnchors,
     _assign_words_to_rows,
     _parse_worksheet_type,
+    _words_to_text,
     extract_header_fields,
     find_reversed_continuation_header_pairs,
     is_header_page,
+    read_footer,
     segment_pdf,
 )
 from tests.make_fixture import (
     HEAVY_PACKETS,
     PACKETS,
+    InvisibleText,
+    PdfBuilder,
     build_footer_edge_case_fixture,
     build_main_fixture,
     build_packet_heavy_fixture,
     build_reversed_pair_fixture,
+    render_continuation_image,
 )
 
 
@@ -357,3 +362,70 @@ def test_page_sequence_excluding_a_page_leaves_it_unassigned(reversed_pair_pdf):
     all_pages = {idx for p in result.packets for idx in p.page_indices}
     assert 2 not in all_pages
     assert result.page_count == 4
+
+
+def test_footer_worksheet_type_words_splits_by_column_not_row():
+    """Real bug, found 2026-08-15 on `010406_PD1_PRT.pdf` physical page 86
+    (0-indexed 85, a real 180-degree-rotated page): OCR measured "Page 1
+    of 2" and "PRT 01 2024" only 0.7pt apart *vertically* -- close enough
+    that `_words_to_text`'s plain `(top, x0)` sort (which assumes the
+    worksheet-type line always measures comfortably *above* the page-
+    marker line, true on ordinary real pages by ~10-12pt) interleaved them
+    into "Page 1 of 2 PRT 01 2024", which `_parse_worksheet_type`'s own
+    regex then greedily over-captured as "Page 1 of 2 PRT" instead of
+    "PRT". Reproduces the exact real word geometry directly (top values
+    0.7pt apart, real x0s from the actual page) at the word-list level, so
+    this test exercises the same code path a real OCR'd scan does -- a
+    fixture with a native text layer would go through pdfplumber's own
+    `extract_text()` instead and wouldn't reproduce the bug at all, since
+    `extract_text()`'s own line-clustering doesn't have this failure mode."""
+    from melredact.config import FOOTER_PAGE_MARKER, FOOTER_WORKSHEET_TYPE
+
+    words = [
+        {"text": "Page", "top": 736.0, "x0": 526.6},
+        {"text": "1", "top": 736.0, "x0": 554.9},
+        {"text": "of", "top": 736.0, "x0": 564.2},
+        {"text": "2", "top": 736.0, "x0": 576.0},
+        {"text": "PRT", "top": 736.7, "x0": 44.9},
+        {"text": "01", "top": 736.7, "x0": 72.2},
+        {"text": "2024", "top": 736.7, "x0": 88.3},
+    ]
+    assert FOOTER_WORKSHEET_TYPE["x1"] < FOOTER_PAGE_MARKER["x0"]  # columns genuinely don't overlap
+
+    # The bug, demonstrated directly: parsing the *unsplit* blob (the old
+    # behavior) over-captures past "PRT" into the page-marker text.
+    buggy = _parse_worksheet_type(_words_to_text(words))
+    assert buggy == "PAGE_1_OF_2_PRT"
+
+    # The fix: splitting by column before parsing recovers "PRT" cleanly.
+    from melredact.segment import _footer_worksheet_type_words
+
+    fixed = _parse_worksheet_type(_words_to_text(_footer_worksheet_type_words(words)))
+    assert fixed == "PRT"
+
+
+def test_worksheet_type_parses_correctly_when_page_marker_and_type_share_a_row(tmp_path):
+    """End-to-end sanity check on top of the direct unit test above: a
+    fixture built with the same shared-row geometry, read through the real
+    `read_footer` entry point, must still resolve to "PRT" (this fixture
+    carries a native text layer, so it exercises the `page.chars` branch
+    -- a different code path than the real bug's own OCR branch, but
+    `read_footer` now runs both through the same anchor-relative
+    extraction, so there's no reason for the two branches to disagree)."""
+    from melredact.config import FOOTER_PAGE_MARKER, FOOTER_WORKSHEET_TYPE
+
+    shared_top = FOOTER_WORKSHEET_TYPE["top"]
+    img = render_continuation_image(worksheet_type="PRT (01/2024)", page_marker="Page 1 of 2")
+    items = [
+        InvisibleText("PRT 01 2024", FOOTER_WORKSHEET_TYPE["x0"], shared_top, 9),
+        InvisibleText("Page 1 of 2", FOOTER_PAGE_MARKER["x0"], shared_top, 9),
+    ]
+    builder = PdfBuilder()
+    builder.add_page(img, items)
+    pdf_path = tmp_path / "shared_row_footer.pdf"
+    builder.save(pdf_path)
+
+    with pdfplumber.open(pdf_path) as pdf:
+        info = read_footer(pdf.pages[0])
+    assert info.worksheet_type == "PRT"
+    assert info.page_num == 1 and info.page_total == 2 and info.readable

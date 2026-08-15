@@ -129,6 +129,33 @@ def test_preflight_reports_rotation_unsegmentable_and_no_match_packets(tmp_path)
     assert sheet_path is not None and sheet_path.exists()
 
 
+def test_preflight_honors_composition_overrides(tmp_path):
+    """A packet a human has already confirmed the composition for (see
+    pipeline.composition_overrides) must report unblocked in preflight
+    too, not just in a real run -- otherwise the verdict a human sees
+    before reviewing would disagree with what a real run actually does
+    with the confirmation already on record. Packet D (build_preflight_
+    fixture's own unreadable-continuation-footer packet) is exactly the
+    composition-confirmable shape."""
+    pdf_path, roster_path = build_preflight_fixture(tmp_path / "fixture")
+    roster = load_roster(roster_path)
+
+    baseline = run_preflight(pdf_path, roster)
+    other_blocked = other_blocked_packets(baseline)
+    assert len(other_blocked) == 1
+    tag = other_blocked[0].packet_tag
+    assert other_blocked[0].blocked
+
+    confirmed = run_preflight(pdf_path, roster, composition_overrides={tag})
+    packet = next(p for p in confirmed.packets if p.packet_tag == tag)
+    assert packet.composition_confirmed
+    assert not packet.blocked
+    assert confirmed.n_cannot_process == baseline.n_cannot_process - 1
+
+    text = format_preflight_report(confirmed)
+    assert tag not in "\n".join(str(p) for p in other_blocked_packets(confirmed))
+
+
 def test_preflight_populates_the_same_cache_the_real_run_reads(tmp_path, monkeypatch):
     fixture = build_main_fixture(tmp_path / "fixture")
     roster = load_roster(fixture.roster_path)

@@ -4294,6 +4294,134 @@ above, which need a human to look at the actual pages and decide which
 (if either) confirmation for each pair is correct before a real run for
 010406 should happen at all.
 
+## A real page-order/rotation correction applied to 010406, and a worksheet-type parsing bug found while applying it (2026-08-15, same day)
+
+**A human reviewer, using the review server this session's own fixes made
+possible, requested a specific structural correction for
+`010406_PD1_PRT.pdf`: swap physical pages 85 and 86 (1-indexed; 0-indexed
+84/85), confirm each is rotated 180° (already recorded from an earlier
+session), combine the two into one packet, and confirm pages 87/88
+(1-indexed; 0-indexed 86/87) belong together as one packet.** This maps
+exactly onto the real reversed-continuation-header pair and the real
+unreadable-continuation-footer packet this file's own preflight report
+already named (see the section above) — the rotation was already
+confirmed (`decisions/010406_PD1_PRT.orientation.json` already had `{"84":
+180, "85": 180}` from an earlier session), so applying this request meant:
+saving a `page_order` override moving physical page 85 immediately before
+84 (`pipeline.save_page_order`, the same mechanism "Apply suggested fix"
+in the page composition editor calls), and saving a `composition_
+overrides` entry for the `010406_PD1_PRT_p086` tag (the same mechanism the
+composition-override checkbox calls). Verified directly against the real
+file before persisting, not assumed: `segment_pdf(pdf_path,
+orientation_overrides=..., page_sequence=...)` produces `page_indices=
+[85, 84]`, `header_page_index=85`, `issues=[]` for the combined packet.
+
+**Applying it surfaced a second real bug, found while verifying, not
+assumed: the combined packet's `worksheet_type` parsed as
+`"PAGE_1_OF_2_PRT"` instead of `"PRT"`.** Root cause, confirmed by
+dumping the real footer-band words for physical page 85 (0-indexed) with
+their positions: `segment._words_to_text`'s plain `(top, x0)` sort
+assumes the worksheet-type line always measures comfortably *above* the
+page-marker line — true on every ordinary real page sampled (~10-12pt
+vertical gap, matching `config.py`'s own `FOOTER_WORKSHEET_TYPE`/
+`FOOTER_PAGE_MARKER` anchors, 11pt apart) — but false on this specific
+real, 180°-rotated page: OCR measured "Page 1 of 2" (top=736.0) and "PRT
+01 2024" (top=736.7) only 0.7pt apart vertically, close enough that the
+sort put "Page 1 of 2" first, producing the blob "Page 1 of 2 PRT 01
+2024". `_parse_worksheet_type`'s own regex (anchored to "everything from
+the start of the blob up to a dd/dddd-shaped date") then greedily
+captured "Page 1 of 2 PRT" instead of "PRT" — which would have misfiled
+this packet's real redacted output under a wrong `worksheet_type` path
+segment (`out/010406/01/PAGE_1_OF_2_PRT/...` instead of `.../PRT/...`)
+had it shipped as read, without ever raising or flagging anything.
+`PAGE_MARKER_PATTERN`'s own match (page 1 of 2) was unaffected by the
+same interleaving, since it searches the whole blob for a literal phrase
+rather than depending on blob order — only the worksheet-type extraction
+needed a fix.
+
+**First fix attempt (nearest-anchor by vertical position, mirroring
+`_assign_words_to_rows`' own established pattern) failed on this exact
+same real page, for the same underlying reason the bug exists at all: the
+page-marker line's own *measured* top (736.0) landed almost exactly on
+the worksheet-type anchor's *configured* top (736), not anywhere near its
+own (747)** — whatever this page's rotation/OCR quirk is, it moved the
+page-marker text's apparent vertical position outright, not just closed
+the normal gap, so a vertical-distance test misclassified the page-marker
+words as worksheet-type words too.
+
+**Fixed correctly: `segment._footer_worksheet_type_words` splits by
+horizontal position instead** — worksheet-type prints in the left margin
+(x0 27-88 on every real page checked, including this one), page-marker
+prints in the right margin (x0 512-576) — genuinely different columns,
+never scrambled by whatever vertical-measurement noise broke the top-based
+split. Split point is the midpoint between `FOOTER_WORKSHEET_TYPE["x1"]`
+and `FOOTER_PAGE_MARKER["x0"]`. `read_footer` now extracts `worksheet_
+type` from just these column-filtered words (`_parse_worksheet_type(
+_words_to_text(_footer_worksheet_type_words(page_words(page, bbox))))`)
+instead of the same flat blob `PAGE_MARKER_PATTERN` searches — the same
+disk-cached OCR call `page_words` already makes on the OCR path (identical
+bbox), so this costs nothing extra once warm. Verified directly: real
+pages 0, 2, 85, 86 (0-indexed) all now read `worksheet_type == "PRT"`,
+where page 85 previously read `"PAGE_1_OF_2_PRT"`.
+
+**Testing note: a synthetic fixture with a native invisible text layer
+cannot reproduce this bug at all**, and an end-to-end `read_footer` test
+built that way (`test_worksheet_type_parses_correctly_when_page_marker_
+and_type_share_a_row`) passes whether or not the fix is applied — because
+`page.chars` being truthy routes through pdfplumber's own `extract_text()`
+for the blob (not `_words_to_text`), and `extract_text()`'s own internal
+line-clustering doesn't share this failure mode. The real regression
+proof (`test_footer_worksheet_type_words_splits_by_column_not_row`,
+`tests/test_segment.py`) reproduces the exact real word geometry (top
+values 0.7pt apart, real x0s) directly at the word-list level, bypassing
+the `page.chars` dispatch entirely — demonstrating the bug (`_parse_
+worksheet_type(_words_to_text(words))` returns `"PAGE_1_OF_2_PRT"`) and
+the fix (`_footer_worksheet_type_words` first recovers `"PRT"`) in the
+same test. The fixture-based end-to-end test is kept as a secondary sanity
+check, not the regression proof.
+
+**`composition_overrides` was also wired into `run_preflight`, closing a
+gap found while re-verifying the real file end to end.** `preflight` was
+already override-aware for orientation and page-order (both loaded from
+`decisions_dir` and threaded through, see the sections above), but a
+packet a human had confirmed the *composition* for still reported
+`blocked` in preflight's own verdict, disagreeing with what a real run
+would actually do with that same confirmation on record. Fixed:
+`PreflightPacket` gained a `composition_confirmed` field, and its
+`blocked` property now mirrors `run_dispositions`' own release logic
+exactly (`is_composition_confirmable_issue` on every one of the packet's
+issues, same as a real run) — an orientation or worksheet-type issue
+still blocks regardless, same as a real run. `run_preflight` takes a new
+`composition_overrides` parameter (loaded and threaded through in
+`cli.py`'s `_cmd_preflight`, mirroring how orientation/page-order overrides
+already load there). Test: `test_preflight_honors_composition_overrides`
+(`tests/test_preflight.py`).
+
+**Real result, confirmed by re-running `cli.py preflight` against the
+unmodified real file after all of the above:** the "Page-count vs.
+footer" section now reports 0 disagreeing (was 2 — `p084`/`p085`), the
+"Unsegmentable packets" section now reports only `p056` (was 2 — `p084`'s
+own orphan status is gone, since it's no longer orphaned, it's merged),
+and "Other blocked packets" is now empty (was `p086`). **Verdict: 13 would
+process cleanly, 32 would need a human in the editor, 1 cannot be
+processed without a fix** — down from the pre-session baseline's 3 (or,
+correctly itemized, 4) unprocessable packets to exactly the one (`p056`)
+that has no printed header at all and genuinely needs something outside
+this tool. Both new sidecar files (`decisions/010406_PD1_PRT.page_order.
+json`, `decisions/010406_PD1_PRT.composition_overrides.json`) are real,
+human-directed state now on disk for this teacher — **nothing was written
+to `out/`, redacted, or shipped as part of this** — these two files only
+change how segmentation groups pages and which structural hold a real run
+would release; a real run for 010406 still needs the same explicit
+human-initiated step it always has.
+
+The review server (port 8503, `data/PRT/010406_PD1_PRT.pdf`, all 47→46
+packets) was restarted after these code changes, since Python's own
+module cache means an already-running process doesn't pick up an edited
+`.py` file's new code the way Streamlit's script-level auto-rerun picks up
+changed *script* logic — a correctness-relevant fix like this one needs an
+actual process restart, not just a browser reload, to take effect.
+
 ## Working preferences
 
 - Calibrate against real measured data, not assumptions — when a

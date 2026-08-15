@@ -35,6 +35,8 @@ from melredact.config import (
     COLUMN_SPLIT_X,
     DATE_LABEL_WORDS,
     FOOTER_BAND_TOP,
+    FOOTER_PAGE_MARKER,
+    FOOTER_WORKSHEET_TYPE,
     GROUP_ANCHOR,
     GROUP_ANCHOR_WORDS,
     GROUP_LABEL_WORDS,
@@ -169,6 +171,47 @@ def _words_to_text(words: list[Word]) -> str:
     return " ".join(w["text"] for w in sorted(words, key=lambda w: (w["top"], w["x0"])))
 
 
+def _footer_worksheet_type_words(words: list[Word]) -> list[Word]:
+    """Just the footer-band words left of the midpoint between the
+    worksheet-type anchor's own right edge and the page-marker anchor's
+    own left edge -- i.e. words horizontally in the worksheet-type
+    column, never the page-marker column, regardless of vertical (top)
+    measurement.
+
+    Found real, 2026-08-15: `_words_to_text`'s plain `(top, x0)` sort
+    assumes the worksheet-type line always measures comfortably *above*
+    the page-marker line (true on the overwhelming majority of real pages
+    -- config.py's own anchors put them ~11pt apart vertically, and
+    ordinary real pages measure a similar gap). That assumption failed on
+    a real, 180°-rotated page (`010406_PD1_PRT.pdf`, 0-indexed page 85):
+    OCR measured "Page 1 of 2" and "PRT 01 2024" only 0.7pt apart
+    *vertically*, close enough that the plain sort interleaved them into
+    "Page 1 of 2 PRT 01 2024" -- `_parse_worksheet_type`'s own regex,
+    anchored to "start of blob until a dd/dddd-shaped date", then greedily
+    captured "Page 1 of 2 PRT" instead of "PRT", which would have misfiled
+    this packet's real output under a wrong worksheet_type path segment
+    had it shipped as read.
+
+    A first fix attempt split words by nearest *vertical* anchor (mirroring
+    `_assign_words_to_rows`' own nearest-anchor pattern) and failed on this
+    same real page for the same underlying reason the bug exists at all:
+    the page-marker text's own *measured* top (736.0) sat almost exactly
+    at the worksheet-type anchor's configured top (736), not anywhere near
+    its own (747) -- whatever this specific rotated page's OCR/geometry
+    quirk is, it moved the page-marker line's apparent vertical position,
+    not just closed the gap. Horizontal position is what's actually
+    reliable here: worksheet-type prints in the left margin (x0 27-88 on
+    every real page sampled, including this one), page-marker prints in
+    the right margin (x0 512-576) -- genuinely different columns, never
+    scrambled by the same vertical-measurement noise that broke the
+    top-based split. `PAGE_MARKER_PATTERN`'s own match is unaffected by
+    either version of this bug (it searches the whole blob for a literal
+    "Page N of N" phrase, not order-sensitive), so only the worksheet-type
+    extraction ever needed this fix."""
+    split_x = (FOOTER_WORKSHEET_TYPE["x1"] + FOOTER_PAGE_MARKER["x0"]) / 2
+    return [w for w in words if w["x0"] < split_x]
+
+
 def _parse_worksheet_type(text: str) -> str | None:
     """Extract and normalize the printed worksheet-type label (e.g. "PRT
     (01/2024)", "pcMEL MPR+ADR (06/2025)") from the footer band's own text
@@ -207,7 +250,12 @@ def read_footer(page: pdfplumber.page.Page) -> FooterInfo:
     else:
         text = _words_to_text(page_words(page, bbox))
     matches = list(re.finditer(PAGE_MARKER_PATTERN, text))
-    worksheet_type = _parse_worksheet_type(text)
+    # Anchor-relative, not the same flat `text` blob PAGE_MARKER_PATTERN
+    # searches -- see _footer_worksheet_type_words' own docstring for the
+    # real page this distinction was found to matter on. Same disk-cached
+    # OCR call `page_words` already makes above on the OCR path (identical
+    # bbox), so this costs nothing extra once warm.
+    worksheet_type = _parse_worksheet_type(_words_to_text(_footer_worksheet_type_words(page_words(page, bbox))))
 
     if len(matches) != 1:
         # Zero matches: unreadable. More than one: ambiguous. Neither is

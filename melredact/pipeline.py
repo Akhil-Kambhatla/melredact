@@ -1705,6 +1705,7 @@ class PreflightPacket:
     consensus_hold: bool = False
     consensus_reason: str | None = None
     consensus_hold_pages: list[int] = field(default_factory=list)
+    composition_confirmed: bool = False
 
     @property
     def blocked(self) -> bool:
@@ -1714,8 +1715,20 @@ class PreflightPacket:
         controls before *anything* -- matching, redaction -- can even be
         attempted for this packet. Mirrors run_dispositions' own "a packet
         with unresolved issues is refused even if decisions names a SID
-        for it" rule."""
-        return bool(self.issues)
+        for it" rule -- including the one exception to it:
+        `composition_confirmed` (set when this tag is in the
+        `composition_overrides` set `run_preflight` was called with, see
+        pipeline.composition_overrides' own docstring) releases this the
+        same way it releases run_dispositions' own hold, and only when
+        every one of this packet's own issues is one `is_composition_
+        confirmable_issue` recognizes -- an orientation or worksheet-type
+        issue still blocks regardless of this override, same as a real
+        run."""
+        if not self.issues:
+            return False
+        if self.composition_confirmed and all(is_composition_confirmable_issue(i) for i in self.issues):
+            return False
+        return True
 
     @property
     def clean(self) -> bool:
@@ -1851,6 +1864,7 @@ def run_preflight(
     period: str | None = None,
     orientation_overrides: dict[int, int] | None = None,
     page_sequence: list[int] | None = None,
+    composition_overrides: set[str] = frozenset(),
     dpi: int = RENDER_DPI_FINAL,
 ) -> PreflightReport:
     """The preflight entry point -- see the module note above this section
@@ -1862,7 +1876,12 @@ def run_preflight(
     pdf's own parameter and pipeline.load_page_order) applies a human-
     confirmed page-order correction the same way orientation_overrides
     applies a human-confirmed rotation -- reported against, never inferred
-    here."""
+    here. `composition_overrides` is the same structural-confirmation
+    category as the other two (see PreflightPacket.blocked and pipeline.
+    composition_overrides) -- a packet a human has already confirmed the
+    composition for reports as unblocked here too, not just in a real
+    run, so the verdict a human sees before reviewing matches what a real
+    run would actually do with the confirmations already on record."""
     start = time.monotonic()
     pdf_path = Path(pdf_path)
 
@@ -1922,6 +1941,7 @@ def run_preflight(
                     consensus_hold=bool(tag_holds),
                     consensus_reason="; ".join(h.reason for h in tag_holds) if tag_holds else None,
                     consensus_hold_pages=sorted({h.physical_page_index for h in tag_holds}),
+                    composition_confirmed=tag in composition_overrides,
                 )
             )
 

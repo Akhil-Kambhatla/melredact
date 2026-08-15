@@ -486,6 +486,7 @@ def _cmd_preflight(args: argparse.Namespace) -> int:
     # not an error.
     orientation_overrides = load_orientation_overrides(pdf_path, decisions_dir=Path(args.decisions))
     page_sequence = load_page_order(pdf_path, decisions_dir=Path(args.decisions))
+    composition_overrides = load_composition_overrides(pdf_path, decisions_dir=Path(args.decisions))
 
     try:
         roster = load_roster(roster_path, period=args.period, infer_period_from=pdf_path)
@@ -494,7 +495,12 @@ def _cmd_preflight(args: argparse.Namespace) -> int:
         return 1
 
     report = run_preflight(
-        pdf_path, roster, period=args.period, orientation_overrides=orientation_overrides, page_sequence=page_sequence
+        pdf_path,
+        roster,
+        period=args.period,
+        orientation_overrides=orientation_overrides,
+        page_sequence=page_sequence,
+        composition_overrides=composition_overrides,
     )
     print(format_preflight_report(report))
 
