@@ -4645,6 +4645,287 @@ and were not regenerated or moved under the new hierarchy as part of
 this session. A future run for 010406 will write under the new,
 flatter path shape; nothing automatically migrates the older files.
 
+## The manual editor was hard-capped at two header boxes, and its canvas clipped part of the page (2026-08-15, same day)
+
+**Motivation: a real reviewer finished period 2 of teacher 010406's PRT
+scan through the review server and reported two concrete tool bugs, plus
+asked why two packets were held back.** Both bugs were real, both are
+fixed; the two held-back packets turned out to be an instance of exactly
+the first bug.
+
+**Bug 1: the manual editor silently dropped any header-page box past the
+second one drawn.** `redact_packet`/`render_redaction_preview`'s
+`header_bbox_override` parameter, and `review_app.py`'s own editor code
+computing it, were all typed and written around exactly two rectangles
+(`tuple[Bbox, Bbox]`) -- the automatic left-column-plus-overflow-strip
+pair `redact_bboxes_for_band` always produces (see "Two rectangles are
+redacted per header page" above). The manual editor seeds those same two
+boxes as a starting point, but a reviewer drawing a third box to cover
+ink outside that pair had it silently discarded in both the live preview
+and the actual applied redaction (`review_app.py` did `boxes[0], boxes[1]
+if len(boxes) >= 2 else ...` -- anything past index 1 was never read).
+This read as "I can draw two boxes... but not a third" and, worse, made
+it look like drawing simply didn't work in some cases: a reviewer trying
+to add a needed third box would see the click register but nothing
+change, because the extra geometry never reached the redaction call at
+all.
+
+**Fixed by generalizing the whole chain from a fixed pair to an
+arbitrary-length list**, not by raising a cap: `redact.
+find_uncovered_group_words(header_words, anchors, bboxes: list[Bbox])`,
+`redact_packet`/`render_redaction_preview`'s `header_bbox_override: list[
+Bbox] | None`, and `review_app.py`'s editor now pass `current_boxes`
+(however many are drawn) straight through, with no length check anywhere
+in the path. `RedactResult` gained `header_bboxes: list[Bbox]` (every box
+actually applied, in order) alongside the existing `redact_bbox`/
+`redact_strip_bbox` fields (kept, unchanged, as the list's first two
+entries -- every existing test built around the automatic two-box case
+reads them the same way it always did). The automatic path
+(`redact_bboxes_for_band`) still always returns exactly two boxes,
+unchanged -- this was never about the automatic geometry, only about what
+a human reviewer can add on top of it.
+
+**Bug 2: the editor's two panes (original + live preview) were split into
+`st.columns(2)`, and `st_canvas` renders at a literal, non-responsive
+pixel size that does not shrink to fit a container.** `MANUAL_EDITOR_
+TARGET_WIDTH_PX = 700` was sized assuming the canvas got the *full* main
+content width; splitting it into two columns instead gave the canvas
+roughly half that, which is narrower than 700px on an entirely ordinary
+browser window even with `layout="wide"`. Since the canvas doesn't scale
+down, the part that didn't fit was clipped by the component's own iframe
+-- read by the reviewer as "the page doesn't display fully," and made it
+impossible to draw a box anywhere in the clipped-off region (frequently
+the right or bottom edge of the page -- exactly where a name written
+outside the normal header geometry is likely to be). Fixed by stacking
+the two panes full-width, one above the other, instead of side by side;
+`config.py`'s own `MANUAL_EDITOR_TARGET_WIDTH_PX` docstring documents
+both this and the original misalignment fix it was already built for.
+
+**The two held-back packets the reviewer asked about (010406_PD2_PRT,
+period 2) are both `verify_no_leaked_names` holds, not detection-
+confidence or uncovered-ink -- confirmed directly, not assumed, by
+drafting each one's redaction read-only and re-running the same checks
+`run_dispositions` does:** `010406_PD2_PRT_p006` (sid 0104060208, a fuzzy
+match on "grataces") and `010406_PD2_PRT_p024` (sid 0104060206, exact
+matches on "gavin" and "ghavami"). Both packets' automatic two-box header
+geometry left the student's own name text sitting somewhere in the
+written file's kept text layer -- meaning the name was written outside
+where the two automatic boxes reach, the same shape as the reviewer's own
+"name written at the top" observation for 0104060206 (page 25) -- one of
+the two packets (0104060202, page 21) the reviewer separately flagged as
+needing manual redaction for the same reason. 0104060202 was successfully
+hand-redacted already (it shipped); 0104060206 could not be, because
+whatever additional box the reviewer tried to draw for it was silently
+dropped by bug 1 above -- now fixed, so it (and 0104060208) should be
+resolvable by opening the editor, drawing a box over wherever the name
+actually sits (including above/outside the printed header border, if
+that's where it is), and applying.
+
+**A persistent "why was this held back" indicator was added, since there
+previously wasn't one.** `results` from a "Run redaction pipeline" click
+was a local variable, shown only as a transient sidebar toast at the
+moment the run finished -- a reviewer who saw it, then navigated to a
+different packet, had no way to recall which packets were held or why.
+`st.session_state.last_run_held_back` (packet_tag -> reason, replaced
+wholesale on every run so a since-fixed packet doesn't keep showing a
+stale banner) is now checked in `_render_packet`: a held-back packet gets
+a persistent `st.error` banner naming the reason, right above the "Edit
+redaction" expander, and that expander now auto-expands and names the
+hold reason in its own label the same way it already did for a queued
+packet -- reachable and self-explanatory without re-running the pipeline
+just to remember why a packet needs attention.
+
+**The itemized "COLLISION AVOIDED for ..." lines (`cli.py`'s per-run
+output) and the matching `st.sidebar.warning` per collision
+(`review_app.py`) were removed, per explicit request -- the underlying
+mechanism (`pipeline._claim_output_path`'s numbered-suffix backstop, see
+"Teacher 010406 roster reissue..." above) is unchanged and still silently
+guarantees no file is ever overwritten; only the noisy per-occurrence
+message went away.** The aggregate `(N collision(s) avoided)` count in
+the one-line run summary was kept, both in `cli.py` and `review_app.py`'s
+sidebar, since it's a single low-noise signal rather than one line per
+occurrence (this teacher's own real 010406_PD1 run produced 22 of them in
+one run -- see "A real page-order/rotation correction applied to
+010406..." above -- which is what made the itemized version noisy enough
+to ask to remove in the first place).
+
+## Root-caused the manual editor's intermittent crash: inverted-corner boxes reaching PIL unnormalized (2026-08-15, same day)
+
+**Motivation: the previous session's fix (unlimited header boxes, stacked
+canvas layout) didn't fully resolve the real reviewer's experience --
+drawing/resizing a second box "sometimes glitched and threw an error,"
+and a crash mid-Apply made it look like a redaction was never applied at
+all ("saved for later" rather than done). Per explicit instruction, this
+was root-caused with closed-loop testing (write a test that reproduces
+it, fix it, re-run the whole suite, repeat) rather than patched at the
+symptom.**
+
+**Root cause, reproduced locally, not assumed:** `PIL.ImageDraw.rectangle`
+raises `ValueError: x1 must be greater than or equal to x0` for inverted
+coordinates (`right < left` or `bottom < top`) rather than silently
+swapping them (confirmed directly: `draw.rectangle([100,100,50,50], ...)`
+raises on this environment's Pillow 12.3.0). `review_app.py`'s
+`_canvas_rect_to_bbox` folds a fabric.js object's `scaleX`/`scaleY` into
+its width/height without ever checking their sign -- and fabric.js's
+default interactive resize allows dragging a corner handle *past* the
+object's opposite handle, flipping the rectangle and reporting a
+*negative* scale rather than a re-normalized positive one. The very next
+redaction call (`Update preview`'s `render_redaction_preview`, or
+Apply's `redact_packet`, both funneling through `_draw_redaction_box`)
+then crashed on that inverted box. Traced this to fabric.js's own
+built-in scaling behavior by reading the bundled frontend directly (not
+guessed) -- confirmed `lockScalingFlip` is a real, actively-checked
+property in this bundle's fabric.js
+(`lockScalingFlip&&(e.signX!==c||e.signY!==f))return!1` inside its own
+scaling-transform logic), the standard fix for exactly this class of
+flip.
+
+**Also investigated and ruled out, not assumed clean:** (1) whether a
+shrinking `st.selectbox` options list (the "Rectangle to delete" control,
+if a canvas sync transiently reports fewer boxes than session_state's
+stored selection index) could raise `StreamlitAPIException` -- built a
+minimal standalone probe script and drove it through `AppTest` directly;
+confirmed this Streamlit version (1.59.x) gracefully falls back to a
+valid default rather than raising, so this was never a real risk. (2)
+Whether the *drawing* tool itself (as opposed to resizing) can produce a
+crash -- read the bundled `onMouseDown`/`onMouseMove` handlers for
+fabric.js's Rect-drawing tool directly: width/height are always
+`Math.max(..., 2*minLength)` (never negative), and while there IS a real,
+separate upstream bug in this exact tool (`left:Math.abs(n.x)` on a
+backward drag, which does not correctly clamp to the canvas boundary if
+the pointer goes negative -- i.e. the drag exits the canvas element),
+that bug can at worst place a freshly-drawn box's corner in the wrong
+spot; it does not report an inverted box and cannot reach `_draw_
+redaction_box` in the state that crashes it. Not fixed (it lives in the
+third-party bundled JS, not this codebase, and the failure mode is a
+placement inaccuracy a reviewer would immediately see and just redraw,
+not a crash) -- recorded here so it isn't mistaken for unexplored ground
+next time this component acts up.
+
+**Fixed at every layer that touches a box's corners, not just the one
+that crashed -- normalizing only at the final PIL draw call would have
+stopped the crash but left `_overlaps_bbox` (the leak-coverage check and
+the kept-text-layer word-stripping) computing overlap against the
+*original*, still-inverted corners, which could silently disagree with
+what the raster actually shows as covered.** `redact._normalize_bbox`
+(new) is the single point every bbox-consuming function in `redact.py`
+now funnels through: `_draw_redaction_box`, `_overlaps_bbox`, and the
+entry points that receive a caller-supplied box list at all
+(`redact_packet`'s `header_bbox_override` branch, `render_redaction_
+preview`'s). `review_app.py`'s `_canvas_rect_to_bbox` independently
+normalizes too (`sorted((left, left+width))` / `sorted((top, top+
+height))`), so a box is already correctly ordered by the time it leaves
+the conversion layer -- `redact.py`'s own normalization is the second,
+independent line of defense, not a duplicate of the same bug. Also added
+`_bbox_to_canvas_rect`'s `lockScalingFlip: True` (real, verified fabric.js
+property, see above) as the *first* line of defense -- stops the flip
+from ever happening at the UI level, so a reviewer resizing a box hits a
+hairline-width clamp instead of a flip-through-zero. A `review_app._num`
+helper was also added (`obj.get(key, default)` doesn't catch an explicit
+`null`, and `float(None)` raises `TypeError` -- found while auditing
+every numeric field this conversion reads, not from a specific observed
+crash).
+
+**`header_bbox_override`'s truthy check was also hardened**
+(`if header_bbox_override:` instead of `is not None`, in both
+`redact_packet` and `render_redaction_preview`): an empty list is
+functionally "no override," but the old `is not None` check let one
+through into `min()`/`max()` calls on an empty sequence, which raises
+`ValueError: min() arg is an empty sequence`. Not a reported bug, found
+while hardening the same entry points against every input shape they
+could realistically receive.
+
+**"I don't want it saved for later" was very likely this exact crash,
+not a separate design request -- confirmed by tracing what an unhandled
+exception mid-Apply actually does.** `release_from_manual_queue` already
+writes to `out/` synchronously, immediately, the moment it's called --
+there was never a queued-for-later step. But an unhandled exception
+inside `redact_packet` (the crash above) aborts the whole Streamlit
+script run *before* either the success or failure branch below it gets a
+chance to render anything, which reads exactly like "I clicked Apply and
+nothing happened." Both known causes of that specific crash are fixed at
+the source now, but as a second, independent line of defense, both the
+preview-generation block and the Apply handler in `_render_manual_editor`
+are now wrapped in `try`/`except`: any exception -- this one or a future,
+unanticipated one -- becomes a visible, actionable `st.error` (the Apply
+handler's own message explicitly says the decision was still recorded
+and to adjust the boxes and retry) instead of a silent full-script crash.
+This makes "did it apply or not" never ambiguous, regardless of whether
+every possible crash has been anticipated.
+
+**Closed-loop testing, per explicit instruction: write the reproduction,
+fix it, verify, re-run the whole suite, repeat until clean.** 18 new
+tests across `tests/test_redact.py` (corner-order normalization at the
+`_normalize_bbox` level; `_draw_redaction_box` proven to both not crash
+*and* paint the pixel-identical region as the pre-normalized equivalent,
+not just swallow the error; `_overlaps_bbox` proven to agree regardless
+of corner order; an end-to-end `redact_packet` call with one ordinary and
+one fully-flipped header box producing byte-identical output to the
+non-flipped equivalent; `render_redaction_preview`/`render_region_
+preview` with inverted boxes; three real header boxes actually all
+applied, closing the loop on the previous session's "not capped at two"
+fix; the empty-list `header_bbox_override` edge case) and
+`tests/test_review_app.py` (the `_num` None-guard; `_canvas_rect_to_bbox`
+normalizing a negative scale from all three flip directions; and
+`test_manual_editor_survives_a_flipped_resized_box_and_applies_cleanly`,
+a full `AppTest` reproduction of the actual reported scenario -- one
+ordinary box plus one deliberately inverted second box seeded into
+`mq_regions_{tag}` for a real header packet, "Update preview" and "Apply
+manual redaction" driven exactly as a reviewer would click them, asserting
+zero exceptions at every step *and* that the written output is genuinely
+leak-free via `verify_no_leaked_names`, not merely crash-free). Full
+suite: 290 passed (was 272 before this session's two rounds of fixes; +18
+here), 0 failed, run twice after the final fix to confirm stability.
+
+**`lockScalingFlip: True` (this section's own "first line of defense,"
+above) was removed again, the same day, after a real reviewer reported
+the canvas no longer responding to draw actions at all right after this
+went live.** No live browser access to confirm the mechanism directly
+(the Chrome extension this environment can otherwise use for exactly this
+kind of check was not connected) -- but it was the one change in this
+whole round that touched what gets sent to the frontend for *every*
+canvas object, including the auto-seeded ones present the instant a
+packet is opened, so a real-reviewer report of drawing being broken
+outright (a stronger symptom than the intermittent resize-crash this
+property was meant to prevent) made it the clear prime suspect, and it
+was never load-bearing for correctness -- `_canvas_rect_to_bbox`'s own
+corner-order normalization (kept, unchanged, still fully tested) already
+makes a flip harmless regardless of whether the UI can still produce one.
+Removed rather than investigated further blind; every docstring/comment
+that described it as active was corrected in the same change. Full test
+suite re-run after removal: 78/78 in `test_redact.py`+`test_review_app.py`
+still passing (untouched by this reversion, confirming nothing depended
+on the property being present). **This is the one 2026-08-15 fix in this
+file that has NOT been confirmed against a real browser** -- everything
+else in the two sections above was verified through automated tests
+exercising the real Python-side functions directly; whether removing
+`lockScalingFlip` actually restores drawing (as opposed to some other,
+still-unidentified cause) needs a real reviewer's own confirmation.
+
+## Servers restarted, out/ cleared for a fresh 010406 period-2 review pass
+
+**Both review servers for 010406 (`010406_PD1_PRT.pdf` on port 8503,
+`010406_PD2_PRT.pdf` on port 8502) were killed, per explicit instruction,
+before this session's code changes -- neither was left running against
+stale code.** Not yet restarted as of this session's own changes above;
+restart after confirming this section's fixes are what should ship.
+
+**`out/010406/PRT/02/` (all 36 files) and its ledger
+(`out/.ledger/010406_PD2_PRT.json`) were deleted, per explicit
+instruction, to give the fixed manual editor a clean slate for a fresh
+period-2 review pass** -- the same "real human review work stays, derived
+output doesn't" split this file's own precedent already established for
+the 010406 cleanup earlier this session: `decisions/010406_PD2_PRT.json`
+and its sidecars (`.manual_geometry.json`, any orientation/composition
+overrides) were left completely untouched, since those are the actual
+saved review decisions the request referred to ("we anyway have all our
+reviewing saved"). `out/.diagnostics/010406_PD2_PRT_preflight/` (the
+preflight contact sheet) was also left in place -- it's that feature's
+own intended, persistent output, not part of the redacted-packet tree.
+Re-running the redaction pipeline for period 2 (writing everything back
+to `out/`) is explicitly a later step, once a human has finished
+reviewing with the now-fixed editor -- not done as part of this session.
+
 ## Working preferences
 
 - Calibrate against real measured data, not assumptions — when a

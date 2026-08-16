@@ -151,16 +151,25 @@ STAMP_FONT_SIZE_PT = 22
 # bug: st_canvas renders its declared width/height as a literal pixel size
 # (no CSS-driven scaling), while a plain st.image with no explicit width
 # defaults to 'content' sizing, which a container narrower than the image
-# silently shrinks via max-width CSS. Two images of the *same* page shown
-# side by side at two different effective on-screen sizes is what a
-# reviewer sees as "misaligned, and shifts between renders" -- the shift
-# is real browser layout reflow (sidebar state, scrollbar presence)
-# changing the *container's* width from render to render, which only ever
-# moved the CSS-scaled pane, never the fixed-pixel canvas. Fix: pick an
-# editor-specific DPI per page so both the canvas and the preview image
-# render at this literal target width already, with an explicit `width=`
-# on the preview's st.image call too -- neither pane is ever left to a
-# container-relative size that can drift.
+# silently shrinks via max-width CSS. Two images of the *same* page at two
+# different effective on-screen sizes is what a reviewer sees as
+# "misaligned, and shifts between renders" -- the shift is real browser
+# layout reflow (sidebar state, scrollbar presence) changing the
+# *container's* width from render to render, which only ever moved the
+# CSS-scaled pane, never the fixed-pixel canvas. Fix: pick an editor-
+# specific DPI per page so both the canvas and the preview image render at
+# this literal target width already, with an explicit `width=` on the
+# preview's st.image call too -- neither pane is ever left to a
+# container-relative size that can drift. This is also why the two panes
+# are stacked full-width, one above the other, rather than side by side in
+# `st.columns(2)` (also found 2026-08-15, a second real-reviewer-reported
+# bug): splitting them into two columns only ever gave the canvas about
+# half the main content width, which is narrower than this target on an
+# ordinary browser window -- since the canvas doesn't shrink to fit, the
+# extra width got clipped by the component's own frame, reading as "the
+# page doesn't display fully" and making part of the page impossible to
+# draw a box on. Stacking removes the column competing for width; this
+# constant only needs to fit the *full* container, not half of it.
 MANUAL_EDITOR_TARGET_WIDTH_PX = 700
 
 # --- Redaction ---

@@ -518,7 +518,7 @@ def release_from_manual_queue(
     out_dir: str | Path = OUT_DIR,
     dpi: int = RENDER_DPI_FINAL,
     flatten: bool = False,
-    header_bbox_override: tuple[Bbox, Bbox] | None = None,
+    header_bbox_override: list[Bbox] | None = None,
     extra_page_regions: dict[int, list[Bbox]] | None = None,
     flagged_regions_to_verify: dict[int, list[Bbox]] | None = None,
     decisions_dir: str | Path = DECISIONS_DIR,
@@ -702,7 +702,7 @@ def manual_geometry_path(pdf_path: str | Path, decisions_dir: Path = DECISIONS_D
 
 def _serialize_geometry_entry(
     band_override: HeaderBand | None,
-    header_bbox_override: tuple[Bbox, Bbox] | None,
+    header_bbox_override: list[Bbox] | None,
     extra_page_regions: dict[int, list[Bbox]] | None,
 ) -> dict:
     return {
@@ -730,6 +730,12 @@ def _deserialize_geometry_entry(entry: dict) -> dict:
             left=band["left"], top=band["top"], right=band["right"], bottom=band["bottom"], detected=True
         )
     if header_bboxes:
+        # A tuple, not a list, of tuples -- matches redact_bboxes_for_band's
+        # own return shape (still exactly tuple[Bbox, Bbox] for the
+        # automatic 2-box case) so a caller comparing a reloaded entry
+        # against a freshly-computed one with == doesn't get a spurious
+        # list-vs-tuple mismatch. redact_packet accepts either -- it only
+        # ever does list(header_bbox_override) internally.
         kwargs["header_bbox_override"] = tuple(tuple(b) for b in header_bboxes)
     if extra:
         kwargs["extra_page_regions"] = {int(offset): [tuple(b) for b in boxes] for offset, boxes in extra.items()}
@@ -755,7 +761,7 @@ def save_manual_geometry(
     tag: str,
     *,
     band_override: HeaderBand | None = None,
-    header_bbox_override: tuple[Bbox, Bbox] | None = None,
+    header_bbox_override: list[Bbox] | None = None,
     extra_page_regions: dict[int, list[Bbox]] | None = None,
     decisions_dir: Path = DECISIONS_DIR,
 ) -> None:
@@ -1660,8 +1666,8 @@ def _header_geometry_check(page, *, dpi: int = RENDER_DPI_FINAL) -> tuple[Header
     row_height = header_row_height(anchors)
     image = page.to_image(resolution=dpi).original.convert("RGB")
     band = detect_header_band(image, dpi=dpi, anchors=anchors, row_height=row_height)
-    left_bbox, right_bbox = redact_bboxes_for_band(band, anchors.group_top)
-    uncovered = find_uncovered_group_words(header_words, anchors, left_bbox, right_bbox)
+    boxes = list(redact_bboxes_for_band(band, anchors.group_top))
+    uncovered = find_uncovered_group_words(header_words, anchors, boxes)
     return band, uncovered
 
 

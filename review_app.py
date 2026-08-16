@@ -490,6 +490,17 @@ def _init_state(pdf_path: str, decisions_dir: str) -> None:
         # not repeatedly pay for a re-segment/re-OCR/re-consensus pass on
         # every click, only once, when a rotation is actually applied.
         st.session_state.pending_rotation = {}
+    if "last_run_held_back" not in st.session_state:
+        # packet_tag -> reason, from the most recent "Run redaction
+        # pipeline" click this session (see _render_sidebar) -- in-memory
+        # only, replaced wholesale on every run, never persisted. Exists so
+        # a reviewer opening a packet's own page can see *why* it was held
+        # back without that information having only ever existed as a
+        # transient sidebar toast at the moment the run finished (found
+        # 2026-08-15: a reviewer who ran the pipeline, saw the sidebar
+        # warning, then navigated to a different packet had no way to
+        # recall which packets were held or why).
+        st.session_state.last_run_held_back = {}
 
 
 def _set_page_rotation(pdf_path: str, decisions_dir: str, page_index: int, angle: int | None) -> None:
@@ -687,6 +698,11 @@ def _render_sidebar(
             deleted = sum(1 for r in results if r.deleted_path is not None)
             pending = sum(1 for r in results if r.pending)
             held_back = [r for r in results if r.held_back]
+            # Replaced wholesale, not merged -- a packet held back by an
+            # earlier run but written cleanly by this one must not keep
+            # showing a stale "held back" banner on its own page (see
+            # _render_packet and _init_state's own comment on this key).
+            st.session_state.last_run_held_back = {r.packet_tag: r.reason for r in held_back}
             consent_held = [r for r in results if r.consent_hold]
             overridden = [r for r in written if r.reason]
             collided = [r for r in written if r.collision_note]
@@ -711,14 +727,6 @@ def _render_sidebar(
                 f"Geometry: {len(written) - n_manual} automatic, {n_manual} manually edited -- "
                 f"{n_advisory} write(s) carried an uncovered-ink advisory"
             )
-            for r in collided:
-                # A different packet's output already claimed this packet's
-                # natural path this run -- see pipeline.py's
-                # _claim_output_path. Written to a numbered-suffix path
-                # instead of silently overwriting; surfaced prominently so
-                # a reviewer notices and doesn't assume the natural path is
-                # this packet's file.
-                st.sidebar.warning(f"Collision avoided: {r.packet_tag}: {r.collision_note}")
             for r in consent_held:
                 # Never a "needs fixing" item like held_back -- a permanent
                 # structural state (see pipeline.py's consent_hold), shown
@@ -836,7 +844,34 @@ def _bbox_to_canvas_rect(bbox: Bbox, dpi: int, *, interactive: bool = True) -> d
         "hasControls": interactive,
         "hasBorders": interactive,
         "lockRotation": True,
+        # NOT `lockScalingFlip` -- tried as a UI-level guard against the
+        # negative-scale-from-a-flipped-resize crash (see _canvas_rect_to_
+        # bbox's own docstring for the full mechanism), but added to
+        # *every* object's initial JSON, including the auto-seeded ones
+        # present the instant a packet is opened -- a real-reviewer report
+        # of the canvas not responding to draw actions at all right after
+        # this went in made it the prime suspect for breaking this specific
+        # frontend/fabric.js build's own JSON parsing, and it was never
+        # load-bearing: _canvas_rect_to_bbox's own corner-order
+        # normalization already makes a flip harmless regardless of
+        # whether the UI ever produces one. Removed rather than risk
+        # investigated further blind (no live browser access to confirm
+        # either way) -- the Python-side fix carries the actual
+        # correctness guarantee on its own.
     }
+
+
+def _num(obj: dict, key: str, default: float) -> float:
+    """`obj.get(key, default)`, but also falls back to `default` when the
+    key is present with an explicit `None` -- fabric.js's own JSON can
+    include a property as `null` rather than omitting it outright (e.g.
+    `angle: null` has been observed from some canvas states), and a bare
+    `.get(key, default)` doesn't catch that case since the key IS present.
+    `float(None)` would otherwise raise TypeError deep inside geometry
+    math, crashing the whole editor for reasons that have nothing to do
+    with what a reviewer actually drew."""
+    value = obj.get(key, default)
+    return float(default if value is None else value)
 
 
 def _canvas_rect_to_bbox(obj: dict, dpi: int) -> Bbox:
@@ -845,13 +880,31 @@ def _canvas_rect_to_bbox(obj: dict, dpi: int) -> Bbox:
     page-point Bbox. `scaleX`/`scaleY` are fabric.js's own resize factors
     applied on top of the object's original width/height -- both must be
     folded in, not just width/height alone, or a corner-dragged resize
-    would silently be ignored."""
+    would silently be ignored.
+
+    Always returns `left <= right` and `top <= bottom`, regardless of sign
+    -- found 2026-08-15 (real-reviewer-reported crash): dragging a resize
+    handle past an object's own opposite handle flips it in fabric.js,
+    reporting a *negative* scaleX/scaleY rather than a re-normalized
+    positive one. A negative width/height here used to reach PIL's
+    `ImageDraw.rectangle` unnormalized, which raises `ValueError: x1 must
+    be greater than or equal to x0` on inverted coordinates rather than
+    silently swapping them -- this is the ONLY normalization step this
+    editor relies on for that (a `lockScalingFlip` UI-level guard was
+    tried first and removed the same day: it stops the flip from being
+    *possible* via an interactive resize, but a real reviewer report of
+    the canvas no longer responding to draw actions at all, right after
+    it was added to every seeded object's initial JSON, made it too
+    risky to keep without a way to verify it live against this specific
+    frontend build)."""
     scale = dpi / 72.0
-    left = float(obj.get("left", 0.0))
-    top = float(obj.get("top", 0.0))
-    width = float(obj.get("width", 0.0)) * float(obj.get("scaleX", 1.0))
-    height = float(obj.get("height", 0.0)) * float(obj.get("scaleY", 1.0))
-    return (left / scale, top / scale, (left + width) / scale, (top + height) / scale)
+    left = _num(obj, "left", 0.0)
+    top = _num(obj, "top", 0.0)
+    width = _num(obj, "width", 0.0) * _num(obj, "scaleX", 1.0)
+    height = _num(obj, "height", 0.0) * _num(obj, "scaleY", 1.0)
+    x0, x1 = sorted((left, left + width))
+    y0, y1 = sorted((top, top + height))
+    return (x0 / scale, y0 / scale, x1 / scale, y1 / scale)
 
 
 def _advisory_outline_image(image: Image.Image, words: list, dpi: int) -> Image.Image:
@@ -925,17 +978,22 @@ def _render_manual_editor(
     `_render_manual_queue` opens it with the queue entry's own
     `flagged_regions` for a packet an automated check actually held.
 
-    Original page on the left, live redacted result on the right -- both
-    rendered at an identical, fixed pixel width computed per page (see
+    Original page (the drag-corner canvas), then the live redacted result,
+    stacked full-width one above the other -- not side by side (found
+    2026-08-15: `st_canvas` renders at a literal, non-responsive pixel
+    size regardless of its container, so splitting the two into
+    `st.columns(2)` gave the canvas only about half the main content
+    width, which is narrower than MANUAL_EDITOR_TARGET_WIDTH_PX on an
+    ordinary browser window -- the component iframe clipped whatever
+    didn't fit, which read as "the page doesn't display fully" and made
+    part of the page impossible to draw a box on at all). Both panes still
+    render at an identical, fixed pixel width computed per page (see
     `_editor_dpi_for_page`/config.MANUAL_EDITOR_TARGET_WIDTH_PX), and the
     preview pane's `st.image` call is given that same width explicitly, so
-    neither pane is ever left to container-relative CSS sizing that could
-    make the two drift apart (found 2026-08-15: the canvas renders at a
-    literal pixel size regardless of its container, while a plain
-    `st.image` with no explicit width silently shrinks to fit a narrower
-    container -- two views of the same page at two different effective
-    sizes is what read as "misaligned, shifts between renders"). A
-    reviewer drags the corners of the seeded rectangles (see `_seed_
+    the two can't drift apart from each other (a plain `st.image` with no
+    explicit width would otherwise shrink to fit its container while the
+    canvas would not) -- they just no longer compete for the same row's
+    width. A reviewer drags the corners of the seeded rectangles (see `_seed_
     manual_regions`, which seeds the header page's own automatically-
     detected boxes so the common case is nudging what detection already
     proposed, not drawing from nothing) or draws new ones on any page of
@@ -1027,34 +1085,45 @@ def _render_manual_editor(
         current_boxes = []
 
     interactive = mode_label.startswith("Move")
-    col_canvas, col_preview = st.columns(2)
-    with col_canvas:
-        st.caption(f"Original — page {page_offset + 1}")
-        canvas_result = st_canvas(
-            fill_color="rgba(255, 0, 0, 0.25)",
-            stroke_width=2,
-            stroke_color="red",
-            background_image=raw_image,
-            update_streamlit=True,
-            height=raw_image.height,
-            width=raw_image.width,
-            drawing_mode="transform" if interactive else "rect",
-            initial_drawing={
-                "version": "4.4.0",
-                "objects": [_bbox_to_canvas_rect(b, editor_dpi, interactive=interactive) for b in current_boxes],
-            },
-            # Stable across every rerun this function can cause on its own
-            # (page/tool/delete/preview-button interactions never change
-            # tag or page_offset) -- the component is never remounted by
-            # anything this editor itself does, so in-progress canvas
-            # state (fabric.js's own selection/undo history) survives.
-            key=f"mq_canvas_{tag}_{page_offset}",
-        )
-        st.caption(
-            f"Original pane rendered in {render_elapsed_ms:.0f} ms"
-            + (" (cached)" if render_elapsed_ms < 50 else "")
-            + f" · {pane_width}×{raw_image.height}px"
-        )
+    # Deliberately full-width, stacked, not a two-column side-by-side layout
+    # (found 2026-08-15: `st_canvas` renders at a literal, non-responsive
+    # pixel size -- it does not shrink to fit a container the way a plain
+    # `st.image` does. Splitting the editor into `st.columns(2)` gives the
+    # canvas only about half the main content width to work with; on any
+    # browser window narrower than roughly 2x MANUAL_EDITOR_TARGET_WIDTH_PX
+    # (a completely ordinary laptop width, even with `layout="wide"`), the
+    # canvas is wider than its column and the component iframe clips
+    # whatever doesn't fit -- read by a reviewer as "the page doesn't
+    # display fully," and made a real box impossible to draw anywhere in
+    # the clipped-off region. Stacking gives the canvas the full container
+    # width instead, which comfortably fits MANUAL_EDITOR_TARGET_WIDTH_PX
+    # in the overwhelming majority of real browser windows.
+    st.caption(f"Original — page {page_offset + 1}")
+    canvas_result = st_canvas(
+        fill_color="rgba(255, 0, 0, 0.25)",
+        stroke_width=2,
+        stroke_color="red",
+        background_image=raw_image,
+        update_streamlit=True,
+        height=raw_image.height,
+        width=raw_image.width,
+        drawing_mode="transform" if interactive else "rect",
+        initial_drawing={
+            "version": "4.4.0",
+            "objects": [_bbox_to_canvas_rect(b, editor_dpi, interactive=interactive) for b in current_boxes],
+        },
+        # Stable across every rerun this function can cause on its own
+        # (page/tool/delete/preview-button interactions never change
+        # tag or page_offset) -- the component is never remounted by
+        # anything this editor itself does, so in-progress canvas
+        # state (fabric.js's own selection/undo history) survives.
+        key=f"mq_canvas_{tag}_{page_offset}",
+    )
+    st.caption(
+        f"Original pane rendered in {render_elapsed_ms:.0f} ms"
+        + (" (cached)" if render_elapsed_ms < 50 else "")
+        + f" · {pane_width}×{raw_image.height}px"
+    )
     if canvas_result.json_data is not None:
         objs = [o for o in canvas_result.json_data.get("objects", []) if o.get("type") == "rect"]
         current_boxes = [_canvas_rect_to_bbox(o, editor_dpi) for o in objs]
@@ -1078,19 +1147,19 @@ def _render_manual_editor(
             regions[page_offset] = current_boxes
             st.rerun()
 
-    header_bbox_override: tuple[Bbox, Bbox] | None = None
-    if page_offset == header_offset and len(current_boxes) >= 2:
-        header_bbox_override = (current_boxes[0], current_boxes[1])
-    elif page_offset == header_offset and len(current_boxes) == 1:
-        header_bbox_override = (current_boxes[0], current_boxes[0])
+    # Every box currently drawn on the header page, however many -- not
+    # capped at two. redact_packet/render_redaction_preview both accept an
+    # arbitrary-length list now (see redact.py's header_bbox_override
+    # docstring); the automatic two-box pair (left column + overflow
+    # strip) is just the common case a reviewer starts from, never a hard
+    # limit on what they can draw.
+    header_bbox_override: list[Bbox] | None = current_boxes if (page_offset == header_offset and current_boxes) else None
 
     advisory_words: list = []
     if page_offset == header_offset and header_bbox_override is not None:
         header_fields = _header_fields(args.pdf_path, page_idx, st.session_state.orientation_overrides)
         header_words = _header_words(args.pdf_path, page_idx, st.session_state.orientation_overrides)
-        advisory_words = find_uncovered_group_words(
-            header_words, header_fields.anchors, header_bbox_override[0], header_bbox_override[1]
-        )
+        advisory_words = find_uncovered_group_words(header_words, header_fields.anchors, header_bbox_override)
 
     # The redacted preview is regenerated only on an explicit click, not on
     # every rerun this editor causes (a box drag/resize, a tool switch, the
@@ -1114,11 +1183,22 @@ def _render_manual_editor(
     cached = preview_cache.get(page_offset)
     is_first_view = cached is None
 
-    with col_preview:
-        st.caption("Redacted result")
-        update_clicked = st.button("🔄 Update preview", key=f"mq_updatepreview_{tag}_{page_offset}")
-        if is_first_view or update_clicked:
-            preview_start = time.perf_counter()
+    st.caption("Redacted result")
+    update_clicked = st.button("🔄 Update preview", key=f"mq_updatepreview_{tag}_{page_offset}")
+    if is_first_view or update_clicked:
+        preview_start = time.perf_counter()
+        # Defensive, not just a symptom patch: _canvas_rect_to_bbox and
+        # _draw_redaction_box already normalize any box's corners
+        # regardless of order (see redact.py's _normalize_bbox), so this
+        # try/except is not standing in for a real fix -- it's the second,
+        # independent line of defense that turns *any* exception this
+        # geometry could still raise (a future edge case, a corrupted
+        # session-state entry) into a visible, recoverable st.error instead
+        # of crashing the whole script. Before this, an unhandled exception
+        # here read to a reviewer as the editor silently doing nothing --
+        # nothing gets applied when the script itself crashes mid-render,
+        # which is what made a real glitch look like "it didn't save."
+        try:
             stamp_lines = _stamp_lines_for(default_sid, roster) if default_sid in roster else None
             if page_offset == header_offset:
                 if header_bbox_override is None:
@@ -1131,25 +1211,30 @@ def _render_manual_editor(
             else:
                 preview_image = render_region_preview(raw_image, dpi=editor_dpi, bboxes=current_boxes)
                 preview_caption = "Preview with your drawn regions" if current_boxes else "No regions drawn on this page"
-            preview_elapsed_ms = (time.perf_counter() - preview_start) * 1000
-            preview_cache[page_offset] = {
-                "boxes": boxes_signature,
-                "image": preview_image,
-                "caption": preview_caption,
-                "elapsed_ms": preview_elapsed_ms,
-            }
-            cached = preview_cache[page_offset]
-        st.image(cached["image"], caption=cached["caption"], width=pane_width)
-        st.caption(
-            f"Redacted pane rendered in {cached['elapsed_ms']:.0f} ms"
-            + (" (cached)" if not (is_first_view or update_clicked) else "")
-            + f" · {pane_width}×{raw_image.height}px"
+        except Exception as exc:  # noqa: BLE001 -- deliberately broad, see comment above
+            st.error(f"Couldn't render a preview with the current boxes: {exc}")
+            if cached is None:
+                st.stop()
+            preview_image, preview_caption = cached["image"], cached["caption"]
+        preview_elapsed_ms = (time.perf_counter() - preview_start) * 1000
+        preview_cache[page_offset] = {
+            "boxes": boxes_signature,
+            "image": preview_image,
+            "caption": preview_caption,
+            "elapsed_ms": preview_elapsed_ms,
+        }
+        cached = preview_cache[page_offset]
+    st.image(cached["image"], caption=cached["caption"], width=pane_width)
+    st.caption(
+        f"Redacted pane rendered in {cached['elapsed_ms']:.0f} ms"
+        + (" (cached)" if not (is_first_view or update_clicked) else "")
+        + f" · {pane_width}×{raw_image.height}px"
+    )
+    if cached["boxes"] != boxes_signature:
+        st.info(
+            "This preview reflects an earlier set of regions -- click 'Update preview' to refresh it. "
+            "Applying always uses your current regions regardless of what the preview shows."
         )
-        if cached["boxes"] != boxes_signature:
-            st.info(
-                "This preview reflects an earlier set of regions -- click 'Update preview' to refresh it. "
-                "Applying always uses your current regions regardless of what the preview shows."
-            )
 
     if advisory_words:
         st.warning(
@@ -1190,13 +1275,13 @@ def _render_manual_editor(
 
     apply_disabled = resolved_sid is None or not worksheet_type_value.strip()
     if st.button("Apply manual redaction", type="primary", key=f"mq_apply_{tag}", disabled=apply_disabled):
-        final_header_bbox_override: tuple[Bbox, Bbox] | None = None
+        final_header_bbox_override: list[Bbox] | None = None
         extra_page_regions: dict[int, list[Bbox]] = {}
         for offset, boxes in regions.items():
             if not boxes:
                 continue
             if offset == header_offset:
-                final_header_bbox_override = (boxes[0], boxes[1]) if len(boxes) >= 2 else (boxes[0], boxes[0])
+                final_header_bbox_override = boxes
             else:
                 extra_page_regions[offset] = boxes
 
@@ -1210,29 +1295,51 @@ def _render_manual_editor(
         # packet is never left silently un-decided just because a reviewer
         # used the editor instead of the ordinary radio+Confirm flow.
         _confirm(args.pdf_path, args.decisions_dir, tag, resolved_sid)
-        result = release_from_manual_queue(
-            args.pdf_path,
-            packet_for_release,
-            tag,
-            resolved_sid,
-            roster,
-            None,
-            out_dir=Path(args.out_dir),
-            decisions_dir=Path(args.decisions_dir),
-            header_bbox_override=final_header_bbox_override,
-            extra_page_regions=extra_page_regions or None,
-            flagged_regions_to_verify=flagged_regions,
-            orientation_overrides=st.session_state.orientation_overrides,
-            page_sequence=st.session_state.page_order,
-        )
-        if result.released:
-            st.success(f"Released {tag} -> {result.out_path}")
-            if result.advisory_uncovered_words:
-                st.info(f"Shipped with {len(result.advisory_uncovered_words)} advisory uncovered-ink region(s) noted.")
-            del st.session_state[regions_key]
-            st.rerun()
+        # Applying writes to out/ immediately, right here, synchronously --
+        # there is no "save for later" step in this codebase; a packet is
+        # either written to out/ now (release_from_manual_queue's own
+        # write) or it isn't and stays queued/pending, never something
+        # queued for a *future* step to finish. What could make this look
+        # like nothing happened: an unhandled exception during redaction
+        # (found 2026-08-15, a real reviewer-reported bug -- see redact.py's
+        # _normalize_bbox) used to crash this whole script run before
+        # either branch below ever got to render anything, which reads
+        # exactly like "I clicked Apply and it did nothing." Both known
+        # causes of that are fixed at the source now (inverted-coordinate
+        # boxes are normalized before they ever reach PIL), but this
+        # try/except is the second, independent line of defense: any
+        # exception here becomes a visible, actionable st.error instead of
+        # a silent crash, so "did it apply or not" is never ambiguous.
+        try:
+            result = release_from_manual_queue(
+                args.pdf_path,
+                packet_for_release,
+                tag,
+                resolved_sid,
+                roster,
+                None,
+                out_dir=Path(args.out_dir),
+                decisions_dir=Path(args.decisions_dir),
+                header_bbox_override=final_header_bbox_override,
+                extra_page_regions=extra_page_regions or None,
+                flagged_regions_to_verify=flagged_regions,
+                orientation_overrides=st.session_state.orientation_overrides,
+                page_sequence=st.session_state.page_order,
+            )
+        except Exception as exc:  # noqa: BLE001 -- deliberately broad, see comment above
+            st.error(
+                f"Redaction failed with an unexpected error, nothing was written: {exc}\n\n"
+                "Your decision was still recorded; adjust the boxes and click Apply again."
+            )
         else:
-            st.error(f"Still not safe to release with these regions: {result.reason}")
+            if result.released:
+                st.success(f"Released {tag} -> {result.out_path}")
+                if result.advisory_uncovered_words:
+                    st.info(f"Shipped with {len(result.advisory_uncovered_words)} advisory uncovered-ink region(s) noted.")
+                del st.session_state[regions_key]
+                st.rerun()
+            else:
+                st.error(f"Still not safe to release with these regions: {result.reason}")
 
 
 def _render_manual_queue(args: argparse.Namespace, roster: Roster, packet_by_tag: dict[str, Packet]) -> None:
@@ -1744,6 +1851,15 @@ def _render_packet(
     else:
         st.caption("Recorded: pending (not yet reviewed)")
 
+    held_reason = st.session_state.last_run_held_back.get(tag)
+    if held_reason is not None:
+        st.error(
+            f"Held back by the last redaction run, not written to out/: {held_reason}\n\n"
+            "If this is a verify_no_leaked_names finding, the redaction geometry below didn't fully "
+            "cover the name -- draw an additional box over wherever it actually appears (any page, "
+            "any number of boxes) and Apply."
+        )
+
     # Reachable for ANY packet, held or not -- see CLAUDE.md's "From
     # detection-gates-workflow to human-reviews-everything" section. The
     # automatic geometry (or, for a currently-queued packet, the flagged
@@ -1762,7 +1878,9 @@ def _render_packet(
     expander_label = "✏️ Edit redaction (manual)"
     if queued_entry is not None:
         expander_label += " -- currently held: " + queued_entry["reason"]
-    with st.expander(expander_label, expanded=queued_entry is not None):
+    elif held_reason is not None:
+        expander_label += " -- held back last run: " + held_reason
+    with st.expander(expander_label, expanded=queued_entry is not None or held_reason is not None):
         _render_manual_editor(
             args,
             roster,

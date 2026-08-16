@@ -375,6 +375,121 @@ def test_edit_redaction_reachable_for_a_non_held_packet_and_resolves_by_name(mai
     assert saved[tag] == sid, "applying a manual edit must record the decision, same as Confirm decision would"
 
 
+def test_num_helper_falls_back_to_default_on_explicit_none():
+    """fabric.js's own JSON can include a property as an explicit `null`
+    rather than omitting it -- a bare `.get(key, default)` doesn't catch
+    that case since the key IS present, and `float(None)` raises TypeError
+    deep inside geometry math (found 2026-08-15 while hardening the
+    manual editor against real-reviewer-reported crashes)."""
+    assert review_app._num({"scaleX": None}, "scaleX", 1.0) == 1.0
+    assert review_app._num({"scaleX": 2.0}, "scaleX", 1.0) == 2.0
+    assert review_app._num({}, "scaleX", 1.0) == 1.0
+
+
+@pytest.mark.parametrize(
+    "scale_x, scale_y",
+    [(-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)],
+    ids=["flip-x", "flip-y", "flip-both"],
+)
+def test_canvas_rect_to_bbox_normalizes_a_negative_scale_from_a_flipped_resize(scale_x, scale_y):
+    """Dragging a resize handle past the object's own opposite handle
+    flips the rectangle in fabric.js, reporting a *negative* scaleX/scaleY
+    rather than a re-normalized positive one (fabric.js's default
+    behavior -- there is no UI-level guard against this, see
+    _bbox_to_canvas_rect's own docstring for why a `lockScalingFlip`
+    attempt was tried and removed the same day; this Python-side
+    normalization is the only thing standing between a flip and a crash).
+    Before the 2026-08-15 fix, this produced a bbox with right < left or
+    bottom < top, which crashed the very next PIL draw call -- the real
+    bug a reviewer hit while resizing a second box."""
+    dpi = 150
+    scale = dpi / 72.0
+    obj = {
+        "left": 100.0 * scale,
+        "top": 60.0 * scale,
+        "width": 50.0 * scale,
+        "height": 30.0 * scale,
+        "scaleX": scale_x,
+        "scaleY": scale_y,
+    }
+    left, top, right, bottom = review_app._canvas_rect_to_bbox(obj, dpi)
+    assert left <= right
+    assert top <= bottom
+
+
+def test_manual_editor_survives_a_flipped_resized_box_and_applies_cleanly(main_fixture, tmp_path):
+    """Closed-loop, end-to-end reproduction of the real reviewer-reported
+    glitch: draw a second header box, then resize it past its own opposite
+    corner (fabric.js reports this as the object's own left/top shifting
+    *and* a negative scale -- exactly what _canvas_rect_to_bbox must
+    normalize). Seeds `mq_regions_{tag}` with one ordinary auto-detected
+    box plus one deliberately inverted second box (the shape a flipped
+    resize produces once run through _canvas_rect_to_bbox at drag time),
+    drives 'Update preview' and 'Apply manual redaction' exactly as a
+    reviewer would click them, and asserts: no exception anywhere, the
+    packet actually gets written (not left in limbo -- see CLAUDE.md on
+    "I don't want it saved for later"), and the written file is genuinely
+    leak-free, not just crash-free."""
+    from melredact.pipeline import output_path
+    from melredact.redact import detect_header_band, header_row_height, locate_header_anchors, page_words, redact_bbox_for_band
+    from melredact.segment import HEADER_SEARCH_MAX_TOP
+
+    out_dir = tmp_path / "out"
+    decisions_dir = tmp_path / "decisions"
+    tag = "packets_p000"  # clean_match, "Jordan Ames"
+
+    with pdfplumber.open(main_fixture.pdf_path) as pdf:
+        header_page = pdf.pages[0]
+        header_words = page_words(header_page, (0, 0, header_page.width, HEADER_SEARCH_MAX_TOP))
+        anchors = locate_header_anchors(header_words)
+        image = header_page.to_image(resolution=review_app.DPI).original.convert("RGB")
+    band = detect_header_band(image, dpi=review_app.DPI, anchors=anchors, row_height=header_row_height(anchors))
+    # Real coverage: the same left-column box the automatic path itself
+    # would draw, so this test proves correctness, not just "no crash" --
+    # if the flip broke coverage, verify_no_leaked_names below would catch it.
+    left_box = redact_bbox_for_band(band)
+    # The second box, as it would land in session_state after a flipped
+    # resize: both corners inverted relative to the real box's own extent
+    # -- right < left, bottom < top.
+    flipped_second_box = (left_box[2], left_box[3], left_box[0], left_box[1])
+
+    sys.argv = [
+        "review_app.py",
+        str(main_fixture.pdf_path),
+        str(main_fixture.roster_path),
+        "--out-dir",
+        str(out_dir),
+        "--decisions-dir",
+        str(decisions_dir),
+    ]
+    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at.session_state[f"mq_regions_{tag}"] = {0: [left_box, flipped_second_box]}
+    at.run()
+    assert not at.exception, "opening the editor with an inverted box in session_state must not crash the app"
+
+    update_btn = next(b for b in at.button if b.key == f"mq_updatepreview_{tag}_0")
+    update_btn.click().run()
+    assert not at.exception, "'Update preview' with an inverted box must not crash the app"
+
+    apply_btn = next(b for b in at.button if b.key == f"mq_apply_{tag}")
+    assert not apply_btn.disabled
+    apply_btn.click().run()
+    assert not at.exception, "'Apply manual redaction' with an inverted box must not crash the app"
+
+    roster = load_roster(main_fixture.roster_path, infer_period_from=main_fixture.pdf_path)
+    sid = main_fixture.expected_auto_assign_sid["clean_match"]
+    entry = roster.by_sid[sid]
+    packet = next(
+        p for p in segment_pdf(main_fixture.pdf_path).packets if packet_tag(main_fixture.pdf_path, p) == tag
+    )
+    expected_path = output_path(out_dir, entry, packet.worksheet_type)
+    assert expected_path.exists(), (
+        "applying must write the file immediately -- a reviewer should never have to wonder whether "
+        "it 'saved for later'"
+    )
+    assert verify_no_leaked_names(expected_path, roster) == []
+
+
 def test_issue_flagged_packet_blocks_sid_confirmation(tmp_path):
     edge_pdf = build_footer_edge_case_fixture(tmp_path / "edge")
     main = build_main_fixture(tmp_path / "main")  # borrow a roster with real candidates

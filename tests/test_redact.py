@@ -6,7 +6,9 @@ from PIL import Image, ImageDraw
 from melredact.config import COLUMN_SPLIT_X, GROUP_ANCHOR, HEADER_BAND_FALLBACK, RENDER_DPI_PREVIEW
 from melredact.redact import (
     HeaderBand,
+    _draw_redaction_box,
     _invisible_text_op,
+    _normalize_bbox,
     _overlaps_bbox,
     _pdf_baseline_y,
     _PdfWriter,
@@ -14,6 +16,8 @@ from melredact.redact import (
     find_uncovered_group_words,
     redact_bbox_for_band,
     redact_packet,
+    render_redaction_preview,
+    render_region_preview,
     verify_no_leaked_names,
 )
 from melredact.roster import load_roster
@@ -603,7 +607,7 @@ def test_find_uncovered_group_words_actually_catches_a_miss():
         {"text": "Group", "x0": 46.0, "x1": 71.0, "top": 111.0, "bottom": 120.0},
         escaped_word,
     ]
-    escaping = find_uncovered_group_words(header_words, anchors, left_bbox, right_bbox)
+    escaping = find_uncovered_group_words(header_words, anchors, [left_bbox, right_bbox])
     assert escaped_word in escaping
 
 
@@ -724,3 +728,150 @@ def test_verify_no_leaked_names_catches_ocr_garbled_near_miss(tmp_path):
     assert len(findings) == 1
     assert findings[0].token == "ganik"
     assert not findings[0].exact
+
+
+# --- Inverted-coordinate boxes (2026-08-15 real-reviewer-reported crash) ---
+#
+# A manually resized box (review_app.py's drag-corner editor) can arrive
+# with its two corners in the "wrong" order -- dragging a resize handle
+# past the object's opposite handle flips the rectangle, reporting a
+# negative scaleX/scaleY rather than a re-normalized positive one. PIL's
+# ImageDraw.rectangle raises ValueError on inverted coordinates rather than
+# silently swapping them, which is what a reviewer saw as an intermittent
+# crash while resizing boxes. _normalize_bbox is the fix; these tests prove
+# it doesn't just avoid a crash but also doesn't change *where* anything
+# gets redacted.
+
+
+@pytest.mark.parametrize(
+    "corners",
+    [
+        (38.0, 58.0, 400.0, 148.0),  # ordinary, already-normalized
+        (400.0, 58.0, 38.0, 148.0),  # left/right flipped (negative scaleX)
+        (38.0, 148.0, 400.0, 58.0),  # top/bottom flipped (negative scaleY)
+        (400.0, 148.0, 38.0, 58.0),  # both flipped (180-degree drag)
+    ],
+    ids=["normal", "flip-x", "flip-y", "flip-both"],
+)
+def test_normalize_bbox_handles_every_corner_order(corners):
+    """Regardless of which order the two corners arrive in, _normalize_bbox
+    must recover the exact same (left, top, right, bottom) rectangle --
+    same absolute region, not just "some" ordered box."""
+    assert _normalize_bbox(corners) == (38.0, 58.0, 400.0, 148.0)
+
+
+def test_draw_redaction_box_does_not_crash_on_inverted_coordinates_and_paints_the_same_region():
+    """A box handed to _draw_redaction_box with inverted corners must not
+    raise (the real crash: PIL's ImageDraw.rectangle on right<left or
+    bottom<top), and must paint the *identical* region a pre-normalized
+    call would -- proof this is a real fix, not just a swallowed error."""
+    dpi = DPI
+    normal_bbox = (38.0, 58.0, 400.0, 148.0)
+    inverted_bbox = (400.0, 148.0, 38.0, 58.0)  # both corners flipped
+
+    img_normal = Image.new("RGB", (600, 800), "white")
+    _draw_redaction_box(img_normal, normal_bbox, dpi, draw_stamp=False)
+
+    img_inverted = Image.new("RGB", (600, 800), "white")
+    _draw_redaction_box(img_inverted, inverted_bbox, dpi, draw_stamp=False)  # must not raise
+
+    assert np.array_equal(np.array(img_normal), np.array(img_inverted))
+
+
+@pytest.mark.parametrize(
+    "bbox",
+    [
+        (400.0, 58.0, 38.0, 148.0),
+        (38.0, 148.0, 400.0, 58.0),
+        (400.0, 148.0, 38.0, 58.0),
+    ],
+    ids=["flip-x", "flip-y", "flip-both"],
+)
+def test_overlaps_bbox_agrees_regardless_of_corner_order(bbox):
+    """A word's overlap result against an inverted bbox must match the
+    result against its normalized equivalent -- otherwise the raster (drawn
+    via the normalized box) and the kept-text-layer stripping/leak-coverage
+    check (which reads the raw box) could silently disagree about what's
+    actually covered."""
+    normalized = _normalize_bbox(bbox)
+    inside_word = {"text": "Inside", "x0": 100.0, "x1": 150.0, "top": 90.0, "bottom": 110.0}
+    outside_word = {"text": "Outside", "x0": 450.0, "x1": 500.0, "top": 90.0, "bottom": 110.0}
+    assert _overlaps_bbox(inside_word, bbox) == _overlaps_bbox(inside_word, normalized) is True
+    assert _overlaps_bbox(outside_word, bbox) == _overlaps_bbox(outside_word, normalized) is False
+
+
+def test_redact_packet_handles_a_flipped_header_box_without_crashing(main_fixture, segmented, tmp_path):
+    """End-to-end: redact_packet's header_bbox_override, given one ordinary
+    box and one flipped (both-corners-inverted) box -- exactly the shape a
+    resize-past-the-opposite-handle produces -- must not raise, and must
+    produce byte-identical output to the pre-normalized equivalent call."""
+    packet = _packet_by_tag(segmented, "clean_match")
+    normal_boxes = [(38.0, 58.0, 400.0, 148.0), (38.0, 148.0, 574.0, 178.0)]
+    flipped_boxes = [(38.0, 58.0, 400.0, 148.0), (574.0, 178.0, 38.0, 148.0)]  # second box flipped
+
+    out_normal = tmp_path / "flip_normal.pdf"
+    result_normal = redact_packet(
+        main_fixture.pdf_path, packet, out_normal, dpi=DPI, header_bbox_override=normal_boxes
+    )
+    out_flipped = tmp_path / "flip_flipped.pdf"
+    result_flipped = redact_packet(  # must not raise
+        main_fixture.pdf_path, packet, out_flipped, dpi=DPI, header_bbox_override=flipped_boxes
+    )
+
+    assert out_normal.read_bytes() == out_flipped.read_bytes()
+    assert result_normal.header_bboxes == result_flipped.header_bboxes
+
+
+def test_render_redaction_preview_handles_inverted_header_bbox_override_without_crashing(main_fixture):
+    with pdfplumber.open(main_fixture.pdf_path) as pdf:
+        image = pdf.pages[0].to_image(resolution=DPI).original.convert("RGB")
+    preview, band = render_redaction_preview(
+        image,
+        dpi=DPI,
+        header_bbox_override=[(400.0, 148.0, 38.0, 58.0)],  # flipped
+    )
+    assert band.left == 38.0 and band.right == 400.0
+    assert band.top == 58.0 and band.bottom == 148.0
+
+
+def test_render_region_preview_handles_inverted_bboxes_without_crashing(main_fixture):
+    with pdfplumber.open(main_fixture.pdf_path) as pdf:
+        image = pdf.pages[0].to_image(resolution=DPI).original.convert("RGB")
+    render_region_preview(image, dpi=DPI, bboxes=[(400.0, 148.0, 38.0, 58.0)])  # must not raise
+
+
+def test_redact_packet_accepts_more_than_two_header_boxes(main_fixture, segmented, tmp_path):
+    """Closes the loop on the manual editor's own "not capped at two"
+    fix (2026-08-15): a reviewer drawing a third header box -- e.g. to
+    cover a name written above the printed border, outside the automatic
+    left-column/overflow-strip pair -- must have all three actually
+    applied, not just the first two."""
+    packet = _packet_by_tag(segmented, "clean_match")
+    three_boxes = [
+        (38.0, 58.0, 400.0, 148.0),
+        (38.0, 148.0, 574.0, 178.0),
+        (38.0, 20.0, 574.0, 55.0),  # a third box, above the other two
+    ]
+    out = tmp_path / "three_boxes.pdf"
+    result = redact_packet(main_fixture.pdf_path, packet, out, dpi=DPI, header_bbox_override=three_boxes)
+    assert len(result.header_bboxes) == 3
+    with pdfplumber.open(out) as pdf:
+        image = pdf.pages[0].to_image(resolution=DPI).original.convert("RGB")
+    scale = DPI / 72.0
+    arr = np.array(image)
+    for left, top, right, bottom in three_boxes:
+        region = arr[int((top + 3) * scale) : int((bottom - 3) * scale), int((left + 3) * scale) : int((right - 3) * scale)]
+        assert region.mean() < 10  # every one of the three boxes is actually painted black
+
+
+def test_redact_packet_header_bbox_override_empty_list_falls_back_to_automatic_detection(main_fixture, segmented, tmp_path):
+    """An empty list is functionally "no override" -- must fall through to
+    automatic detection rather than crashing on min()/max() of an empty
+    sequence (found while hardening header_bbox_override's entry points)."""
+    packet = _packet_by_tag(segmented, "clean_match")
+    out_auto = tmp_path / "auto.pdf"
+    result_auto = redact_packet(main_fixture.pdf_path, packet, out_auto, dpi=DPI)
+    out_empty = tmp_path / "empty_override.pdf"
+    result_empty = redact_packet(main_fixture.pdf_path, packet, out_empty, dpi=DPI, header_bbox_override=[])
+    assert out_auto.read_bytes() == out_empty.read_bytes()
+    assert result_empty.band.detected == result_auto.band.detected

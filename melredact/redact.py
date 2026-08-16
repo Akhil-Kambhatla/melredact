@@ -314,8 +314,31 @@ def redact_bboxes_for_band(band: HeaderBand, group_top: float) -> tuple[Bbox, Bb
     return left, right
 
 
-def _overlaps_bbox(word: Word, bbox: Bbox) -> bool:
+def _normalize_bbox(bbox: Bbox) -> Bbox:
+    """Guarantee `left <= right` and `top <= bottom`, regardless of which
+    order a caller's two corners arrived in. Found 2026-08-15: a manually
+    drawn box (review_app.py's drag-corner editor) can in principle arrive
+    inverted -- a resize that flips a rectangle through zero width/height
+    reports a negative scale, and a stored `manual_geometry.json` entry
+    could in principle be hand-edited or come from an older schema. This
+    is the single normalization point every bbox-consuming function in
+    this module funnels through (drawing, overlap-checking, word-
+    stripping), so all three ways of using the same box -- what gets
+    painted, what counts as 'covered' for the leak check, and what gets
+    dropped from the kept text layer -- agree with each other regardless
+    of corner order. Normalizing only at the raster-drawing step (PIL's
+    ImageDraw.rectangle, which raises ValueError on inverted coordinates
+    rather than silently swapping them) was tried first and rejected: it
+    stopped the crash but left `_overlaps_bbox` computing overlap against
+    the *original*, still-inverted corners, which could silently disagree
+    with what the raster actually shows as covered -- a correctness risk
+    a crash, at least, cannot hide."""
     left, top, right, bottom = bbox
+    return (min(left, right), min(top, bottom), max(left, right), max(top, bottom))
+
+
+def _overlaps_bbox(word: Word, bbox: Bbox) -> bool:
+    left, top, right, bottom = _normalize_bbox(bbox)
     return not (word["x1"] <= left or word["x0"] >= right or word["bottom"] <= top or word["top"] >= bottom)
 
 
@@ -338,7 +361,13 @@ def _draw_redaction_box(
     this is still image-pixel space, not a PDF content stream.
     """
     scale = dpi / 72.0
-    left, top, right, bottom = (v * scale for v in bbox_pt)
+    # Normalized in point-space, before scaling, purely so this and every
+    # other bbox-consuming function agree on the same (min, max) pair --
+    # see _normalize_bbox's own docstring for why this has to happen once,
+    # consistently, rather than independently at each drawing call. PIL's
+    # ImageDraw.rectangle raises ValueError on inverted coordinates rather
+    # than silently swapping them, which is the actual crash this closes.
+    left, top, right, bottom = (v * scale for v in _normalize_bbox(bbox_pt))
     draw = ImageDraw.Draw(image)
     draw.rectangle([left, top, right, bottom], fill=REDACTION_FILL_COLOR)
 
@@ -366,7 +395,7 @@ def render_redaction_preview(
     group_top: float | None = None,
     stamp_lines: list[str] | None = None,
     band_override: HeaderBand | None = None,
-    header_bbox_override: tuple[Bbox, Bbox] | None = None,
+    header_bbox_override: list[Bbox] | None = None,
 ) -> tuple[Image.Image, HeaderBand]:
     """Non-destructive preview of what redact_packet would do to this
     header page: same detection + box-drawing (including the same
@@ -393,18 +422,23 @@ def render_redaction_preview(
     candidate match before confirming it.
 
     `header_bbox_override`, when given, takes precedence over both of the
-    above and previews that exact (left_bbox, right_bbox) pair directly --
-    the drag-corner manual editor's own geometry (see redact_packet's
-    identically-named parameter), so a reviewer sees precisely the two
-    rectangles they just dragged, not a band reconstructed from them.
+    above and previews that exact list of rectangles directly -- the
+    drag-corner manual editor's own geometry (see redact_packet's
+    identically-named parameter), so a reviewer sees precisely the boxes
+    they just dragged (however many -- the editor is not limited to two),
+    not a band reconstructed from them.
     """
     preview = header_page_image.copy()
-    if header_bbox_override is not None:
-        left_bbox, right_bbox = header_bbox_override
-        lefts = [b[0] for b in header_bbox_override]
-        tops = [b[1] for b in header_bbox_override]
-        rights = [b[2] for b in header_bbox_override]
-        bottoms = [b[3] for b in header_bbox_override]
+    if header_bbox_override:
+        # Normalized once, here, so the union band computed from these
+        # boxes (min/max below) and the drawing calls each box goes
+        # through afterward (_draw_redaction_box) agree on the same
+        # corners -- see _normalize_bbox's own docstring.
+        boxes = [_normalize_bbox(b) for b in header_bbox_override]
+        lefts = [b[0] for b in boxes]
+        tops = [b[1] for b in boxes]
+        rights = [b[2] for b in boxes]
+        bottoms = [b[3] for b in boxes]
         band = HeaderBand(left=min(lefts), top=min(tops), right=max(rights), bottom=max(bottoms), detected=True)
     else:
         row_height = header_row_height(anchors) if anchors is not None else None
@@ -416,9 +450,10 @@ def render_redaction_preview(
         effective_group_top = group_top
         if effective_group_top is None:
             effective_group_top = anchors.group_top if anchors is not None else GROUP_ANCHOR["top"]
-        left_bbox, right_bbox = redact_bboxes_for_band(band, effective_group_top)
-    _draw_redaction_box(preview, left_bbox, dpi, stamp_lines)
-    _draw_redaction_box(preview, right_bbox, dpi, draw_stamp=False)
+        boxes = list(redact_bboxes_for_band(band, effective_group_top))
+    _draw_redaction_box(preview, boxes[0], dpi, stamp_lines)
+    for b in boxes[1:]:
+        _draw_redaction_box(preview, b, dpi, draw_stamp=False)
     return preview, band
 
 
@@ -613,13 +648,24 @@ class RedactResult:
     # (run_dispositions) must treat this exactly like a verify_no_leaked_
     # names finding, not just log it.
     uncovered_group_words: list[Word] = field(default_factory=list)
+    # Every header-page redaction rectangle actually applied, in order --
+    # `redact_bbox`/`redact_strip_bbox` above are just this list's first
+    # two entries, kept for existing callers/tests built around the
+    # automatic two-box case. The manual editor (review_app.py) is not
+    # capped at two boxes, so a caller that wants the *complete* set (to
+    # re-preview it, for instance) should read this rather than assume
+    # there are only ever two. Empty for an orphan packet, same as band.
+    header_bboxes: list[Bbox] = field(default_factory=list)
 
 
 def find_uncovered_group_words(
-    header_words: list[Word], anchors: HeaderAnchors, left_bbox: Bbox, right_bbox: Bbox
+    header_words: list[Word], anchors: HeaderAnchors, bboxes: list[Bbox]
 ) -> list[Word]:
-    """Proof that the two redaction rectangles actually cover the Group
-    row's ink, independent of whatever OCR thinks that ink says.
+    """Proof that the redaction rectangles (however many a caller drew --
+    the automatic path always passes exactly two, see redact_bboxes_for_
+    band, but the manual editor's drag-corner geometry can be any number)
+    actually cover the Group row's ink, independent of whatever OCR thinks
+    that ink says.
 
     Reuses segment._assign_words_to_rows -- the same vertical-nearest-
     anchor logic segment.py already relies on to keep Group-row content
@@ -676,7 +722,7 @@ def find_uncovered_group_words(
     toward the former on purpose -- see CLAUDE.md's "packet 14" section.
     """
     rows = _assign_words_to_rows(header_words, anchors, band_bottom=HEADER_SEARCH_MAX_TOP)
-    return [w for w in rows["group"] if not (_overlaps_bbox(w, left_bbox) or _overlaps_bbox(w, right_bbox))]
+    return [w for w in rows["group"] if not any(_overlaps_bbox(w, b) for b in bboxes)]
 
 
 def redact_packet(
@@ -688,7 +734,7 @@ def redact_packet(
     flatten: bool = False,
     stamp_lines: list[str] | None = None,
     band_override: HeaderBand | None = None,
-    header_bbox_override: tuple[Bbox, Bbox] | None = None,
+    header_bbox_override: list[Bbox] | None = None,
     extra_page_regions: dict[int, list[Bbox]] | None = None,
     orientation_overrides: dict[int, int] | None = None,
 ) -> RedactResult:
@@ -720,14 +766,17 @@ def redact_packet(
     `header_bbox_override` is a sibling to `band_override`, for the manual
     queue's drag-corner editor (review_app.py): instead of one HeaderBand
     that `redact_bboxes_for_band` expands into the left column + overflow
-    strip pair, the editor lets a human independently drag each of those
-    two rectangles' own corners, so this takes the (left_bbox, right_bbox)
-    pair directly and skips `redact_bboxes_for_band` entirely. It is still
-    exactly two rectangles passed straight into the SAME, unmodified
-    `find_uncovered_group_words` call every other path uses -- the editor
-    seeds its two draggable boxes from `redact_bboxes_for_band`'s own
-    automatic output (see review_app.py), so the common case is nudging an
-    existing pair of boxes, not drawing from nothing. Takes precedence over
+    strip pair, the editor lets a human independently drag each rectangle's
+    own corners -- and draw more than two, if the automatic pair isn't
+    enough for what's actually on the page -- so this takes the list of
+    boxes directly and skips `redact_bboxes_for_band` entirely. Every box in
+    the list is passed straight into the SAME, unmodified `find_uncovered_
+    group_words` call every other path uses -- the editor seeds its two
+    draggable boxes from `redact_bboxes_for_band`'s own automatic output
+    (see review_app.py), so the common case is nudging an existing pair of
+    boxes, not drawing from nothing, but a reviewer is never capped at two.
+    The first box in the list is stamped (`SID: ...`/`PD: ...`); the rest
+    are not, same as the automatic left/right pair. Takes precedence over
     `band_override` when both are given.
 
     `extra_page_regions` (packet page offset -- 0-based index into
@@ -762,8 +811,7 @@ def redact_packet(
     extra_page_regions = extra_page_regions or {}
     with open_pdf(pdf_path, orientation_overrides=orientation_overrides) as pdf:
         band: HeaderBand | None = None
-        left_bbox: Bbox | None = None
-        right_bbox: Bbox | None = None
+        header_boxes: list[Bbox] = []
         uncovered: list[Word] = []
         if packet.header_page_index is not None:
             header_page = pdf.pages[packet.header_page_index]
@@ -771,12 +819,17 @@ def redact_packet(
             header_words = page_words(header_page, (0, 0, header_page.width, HEADER_SEARCH_MAX_TOP))
             anchors = locate_header_anchors(header_words)
             row_height = header_row_height(anchors)
-            if header_bbox_override is not None:
-                left_bbox, right_bbox = header_bbox_override
-                lefts = [b[0] for b in header_bbox_override]
-                tops = [b[1] for b in header_bbox_override]
-                rights = [b[2] for b in header_bbox_override]
-                bottoms = [b[3] for b in header_bbox_override]
+            if header_bbox_override:
+                # Normalized once, here, so the union band below, the
+                # coverage check (find_uncovered_group_words), the word-
+                # stripping loop, and the actual drawing all agree on the
+                # same corners regardless of which order a caller's box
+                # arrived in -- see _normalize_bbox's own docstring.
+                header_boxes = [_normalize_bbox(b) for b in header_bbox_override]
+                lefts = [b[0] for b in header_boxes]
+                tops = [b[1] for b in header_boxes]
+                rights = [b[2] for b in header_boxes]
+                bottoms = [b[3] for b in header_boxes]
                 band = HeaderBand(
                     left=min(lefts), top=min(tops), right=max(rights), bottom=max(bottoms), detected=True
                 )
@@ -785,8 +838,8 @@ def redact_packet(
                     band = band_override
                 else:
                     band = detect_header_band(header_image, dpi=dpi, anchors=anchors, row_height=row_height)
-                left_bbox, right_bbox = redact_bboxes_for_band(band, anchors.group_top)
-            uncovered = find_uncovered_group_words(header_words, anchors, left_bbox, right_bbox)
+                header_boxes = list(redact_bboxes_for_band(band, anchors.group_top))
+            uncovered = find_uncovered_group_words(header_words, anchors, header_boxes)
 
         writer = _PdfWriter()
         for offset, idx in enumerate(packet.page_indices):
@@ -794,8 +847,8 @@ def redact_packet(
             image = page.to_image(resolution=dpi).original.convert("RGB")
             is_header = idx == packet.header_page_index
             page_bboxes: list[Bbox] = []
-            if is_header and left_bbox is not None:
-                page_bboxes.extend([left_bbox, right_bbox])
+            if is_header and header_boxes:
+                page_bboxes.extend(header_boxes)
             page_bboxes.extend(extra_page_regions.get(offset, []))
 
             for i, bbox in enumerate(page_bboxes):
@@ -815,10 +868,11 @@ def redact_packet(
     return RedactResult(
         out_path=Path(out_path),
         band=band,
-        redact_bbox=left_bbox,
-        redact_strip_bbox=right_bbox,
+        redact_bbox=header_boxes[0] if header_boxes else None,
+        redact_strip_bbox=header_boxes[1] if len(header_boxes) > 1 else None,
         flattened=flatten,
         uncovered_group_words=uncovered,
+        header_bboxes=header_boxes,
     )
 
 

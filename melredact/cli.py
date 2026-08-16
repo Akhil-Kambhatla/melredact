@@ -387,8 +387,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
         geom_note = "  [manual geometry]" if r.geometry_source == "manual" else ""
         advisory_note = f"  [advisory: {len(r.advisory_uncovered_words)} uncovered-ink word(s)]" if r.advisory_uncovered_words else ""
         print(f"wrote   {r.out_path}{note}{geom_note}{advisory_note}")
-    for r in collided:
-        print(f"COLLISION AVOIDED for {r.packet_tag}: {r.collision_note}")
     for r in deleted:
         print(f"deleted {r.deleted_path}")
     for r in pending:
